@@ -49,3 +49,7 @@ The previous asset bundle/transfer and publishing/multi-view phase gates are def
 Run instructions and limits: `mvp-2.md`. Final Android APK: `android/app/build/outputs/apk/debug/app-debug.apk`, SHA-256 `b8ac724774377fd7c6ccd530cdf2e8ae8b098e3be767a582a096102010b23724`. Final Android accepted fixture: 1742 bytes, SHA-256 `2365c848ae53e7709b9f80fcda7418684fad36113068c467b7905f20f16c87de`, unchanged across force-stop/relaunch; existing notes preserved. Platform details are in the two MVP-2 evidence records.
 
 Completed against the user-reduced controlling scope, not the deferred multi-view/publishing/asset-sync backlog. No claim of arbitrary Android Pandoc filters, physical-device coverage or crash-durable unsubmitted drafts.
+
+## Approved quiet-shell follow-up
+
+The user rejected the original exposed-control layout and approved the Codex-inspired sketch. Subsequent UI implementation and verification are tracked separately in [quiet shell evidence](quiet-shell-evidence.md); the original delivery evidence above remains historical. Future GUI changes follow the preserved reference and project instructions.

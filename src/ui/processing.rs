@@ -1,5 +1,5 @@
 //! Small source-to-preview coordinator. Local artwork is explicitly selected, not synced.
-use super::document::{ArtworkCache, render_block, render_pandoc};
+use super::document::{ArtworkCache, editable_block, render_block, render_pandoc};
 use crate::{
     document_jobs::{DocumentJobs, DocumentSnapshot, ProcessedDocument, ProcessingConfig},
     illustration::AssetFile,
@@ -8,6 +8,7 @@ use crate::{
 };
 use eframe::egui;
 use std::{
+    ops::Range,
     path::{Path, PathBuf},
     sync::mpsc,
 };
@@ -31,13 +32,17 @@ pub(super) struct Processing {
     requested: Option<(NoteId, Revision)>,
     result: Option<(NoteId, Revision, ProcessedDocument)>,
     artwork: ArtworkCache,
+    staging_artwork: ArtworkCache,
+    staged: Option<(NoteId, Revision, ProcessedDocument)>,
     native: Option<crate::markdown::Document>,
+    accepted_native: Option<(String, crate::markdown::Document)>,
     error: Option<String>,
+    presentation_error: Option<String>,
     refresh: bool,
 }
 impl Processing {
     pub(super) fn controls(&mut self, ui: &mut egui::Ui) {
-        ui.collapsing("Document processing", |ui| {
+        ui.vertical(|ui| {
             ui.label("Artwork directory (local only; not transferred by sync)");
             super::field_single(ui, &mut self.resource_root, "resource-root");
             #[cfg(target_os = "linux")]
@@ -53,19 +58,81 @@ impl Processing {
             if self.applied != self.pending_settings() { ui.label("Settings changed — Process applies them together."); }
             if ui.button("Process / refresh artwork").clicked() {
                 self.applied = self.pending_settings();
-                self.refresh = true;
+                self.request_refresh();
             }
         });
     }
 
+    /// Retry the applied configuration; pending Settings edits need explicit Apply.
+    pub(super) fn request_refresh(&mut self) {
+        self.refresh = true;
+        self.discard_staged();
+    }
+    fn discard_staged(&mut self) {
+        self.staged = None;
+        self.staging_artwork.invalidate();
+    }
+
+    fn bindings_current(&self, view: &NoteView) -> bool {
+        let key = (view.note.id, view.note.revision);
+        self.requested == Some(key)
+            && !self.refresh
+            && self.loading.is_none()
+            && !self.jobs.is_busy()
+            && self.staged.is_none()
+            && self.error.is_none()
+            && !view.note.trashed
+            && self.result.as_ref().is_some_and(|(id, revision, result)| {
+                (*id, *revision) == key && result.source == view.note.text
+            })
+    }
+
+    pub(super) fn status(&self) -> (&str, bool) {
+        if self.error_details().is_some() {
+            ("Preview needs attention", true)
+        } else if self.refresh
+            || self.loading.is_some()
+            || self.jobs.is_busy()
+            || self.artwork.is_busy()
+            || self.staged.is_some()
+            || self.staging_artwork.is_busy()
+        {
+            ("Processing…", false)
+        } else {
+            ("", false)
+        }
+    }
+    pub(super) fn error_details(&self) -> Option<&str> {
+        self.error
+            .as_deref()
+            .or_else(|| self.artwork.error())
+            .or(self.presentation_error.as_deref())
+    }
+
     pub(super) fn update(&mut self, ctx: &egui::Context, view: &NoteView) {
         let key = (view.note.id, view.note.revision);
+        if !self
+            .accepted_native
+            .as_ref()
+            .is_some_and(|(_, document)| (document.note, document.revision) == key)
+        {
+            self.accepted_native = Some((
+                view.note.text.clone(),
+                crate::markdown::read(key.0, key.1, &view.note.text),
+            ));
+        }
+        if self.requested != Some(key) && self.staged.is_some() {
+            self.discard_staged();
+        }
         if self.refresh && self.requested.is_some() {
             self.jobs.cancel();
             self.requested = None;
         }
         if self.loading.is_none() && (self.requested != Some(key) || self.refresh) {
             self.refresh = false;
+            self.discard_staged();
+            // Keep the last-good document and its matching textures under their old
+            // identity while processing. bindings_current disables every old edit action.
             self.requested = Some(key);
             self.jobs.cancel();
             let source = view.note.text.clone();
@@ -132,36 +199,86 @@ impl Processing {
         if let Some(result) = self.jobs.poll() {
             if (result.note_id, result.revision) == key {
                 match result.outcome {
-                    Ok(document) => {
-                        let assets = document
-                            .figures
-                            .iter()
-                            .filter_map(|figure| {
-                                document.figure_resource(figure).map(|file| {
-                                    (
-                                        figure.id.clone(),
-                                        file.bytes.clone(),
-                                        matches!(
-                                            figure.kind,
-                                            crate::illustration::ArtworkKind::Illustration
-                                        ),
-                                    )
-                                })
-                            })
-                            .collect();
-                        self.artwork.prepare(ctx, result.generation, assets);
-                        self.native = Some(crate::markdown::read(key.0, key.1, &document.source));
-                        self.result = Some((key.0, key.1, document));
-                        self.error = None;
-                    }
+                    Ok(document) => self.stage_document(ctx, key, result.generation, document),
                     Err(error) => self.error = Some(error.to_string()),
                 }
             }
         }
-        self.artwork.poll(ctx);
-        if self.loading.is_some() || self.jobs.is_busy() {
+        self.finish_staged(ctx, view);
+        if self.loading.is_some()
+            || self.jobs.is_busy()
+            || self.staging_artwork.is_busy()
+            || self.staged.is_some()
+        {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
+    }
+
+    fn stage_document(
+        &mut self,
+        ctx: &egui::Context,
+        key: (NoteId, Revision),
+        generation: u64,
+        document: ProcessedDocument,
+    ) {
+        let assets: Vec<_> = document
+            .figures
+            .iter()
+            .filter_map(|figure| {
+                document.figure_resource(figure).map(|file| {
+                    (
+                        figure.id.clone(),
+                        file.bytes.clone(),
+                        matches!(figure.kind, crate::illustration::ArtworkKind::Illustration),
+                    )
+                })
+            })
+            .collect();
+        if assets.len() != document.figures.len() {
+            self.error = Some("Artwork file missing from processed snapshot.".into());
+            self.discard_staged();
+            return;
+        }
+        self.staging_artwork.prepare(ctx, generation, assets);
+        self.staged = Some((key.0, key.1, document));
+    }
+
+    fn finish_staged(&mut self, ctx: &egui::Context, view: &NoteView) {
+        self.staging_artwork.poll(ctx);
+        if self.staging_artwork.is_busy() {
+            return;
+        }
+        let Some((id, revision, document)) = self.staged.take() else {
+            return;
+        };
+        let key = (view.note.id, view.note.revision);
+        if (id, revision) != key
+            || self.requested != Some(key)
+            || self.refresh
+            || self.loading.is_some()
+            || self.jobs.is_busy()
+            || document.source != view.note.text
+        {
+            self.staging_artwork.invalidate();
+            return;
+        }
+        if let Some(error) = self.staging_artwork.error() {
+            self.error = Some(error.to_owned());
+            self.staging_artwork.invalidate();
+            return;
+        }
+        self.presentation_error = document
+            .semantic
+            .as_ref()
+            .and_then(|value| value["blocks"].as_array())
+            .and_then(|blocks| {
+                super::document::pandoc_diagnostic(blocks, &document.figures, &document.source)
+            });
+        self.native = Some(crate::markdown::read(id, revision, &document.source));
+        std::mem::swap(&mut self.artwork, &mut self.staging_artwork);
+        self.staging_artwork.invalidate();
+        self.result = Some((id, revision, document));
+        self.error = None;
     }
 
     fn pending_settings(&self) -> Settings {
@@ -205,48 +322,145 @@ impl Processing {
         Ok(ProcessingConfig::Pandoc(config))
     }
 
-    pub(super) fn show(&self, ui: &mut egui::Ui, view: &NoteView, navigate: &mut Option<String>) {
-        if self.loading.is_some() || self.jobs.is_busy() {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("Processing…");
-            });
-        }
-        if let Some(error) = &self.error {
-            ui.colored_label(egui::Color32::LIGHT_RED, error);
-        }
-        let Some((id, revision, result)) = self
+    pub(super) fn show(
+        &self,
+        ui: &mut egui::Ui,
+        view: &NoteView,
+        navigate: &mut Option<String>,
+    ) -> Option<Range<usize>> {
+        if let Some((_, _, result)) = self
             .result
             .as_ref()
             .filter(|(id, _, _)| *id == view.note.id)
-        else {
-            ui.label("No processed preview yet. Source remains editable.");
-            return;
-        };
-        let _ = id;
-        if *revision != view.note.revision || self.error.is_some() {
-            ui.label("Previous rendering — refresh pending or failed.");
-        }
-        if let Some(blocks) = result
-            .semantic
-            .as_ref()
-            .and_then(|value| value["blocks"].as_array())
         {
-            render_pandoc(ui, blocks, &self.artwork, &result.figures);
+            let current = self.bindings_current(view);
+            if let Some(blocks) = result
+                .semantic
+                .as_ref()
+                .and_then(|value| value["blocks"].as_array())
+            {
+                render_pandoc(
+                    ui,
+                    blocks,
+                    &self.artwork,
+                    &result.figures,
+                    &result.source,
+                    current,
+                    navigate,
+                )
+            } else {
+                self.show_native(
+                    ui,
+                    view,
+                    self.native.as_ref()?,
+                    &result.source,
+                    &result.figures,
+                    current,
+                    navigate,
+                    None,
+                )
+            }
         } else {
-            let Some(native) = &self.native else { return };
-            let frontmatter_end = frontmatter_end(&result.source);
-            for block in &native.blocks {
+            // This is the accepted original source, never guessed filter output.
+            // Missing artwork must not erase the note's independently readable prose.
+            let (source, native) = self.fallback(view)?;
+            self.show_native(
+                ui,
+                view,
+                native,
+                source,
+                &[],
+                !view.note.trashed,
+                navigate,
+                None,
+            )
+        }
+    }
+
+    /// An original-source context snapshot keeps the active block and its neighbours
+    /// stable during a draft, even if the accepted revision changes underneath it.
+    pub(super) fn show_inline(
+        &self,
+        ui: &mut egui::Ui,
+        view: &NoteView,
+        native: &crate::markdown::Document,
+        source: &str,
+        range: &Range<usize>,
+        editor: &mut dyn FnMut(&mut egui::Ui),
+    ) {
+        let figures = self
+            .result
+            .as_ref()
+            .filter(|(id, revision, result)| {
+                *id == native.note && *revision == native.revision && result.source == source
+            })
+            .map_or(&[][..], |(_, _, result)| result.figures.as_slice());
+        self.show_native(
+            ui,
+            view,
+            native,
+            source,
+            figures,
+            false,
+            &mut None,
+            Some((range, editor)),
+        );
+    }
+
+    fn fallback(&self, view: &NoteView) -> Option<(&str, &crate::markdown::Document)> {
+        self.accepted_native
+            .as_ref()
+            .filter(|(source, document)| {
+                document.note == view.note.id
+                    && document.revision == view.note.revision
+                    && source == &view.note.text
+            })
+            .map(|(source, document)| (source.as_str(), document))
+    }
+
+    fn show_native(
+        &self,
+        ui: &mut egui::Ui,
+        view: &NoteView,
+        native: &crate::markdown::Document,
+        source: &str,
+        figures: &[crate::illustration::PreparedFigure],
+        current: bool,
+        navigate: &mut Option<String>,
+        mut editing: Option<(&Range<usize>, &mut dyn FnMut(&mut egui::Ui))>,
+    ) -> Option<Range<usize>> {
+        let frontmatter_end = frontmatter_end(source);
+        let mut selected = None;
+        for (index, block) in native.blocks.iter().enumerate() {
+            if let Some((range, editor)) = editing.as_mut() {
                 if block
                     .origin
                     .as_ref()
-                    .is_some_and(|origin| origin.bytes.end <= frontmatter_end)
+                    .is_some_and(|origin| origin.bytes == **range)
                 {
+                    editable_block(ui, index, None, |ui| editor(ui));
                     continue;
                 }
+            }
+            if block
+                .origin
+                .as_ref()
+                .is_some_and(|origin| origin.bytes.end <= frontmatter_end)
+            {
+                continue;
+            }
+            let range = current
+                .then(|| block.origin.as_ref())
+                .flatten()
+                .filter(|origin| {
+                    origin.note == view.note.id
+                        && origin.revision == view.note.revision
+                        && valid_range(source, &origin.bytes)
+                })
+                .map(|origin| origin.bytes.clone());
+            if let Some(range) = editable_block(ui, index, range, |ui| {
                 if let Some(figure) = block.origin.as_ref().and_then(|origin| {
-                    result
-                        .figures
+                    figures
                         .iter()
                         .find(|figure| figure.source_bytes == origin.bytes)
                 }) {
@@ -254,8 +468,11 @@ impl Processing {
                 } else {
                     render_block(ui, block, navigate);
                 }
+            }) {
+                selected = Some(range);
             }
         }
+        selected
     }
 }
 
@@ -335,6 +552,10 @@ fn collect_resources(root: &Path) -> Result<Vec<AssetFile>, String> {
     Ok(files)
 }
 
+fn valid_range(source: &str, range: &Range<usize>) -> bool {
+    range.start < range.end && source.get(range.clone()).is_some()
+}
+
 // Presentation only: original metadata remains in source mode and its exact source outline.
 fn frontmatter_end(source: &str) -> usize {
     if !source.starts_with("---\n") {
@@ -346,6 +567,98 @@ fn frontmatter_end(source: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn inline_editor_keeps_neighbours_and_large_source_field_has_real_height() {
+        use crate::ui::editor::{Draft, source_editor};
+        let mut app = crate::App::new();
+        let crate::commands::CommandResult::Note(view) = app.execute(
+            crate::commands::Command::CreateNote {
+                path: "context.md".into(),
+                text: "# Before\n\nOriginal paragraph.\nSecond line.\nThird line.\nFourth line.\nFifth line.\n\n# After\n\n```{#art .illustration}\nA detailed illustration brief.\n```\n".into(),
+            }, crate::commands::Caller::Local).unwrap() else { panic!("note") };
+        let mut draft = Draft::new(&view, 0);
+        let range = draft.context.blocks[1]
+            .origin
+            .as_ref()
+            .unwrap()
+            .bytes
+            .clone();
+        assert!(draft.choose_range(Some(range.clone())));
+        assert!(draft.inline_block().is_some());
+        let context = draft.context.clone();
+        let source = draft.base_text.clone();
+        let ctx = egui::Context::default();
+        let processing = Processing::default();
+        let mut editor_rect = egui::Rect::NOTHING;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(700.0, 900.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    processing.show_inline(ui, &view, &context, &source, &range, &mut |ui| {
+                        let start = ui.cursor().min;
+                        source_editor(ui, &mut draft, view.note.id, false, true, 400.0);
+                        editor_rect = egui::Rect::from_min_max(start, ui.min_rect().max);
+                    });
+                });
+            },
+        );
+        fn texts(shapes: &[egui::epaint::ClippedShape], found: &mut Vec<(String, f32)>) {
+            fn visit(shape: &egui::Shape, found: &mut Vec<(String, f32)>) {
+                match shape {
+                    egui::Shape::Text(text) => {
+                        found.push((text.galley.job.text.clone(), text.pos.y))
+                    }
+                    egui::Shape::Vec(shapes) => {
+                        for shape in shapes {
+                            visit(shape, found);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for shape in shapes {
+                visit(&shape.shape, found);
+            }
+        }
+        let mut found = Vec::new();
+        texts(&output.shapes, &mut found);
+        let before = found.iter().find(|(text, _)| text == "Before").unwrap().1;
+        let after = found.iter().find(|(text, _)| text == "After").unwrap().1;
+        assert!(before < editor_rect.top() && editor_rect.bottom() <= after);
+        assert!(editor_rect.height() >= 160.0 && editor_rect.height() < 240.0);
+        assert_eq!(app.note(view.note.id).unwrap().note.text, view.note.text);
+        // The same native field in the custom-fence modal must not collapse to
+        // the few visible lines in the reported screenshot.
+        let range = context
+            .blocks
+            .last()
+            .unwrap()
+            .origin
+            .as_ref()
+            .unwrap()
+            .bytes
+            .clone();
+        assert!(draft.choose_range(Some(range)));
+        assert!(draft.inline_block().is_none());
+        let mut height = 0.0;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.allocate_ui(egui::vec2(650.0, 0.0), |ui| {
+                    let start = ui.cursor().min.y;
+                    source_editor(ui, &mut draft, view.note.id, false, false, 360.0);
+                    height = ui.min_rect().bottom() - start;
+                });
+            });
+        });
+        assert!(height >= 360.0, "source field collapsed: {height}");
+    }
+
     #[test]
     fn settings_are_latched_and_superseded_capture_is_rejected() {
         let mut app = crate::App::new();
@@ -388,7 +701,9 @@ mod tests {
         // Visible edits have not been applied: the captured native config must win.
         processing.update(&ctx, &view);
         assert!(processing.error.is_none());
-        assert!(processing.jobs.is_busy() || processing.result.is_some());
+        assert!(
+            processing.jobs.is_busy() || processing.staged.is_some() || processing.result.is_some()
+        );
         assert!(matches!(
             processing.config(),
             Ok(ProcessingConfig::NativeIllustrations)
@@ -403,5 +718,122 @@ mod tests {
         assert!(processing.requested.is_none());
         assert!(processing.result.is_none());
         assert!(processing.config().is_err());
+        let (fallback_source, fallback) = processing
+            .fallback(&view)
+            .expect("accepted original source remains readable before a successful process");
+        assert_eq!(fallback_source, view.note.text);
+        assert!(
+            fallback
+                .blocks
+                .iter()
+                .any(|block| matches!(block.kind, crate::markdown::BlockKind::Paragraph))
+        );
+        assert!(
+            fallback
+                .blocks
+                .iter()
+                .all(|block| block
+                    .origin
+                    .as_ref()
+                    .is_some_and(|origin| origin.note == key.0
+                        && origin.revision == key.1
+                        && valid_range(fallback_source, &origin.bytes)))
+        );
+        assert!(processing.result.is_none());
+
+        let document = ProcessedDocument {
+            source: view.note.text.clone(),
+            logical_path: view.note.path.clone(),
+            resources: Vec::new(),
+            semantic: None,
+            figures: Vec::new(),
+        };
+        let mut retained = Processing {
+            requested: Some(key),
+            result: Some((key.0, key.1, document)),
+            native: Some(crate::markdown::read(key.0, key.1, &view.note.text)),
+            ..Default::default()
+        };
+        assert!(retained.bindings_current(&view));
+        retained.request_refresh();
+        assert!(retained.result.is_some() && retained.native.is_some());
+        assert!(!retained.bindings_current(&view));
+        retained.update(&ctx, &view);
+        assert!(retained.result.is_some() && retained.native.is_some());
+        assert!(!retained.bindings_current(&view));
+        retained.error = Some("replacement processing failed".into());
+        assert!(retained.result.is_some());
+        assert!(!retained.bindings_current(&view));
+
+        // This is valid saved PNG artwork inside the core's 32M-pixel envelope,
+        // but beyond the deliberately smaller 4M preview decoding quota.
+        let mut png_bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut png_bytes, 2100, 2000);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer
+                .write_image_data(&vec![255; 2100 * 2000 * 3])
+                .unwrap();
+            writer.finish().unwrap();
+        }
+        let mut decoding = Processing {
+            requested: Some(key),
+            result: Some((
+                key.0,
+                key.1,
+                ProcessedDocument {
+                    source: view.note.text.clone(),
+                    logical_path: "last-good.md".into(),
+                    resources: Vec::new(),
+                    semantic: None,
+                    figures: Vec::new(),
+                },
+            )),
+            native: Some(crate::markdown::read(key.0, key.1, &view.note.text)),
+            ..Default::default()
+        };
+        let replacement = ProcessedDocument {
+            source: view.note.text.clone(),
+            logical_path: "new.md".into(),
+            resources: vec![AssetFile {
+                relative_path: "image.png".into(),
+                bytes: png_bytes,
+            }],
+            semantic: None,
+            figures: vec![crate::illustration::PreparedFigure {
+                id: "fig-new".into(),
+                kind: crate::illustration::ArtworkKind::Comic,
+                caption: "New caption".into(),
+                description: "New artwork".into(),
+                width_mm: None,
+                source_bytes: 0..view.note.text.len(),
+                asset_path: "image.png".into(),
+                asset_sha256: String::new(),
+                dimensions: [2100.0, 2000.0],
+            }],
+        };
+        decoding.stage_document(&ctx, key, 1, replacement);
+        assert!(!decoding.bindings_current(&view));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while decoding.staged.is_some() {
+            decoding.finish_staged(&ctx, &view);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            decoding
+                .error_details()
+                .unwrap()
+                .contains("preview pixel limit")
+        );
+        assert_eq!(
+            decoding.result.as_ref().unwrap().2.logical_path,
+            "last-good.md"
+        );
+        assert!(decoding.native.is_some());
+        assert!(decoding.artwork.error().is_none()); // Failed staging never replaced the live cache.
+        assert!(!decoding.bindings_current(&view));
     }
 }

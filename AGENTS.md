@@ -8,6 +8,12 @@
 - Prefer a single Rust package, standalone ECS, egui direct-style rendering, explicit shared commands, and small concrete modules. Command implementation and GUI exposure are independent.
 - Filters transform derived views; source changes use revision-checked commands. MCP, optional D-Bus, AI, and future plugin actions share domain validation and dispatch.
 
+## Approved GUI direction
+
+- The user-approved UI reference is `docs/design/tanglewood-quiet-desktop.html`; implementation rules are in `docs/plans/2026-10-26-approved-egui-shell.md`. Read them before GUI work.
+- Preserve its Codex-inspired quiet rail/sidebar/header, centered document and contextual source editing. Prefer frameless icons with tooltips/accessibility labels; secondary actions live in menus/settings.
+- Do not reintroduce always-visible numbered block-edit lists, processing/debug configuration, rename/trash forms, metadata explanations or routine status rows into the document surface. Validate visible results against the approved reference, not compilation alone.
+
 ## Codex roles
 
 | Role | Model | Reasoning | Instructions |

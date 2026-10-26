@@ -11,6 +11,7 @@ pub(super) struct Draft {
     pub(super) composing: bool,
     pub(super) range: Option<Range<usize>>,
     pub(super) highlight: Option<(String, bool, eframe::egui::text::LayoutJob)>,
+    pub(super) context: std::sync::Arc<crate::markdown::Document>,
 }
 
 impl Draft {
@@ -24,6 +25,11 @@ impl Draft {
             composing: false,
             range: None,
             highlight: None,
+            context: std::sync::Arc::new(crate::markdown::read(
+                view.note.id,
+                view.note.revision,
+                &view.note.text,
+            )),
         }
     }
     pub(super) fn dirty(&self) -> bool {
@@ -48,6 +54,19 @@ impl Draft {
         self.widget_generation += 1;
         self.highlight = None;
         true
+    }
+    /// Only an exact original top-level block has an in-place editing slot.
+    /// Custom fences need more room than their rendered illustration/callout.
+    pub(super) fn inline_block(&self) -> Option<&crate::markdown::RenderBlock> {
+        let range = self.range.as_ref()?;
+        self.context.blocks.iter().find(|block| {
+            block
+                .origin
+                .as_ref()
+                .is_some_and(|origin| origin.bytes == *range)
+                && !matches!(&block.kind, crate::markdown::BlockKind::Fence(fence)
+                    if !fence.attributes.classes.is_empty() || !fence.attributes.values.is_empty())
+        })
     }
     pub(super) fn edit(&self) -> Option<TextEdit> {
         if !self.dirty() || self.conflict || self.composing {
@@ -83,6 +102,155 @@ impl Draft {
         }
         self.highlight.as_ref().unwrap().2.clone()
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum EditorAction {
+    Ready,
+    Cancel,
+}
+
+/// One native field and one action row in every presentation. Domain acceptance,
+/// cancellation and widget retirement remain owned by the shell.
+pub(super) fn source_editor(
+    ui: &mut eframe::egui::Ui,
+    draft: &mut Draft,
+    note: crate::notes::NoteId,
+    trashed: bool,
+    inline: bool,
+    height: f32,
+) -> Option<EditorAction> {
+    use eframe::egui;
+    let ctx = ui.ctx().clone();
+    let source_id = egui::Id::new(("source", note.0, draft.widget_generation));
+    #[cfg(target_os = "android")]
+    {
+        let change = crate::android_input::before(&ctx, source_id, &mut draft.text);
+        if change.active {
+            draft.composing = change.composing;
+        }
+        draft.conflict |= change.conflict;
+    }
+    let job = if inline {
+        let size = draft.inline_block().map_or(15.5, |block| match block.kind {
+            crate::markdown::BlockKind::Heading(1) => 28.0,
+            crate::markdown::BlockKind::Heading(2) => 23.0,
+            crate::markdown::BlockKind::Heading(_) => 19.0,
+            _ => 15.5,
+        });
+        let mut job = egui::text::LayoutJob::simple(
+            draft.text.clone(),
+            egui::FontId::proportional(size),
+            ui.visuals().text_color(),
+            ui.available_width(),
+        );
+        for section in &mut job.sections {
+            section.format.line_height = Some((size * 1.3).max(27.0));
+        }
+        job
+    } else {
+        draft.layout(&ctx)
+    };
+    let mut measured = job.clone();
+    measured.wrap.max_width = (ui.available_width() - if inline { 0.0 } else { 24.0 }).max(1.0);
+    let field_height = if inline {
+        ui.fonts_mut(|fonts| fonts.layout_job(measured))
+            .size()
+            .y
+            .max(28.0)
+            .min(height)
+    } else {
+        height
+    };
+    let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, width: f32| {
+        let mut layout = if job.text == text.as_str() {
+            job.clone()
+        } else {
+            let format = job
+                .sections
+                .first()
+                .map(|section| section.format.clone())
+                .unwrap_or_default();
+            let mut changed = egui::text::LayoutJob::default();
+            changed.append(text.as_str(), 0.0, format);
+            changed
+        };
+        layout.wrap.max_width = width;
+        ui.fonts_mut(|fonts| fonts.layout_job(layout))
+    };
+    // Allocate a real field height: a max-height alone inside the document's
+    // zero-height layout allocation can otherwise collapse to a few clipped lines.
+    let output = egui::ScrollArea::vertical()
+        .id_salt(("active-source", source_id))
+        .max_height(height)
+        // Document blocks are measured from a zero-height child. Without an
+        // explicit viewport minimum, ScrollArea uses its 64-point fallback and
+        // clips even a correctly sized multiline TextEdit to three lines.
+        .min_scrolled_height(field_height)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            // A remote trash must not prevent selecting/copying a retained draft.
+            // Only Ready is disabled; local draft text is never canonical here.
+            egui::TextEdit::multiline(&mut draft.text)
+                .id(source_id)
+                .layouter(&mut layouter)
+                .frame(!inline)
+                .margin(if inline {
+                    egui::Vec2::ZERO
+                } else {
+                    egui::vec2(12.0, 12.0)
+                })
+                .min_size(egui::vec2(0.0, if inline { 28.0 } else { height }))
+                .desired_width(f32::INFINITY)
+                .desired_rows(1)
+                .show(ui)
+        })
+        .inner;
+    let focus_key = source_id.with("initial-focus");
+    if !ctx.data_mut(|data| data.get_temp::<bool>(focus_key).unwrap_or(false)) {
+        output.response.request_focus();
+        ctx.data_mut(|data| data.insert_temp(focus_key, true));
+    }
+    #[cfg(target_os = "android")]
+    crate::android_input::after(&ctx, &output, &draft.text);
+    if output.response.has_focus() {
+        ctx.input(|input| {
+            for event in &input.events {
+                match event {
+                    egui::Event::Ime(egui::ImeEvent::Preedit(text)) => {
+                        draft.composing = !text.is_empty()
+                    }
+                    egui::Event::Ime(egui::ImeEvent::Commit(_))
+                    | egui::Event::Ime(egui::ImeEvent::Disabled) => draft.composing = false,
+                    _ => {}
+                }
+            }
+        });
+    }
+    let mut action = None;
+    ui.horizontal(|ui| {
+        #[cfg(target_os = "android")]
+        crate::android_input::menu(ui);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if super::theme::button(
+                ui,
+                super::theme::Icon::Ready,
+                "Ready — accept changes",
+                !trashed && !draft.composing && !draft.conflict,
+            )
+            .clicked()
+            {
+                action = Some(EditorAction::Ready);
+            }
+            if super::theme::button(ui, super::theme::Icon::Cancel, "Cancel changes", true)
+                .clicked()
+            {
+                action = Some(EditorAction::Cancel);
+            }
+        });
+    });
+    ui.add_space(if inline { 12.0 } else { 0.0 });
+    action
 }
 
 /// Small contiguous edit with byte offsets that remain UTF-8 boundaries.
@@ -134,6 +302,7 @@ mod tests {
         let origin = document.blocks[1].origin.as_ref().unwrap();
         let (start, end) = (origin.bytes.start, origin.bytes.end);
         assert!(draft.choose_range(Some(start..end)));
+        assert!(draft.inline_block().is_some());
         draft.text = "β 🌲".into();
         assert_eq!(app.note(view.note.id).unwrap().note.text, view.note.text);
         assert!(!draft.choose_range(None));
