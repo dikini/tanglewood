@@ -10,9 +10,9 @@ This table describes implemented behavior separately from GUI exposure and runti
 | Markdown reader/filter/render contracts | Implemented derived views, source origins/fence attrs | Preview, internal links/backlinks | Native reader and callout example; external runner deferred | Fixture passed; independent review ready |
 | Markdown import/export/mirror | Local-only async commands; durable outbox/baselines/conflicts | Separate export status; CLI actions | Linux; Android picker still required | Recovery scenarios and real CLI import/rescan/export/restart passed; independent review ready |
 | Android input/lifecycle/storage | Pending | Pending | Tooling/device absent here | Gate open; see android-feasibility.md |
-| CRDT/LAN pairing/reconnect | Offline Automerge engine prepared; migration/transport pending | Pending | Optional sync engine; foreground Android and Linux transport still required | Replica Unicode/rename/tombstone/history scenario passed; no LAN claim |
+| CRDT/LAN pairing/reconnect | Authoritative migration/persistence and authenticated QUIC transport implemented; App network integration pending | Pending | Optional sync engine; foreground Android and Linux transport still required | Replica/migration/durable generation and transport scenarios passed; no integrated LAN claim |
 | MCP single-writer bridge | rmcp stdio -> private Unix socket -> App dispatch/durability | Optional owner attachment | Linux mcp; read-only default, explicit write allowlist | Socket policy/revision fixture and live stdio persisted create/restart passed; review ready |
-| Codex conversation/tools | Pending | Pending | Linux optional feature | Not verified |
+| Codex conversation/tools | App-server adapter, explicit approvals, cancel/disconnect | Streaming conversation panel | Linux optional codex feature, CLI 0.163.0 | Live scoped note tools/cancel/restart and panel responsiveness passed; see codex-live-evidence.md |
 | D-Bus / external filter process | Deferred optional tracks | None | Unavailable | No support claimed |
 
 Accepted in-memory mutations are not durable saves. A caller identity is constructed by the trusted adapter; request payloads cannot grant permission. Runtime gates remain open until their actual workflows run.

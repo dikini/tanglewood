@@ -23,6 +23,8 @@ pub enum StoreError {
     Locked,
     #[error("persistence worker disconnected")]
     Disconnected,
+    #[error("capability unavailable: {0}")]
+    Unavailable(String),
 }
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MirrorConflict {
@@ -34,6 +36,8 @@ pub struct MirrorConflict {
 }
 #[derive(Default)]
 pub struct StoreStartup {
+    #[cfg(feature = "sync")]
+    pub history: Option<crate::sync::HistoryBundle>,
     pub notes: Vec<NoteRecord>,
     pub mirror_enabled: bool,
     pub baselines: HashMap<NoteId, ExportBaseline>,
@@ -50,6 +54,17 @@ pub struct SaveAck {
 }
 #[derive(Debug)]
 pub enum StoreEvent {
+    #[cfg(feature = "sync")]
+    Migrated {
+        request_id: Uuid,
+        result: Result<String, String>,
+    },
+    #[cfg(feature = "sync")]
+    HistorySaved {
+        generation: u64,
+        notes: Vec<NoteRecord>,
+        result: Result<bool, String>,
+    },
     Saved(SaveAck),
     Configured {
         request_id: Uuid,
@@ -69,6 +84,19 @@ pub enum StoreEvent {
 }
 #[derive(Debug)]
 pub enum StoreRequest {
+    #[cfg(feature = "sync")]
+    Migrate {
+        request_id: Uuid,
+        history: crate::sync::HistoryBundle,
+        notes: Vec<NoteRecord>,
+    },
+    #[cfg(feature = "sync")]
+    SaveHistory {
+        generation: u64,
+        history: crate::sync::HistoryBundle,
+        notes: Vec<NoteRecord>,
+        conflicts: Vec<(NoteId, crate::sync::MergeConflicts)>,
+    },
     Configure {
         request_id: Uuid,
         enabled: bool,
@@ -162,6 +190,32 @@ impl Store {
                         }
                         Job::Control(request) => {
                             let event = match request {
+                                #[cfg(feature = "sync")]
+                                StoreRequest::Migrate {
+                                    request_id,
+                                    history,
+                                    notes,
+                                } => StoreEvent::Migrated {
+                                    request_id,
+                                    result: migrate(&mut connection, &database, &history, &notes)
+                                        .map_err(|error| error.to_string()),
+                                },
+                                #[cfg(feature = "sync")]
+                                StoreRequest::SaveHistory {
+                                    generation,
+                                    history,
+                                    notes,
+                                    conflicts,
+                                } => {
+                                    let result =
+                                        save_history(&mut connection, &history, &notes, &conflicts)
+                                            .map_err(|error| error.to_string());
+                                    StoreEvent::HistorySaved {
+                                        generation,
+                                        notes,
+                                        result,
+                                    }
+                                }
                                 StoreRequest::Configure {
                                     request_id,
                                     enabled,
@@ -307,6 +361,7 @@ fn storage(error: impl std::fmt::Display) -> StoreError {
 }
 fn initialize(path: &Path) -> Result<(Connection, StoreStartup), StoreError> {
     let connection = Connection::open(path).map_err(storage)?;
+    require_sync_support(&connection, cfg!(feature = "sync"))?;
     connection
         .pragma_update(None, "journal_mode", "WAL")
         .map_err(storage)?;
@@ -316,7 +371,7 @@ fn initialize(path: &Path) -> Result<(Connection, StoreStartup), StoreError> {
     let version: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(storage)?;
-    if version > 2 {
+    if version > 3 {
         return Err(StoreError::Storage(format!(
             "unsupported schema version {version}"
         )));
@@ -328,8 +383,15 @@ INSERT OR IGNORE INTO settings VALUES('mirror_enabled',0);
 CREATE TABLE IF NOT EXISTS export_baselines(note_id TEXT PRIMARY KEY,path TEXT NOT NULL,text TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS pending_exports(id TEXT PRIMARY KEY,path TEXT NOT NULL,text TEXT NOT NULL,revision TEXT NOT NULL,trashed INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS mirror_conflicts(conflict_id INTEGER PRIMARY KEY,note_id TEXT NOT NULL,path TEXT NOT NULL,revision TEXT NOT NULL,database_text TEXT NOT NULL,note_path TEXT NOT NULL,trashed INTEGER NOT NULL,external_text TEXT,kind TEXT NOT NULL);
-PRAGMA user_version=2;COMMIT;").map_err(storage)?;
+COMMIT;").map_err(storage)?;
+    if version < 2 {
+        connection
+            .pragma_update(None, "user_version", 2)
+            .map_err(storage)?;
+    }
     let mut state = StoreStartup {
+        #[cfg(feature = "sync")]
+        history: load_history(&connection).map_err(storage)?,
         notes: load_notes(&connection, "notes").map_err(storage)?,
         pending: load_notes(&connection, "pending_exports").map_err(storage)?,
         mirror_enabled: enabled(&connection).map_err(storage)?,
@@ -427,8 +489,19 @@ fn enabled(connection: &Connection) -> rusqlite::Result<bool> {
     )
 }
 fn save(connection: &mut Connection, notes: &[NoteRecord]) -> rusqlite::Result<bool> {
+    if has_history(connection)? {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
     let transaction = connection.transaction()?;
-    let mirror = enabled(&transaction)?;
+    let mirror = write_notes(&transaction, notes)?;
+    transaction.commit()?;
+    Ok(mirror)
+}
+fn write_notes(
+    transaction: &rusqlite::Transaction<'_>,
+    notes: &[NoteRecord],
+) -> rusqlite::Result<bool> {
+    let mirror = enabled(transaction)?;
     for note in notes {
         transaction.execute(
             "UPDATE notes SET path=?1 WHERE id=?2",
@@ -444,7 +517,6 @@ fn save(connection: &mut Connection, notes: &[NoteRecord]) -> rusqlite::Result<b
             transaction.execute("INSERT INTO pending_exports(id,path,text,revision,trashed) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET path=excluded.path,text=excluded.text,revision=excluded.revision,trashed=excluded.trashed",params![note.id.0.to_string(),note.path,note.text,note.revision.0.to_string(),note.trashed])?;
         }
     }
-    transaction.commit()?;
     Ok(mirror)
 }
 fn configure(connection: &mut Connection, on: bool) -> rusqlite::Result<Vec<NoteRecord>> {
@@ -493,6 +565,164 @@ fn record_conflict(
     connection.execute("INSERT INTO mirror_conflicts(note_id,path,revision,database_text,trashed,external_text,kind,note_path) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![conflict.note.id.0.to_string(),conflict.path,conflict.note.revision.0.to_string(),conflict.note.text,conflict.note.trashed,conflict.external,conflict.kind,conflict.note.path])?;
     Ok(connection.last_insert_rowid())
 }
+fn has_history(connection: &Connection) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='sync_meta')",
+        [],
+        |row| row.get(0),
+    )
+}
+fn require_sync_support(connection: &Connection, supported: bool) -> Result<(), StoreError> {
+    if !supported && has_history(connection).map_err(storage)? {
+        return Err(StoreError::Unavailable(
+            "vault requires CRDT support".into(),
+        ));
+    }
+    Ok(())
+}
+#[cfg(feature = "sync")]
+fn load_history(connection: &Connection) -> rusqlite::Result<Option<crate::sync::HistoryBundle>> {
+    if !has_history(connection)? {
+        return Ok(None);
+    }
+    let (version, vault, device, catalog): (u32, String, String, Vec<u8>) = connection.query_row(
+        "SELECT history_version,vault_id,device_id,catalog FROM sync_meta WHERE singleton=1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    let parse = |value: &str| {
+        Uuid::parse_str(value).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })
+    };
+    let mut statement =
+        connection.prepare("SELECT note_id,history FROM sync_documents ORDER BY note_id")?;
+    let documents = statement
+        .query_map([], |row| {
+            let id: String = row.get(0)?;
+            Ok(crate::sync::DocumentHistory {
+                id: NoteId(parse(&id)?),
+                bytes: row.get(1)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(crate::sync::HistoryBundle {
+        version,
+        vault_id: parse(&vault)?,
+        device_id: parse(&device)?,
+        catalog,
+        documents,
+    }))
+}
+#[cfg(feature = "sync")]
+fn write_history(
+    transaction: &rusqlite::Transaction<'_>,
+    history: &crate::sync::HistoryBundle,
+    conflicts: &[(NoteId, crate::sync::MergeConflicts)],
+) -> Result<(), StoreError> {
+    transaction.execute("UPDATE sync_meta SET history_version=?1,vault_id=?2,device_id=?3,catalog=?4 WHERE singleton=1",params![history.version,history.vault_id.to_string(),history.device_id.to_string(),history.catalog]).map_err(storage)?;
+    for document in &history.documents {
+        transaction.execute("INSERT INTO sync_documents(note_id,history) VALUES(?1,?2) ON CONFLICT(note_id) DO UPDATE SET history=excluded.history",params![document.id.0.to_string(),document.bytes]).map_err(storage)?;
+    }
+    transaction
+        .execute("DELETE FROM sync_conflicts", [])
+        .map_err(storage)?;
+    for (id, metadata) in conflicts {
+        let bytes = serde_json::to_vec(metadata).map_err(storage)?;
+        transaction
+            .execute(
+                "INSERT INTO sync_conflicts(note_id,metadata) VALUES(?1,?2)",
+                params![id.0.to_string(), bytes],
+            )
+            .map_err(storage)?;
+    }
+    Ok(())
+}
+#[cfg(feature = "sync")]
+fn migrate(
+    connection: &mut Connection,
+    database: &Path,
+    history: &crate::sync::HistoryBundle,
+    notes: &[NoteRecord],
+) -> Result<String, StoreError> {
+    if has_history(connection).map_err(storage)? {
+        return Err(StoreError::Storage("vault already migrated".into()));
+    }
+    let mut current = load_notes(connection, "notes").map_err(storage)?;
+    let mut supplied = notes.to_vec();
+    current.sort_by_key(|note| note.id.0);
+    supplied.sort_by_key(|note| note.id.0);
+    if current != supplied {
+        return Err(StoreError::Storage("migration source changed".into()));
+    }
+    let backup = database
+        .parent()
+        .ok_or_else(|| StoreError::Storage("vault directory missing".into()))?
+        .join(format!("pre-crdt-{}.sqlite3", Uuid::new_v4()));
+    // Reserve a fresh path without ever replacing an existing recovery copy.
+    // VACUUM INTO accepts this empty file, which was created exclusively here.
+    drop(
+        OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&backup)
+            .map_err(storage)?,
+    );
+    connection
+        .execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])
+        .map_err(storage)?;
+    File::open(&backup)
+        .and_then(|file| file.sync_all())
+        .map_err(storage)?;
+    File::open(backup.parent().unwrap())
+        .and_then(|file| file.sync_all())
+        .map_err(storage)?;
+    let transaction = connection.transaction().map_err(storage)?;
+    transaction.execute_batch("CREATE TABLE sync_meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1),history_version INTEGER NOT NULL,vault_id TEXT NOT NULL,device_id TEXT NOT NULL,catalog BLOB NOT NULL,backup_path TEXT NOT NULL);CREATE TABLE sync_documents(note_id TEXT PRIMARY KEY NOT NULL,history BLOB NOT NULL);CREATE TABLE sync_conflicts(note_id TEXT PRIMARY KEY NOT NULL,metadata BLOB NOT NULL);").map_err(storage)?;
+    transaction
+        .execute(
+            "INSERT INTO sync_meta VALUES(1,?1,?2,?3,?4,?5)",
+            params![
+                history.version,
+                history.vault_id.to_string(),
+                history.device_id.to_string(),
+                history.catalog,
+                backup.to_string_lossy()
+            ],
+        )
+        .map_err(storage)?;
+    write_history(&transaction, history, &[])?;
+    write_notes(&transaction, notes).map_err(storage)?;
+    transaction
+        .pragma_update(None, "user_version", 3)
+        .map_err(storage)?;
+    transaction.commit().map_err(storage)?;
+    Ok(backup.to_string_lossy().into())
+}
+#[cfg(feature = "sync")]
+fn save_history(
+    connection: &mut Connection,
+    history: &crate::sync::HistoryBundle,
+    notes: &[NoteRecord],
+    conflicts: &[(NoteId, crate::sync::MergeConflicts)],
+) -> Result<bool, StoreError> {
+    let durable = load_history(connection)
+        .map_err(storage)?
+        .ok_or_else(|| StoreError::Storage("vault not migrated".into()))?;
+    if durable.vault_id != history.vault_id || durable.device_id != history.device_id {
+        return Err(StoreError::Storage("history identity changed".into()));
+    }
+    let transaction = connection.transaction().map_err(storage)?;
+    let mirror = write_notes(&transaction, notes).map_err(storage)?;
+    write_history(&transaction, history, conflicts)?;
+    transaction.commit().map_err(storage)?;
+    Ok(mirror)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

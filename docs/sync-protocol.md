@@ -1,6 +1,6 @@
 # Offline merge engine and integration contract
 
-The isolated engine in `src/sync.rs` is preparatory Y3a work. It is not integrated into App or SQLite yet and does not complete the sync delivery gate. There is no network transport, pairing UI, migration, or advertised sync command.
+The offline engine in `src/sync.rs` now integrates with App and SQLite through explicit local EnableSync migration. Histories become authoritative only after its durable acknowledgement. See [CRDT migration](crdt-migration.md) for backup, persistence and feature compatibility. Authenticated transport, pairing UI and live two-device evidence remain open.
 
 ## Histories and identities
 
@@ -24,4 +24,4 @@ App integration must compare projected state with its accepted record, generate 
 
 ## Remaining integration
 
-A later task must create a recoverable pre-migration SQLite backup, transactionally seed histories/identities for existing UUID notes, load/save histories in the worker, route current commands through engine operations, and persist remote histories/projections before durable acknowledgement. Only then can authenticated QUIC transport and pairing be implemented. Offline engine convergence is not evidence for network, filesystem, Android, or live two-device readiness.
+The local integration creates a pre-migration SQLite backup, transactionally seeds histories/identities for existing UUID notes, loads/saves opaque histories on the worker, and routes current source commands through owner-held engine operations. The private remote merge hook returns an accepted generation; only the persisted generation and durable history snapshot may drive future transport acknowledgements. Authenticated QUIC transport and pairing are the next gate. Offline engine convergence is not evidence for network, filesystem, Android, or live two-device readiness.

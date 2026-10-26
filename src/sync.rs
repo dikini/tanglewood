@@ -36,7 +36,7 @@ pub struct HistoryBundle {
     pub catalog: Vec<u8>,
     pub documents: Vec<DocumentHistory>,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeConflicts {
     pub paths: Vec<String>,
     pub tombstones: Vec<bool>,

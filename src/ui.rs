@@ -34,6 +34,8 @@ pub struct TanglewoodUi {
     closing: bool,
     #[cfg(all(target_os = "linux", feature = "mcp"))]
     mcp: Option<crate::mcp::OwnerSocket>,
+    #[cfg(all(target_os = "linux", feature = "codex"))]
+    conversation: Option<ConversationPanel>,
 }
 
 impl TanglewoodUi {
@@ -53,12 +55,20 @@ impl TanglewoodUi {
             closing: false,
             #[cfg(all(target_os = "linux", feature = "mcp"))]
             mcp: None,
+            #[cfg(all(target_os = "linux", feature = "codex"))]
+            conversation: None,
         }
     }
 
     #[cfg(all(target_os = "linux", feature = "mcp"))]
     pub fn with_mcp(mut self, socket: crate::mcp::OwnerSocket) -> Self {
         self.mcp = Some(socket);
+        self
+    }
+
+    #[cfg(all(target_os = "linux", feature = "codex"))]
+    pub fn with_codex(mut self, config: crate::codex::CodexConfig) -> Self {
+        self.conversation = Some(ConversationPanel::new(config));
         self
     }
 
@@ -160,6 +170,10 @@ impl eframe::App for TanglewoodUi {
                 ctx.request_repaint_after(std::time::Duration::from_millis(20));
             }
         }
+        #[cfg(all(target_os = "linux", feature = "codex"))]
+        if let Some(panel) = &mut self.conversation {
+            panel.poll(ctx);
+        }
         let notes = self.app.notes();
         self.refresh(&notes);
         if self.selected.is_none() {
@@ -183,6 +197,10 @@ impl eframe::App for TanglewoodUi {
                 ui.heading("Tanglewood");
                 ui.toggle_value(&mut self.show_notes, "Notes");
                 ui.checkbox(&mut self.show_preview, "Preview");
+                #[cfg(all(target_os = "linux", feature = "codex"))]
+                if let Some(panel) = &mut self.conversation {
+                    ui.toggle_value(&mut panel.visible, "Codex");
+                }
                 if ui.button("Save now").clicked() {
                     retry = true;
                 }
@@ -194,6 +212,15 @@ impl eframe::App for TanglewoodUi {
                 ui.colored_label(egui::Color32::LIGHT_RED, error);
             }
         });
+        #[cfg(all(target_os = "linux", feature = "codex"))]
+        if let Some(panel) = &mut self.conversation {
+            if panel.visible {
+                egui::SidePanel::right("codex-conversation")
+                    .resizable(true)
+                    .default_width(360.0)
+                    .show(ctx, |ui| panel.show(ui, ctx));
+            }
+        }
         if self.show_notes {
             egui::SidePanel::left("notes")
                 .resizable(true)
@@ -348,8 +375,20 @@ impl eframe::App for TanglewoodUi {
             .drafts
             .values()
             .any(|draft| draft.text != draft.base_text || draft.composing);
+        #[allow(unused_mut)]
+        let mut conversation_pending = false;
+        #[cfg(all(target_os = "linux", feature = "codex"))]
         if self.closing {
-            if pending || local_drafts {
+            if let Some(panel) = &mut self.conversation {
+                panel.disconnect();
+                conversation_pending = panel.adapter.is_some();
+                if conversation_pending {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(20));
+                }
+            }
+        }
+        if self.closing {
+            if pending || local_drafts || conversation_pending {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 let failures: Vec<_> = current
                     .iter()
@@ -370,6 +409,9 @@ impl eframe::App for TanglewoodUi {
                 };
                 if local_drafts {
                     status.push_str(" A local draft is not accepted; preserve it or adopt the current note first.");
+                }
+                if conversation_pending {
+                    status.push_str(" Waiting for Codex to disconnect.");
                 }
                 self.error = Some(status);
             } else {
@@ -572,5 +614,424 @@ mod tests {
             (edit.start, edit.end, edit.replacement.as_str()),
             (1, 3, "ê")
         );
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "codex"))]
+use crate::codex::{ApprovalDecision, CodexAdapter, CodexConfig, CodexEvent, CodexRequest};
+
+#[cfg(all(target_os = "linux", feature = "codex"))]
+struct ConversationMessage {
+    role: &'static str,
+    key: Option<(String, String, String)>,
+    text: String,
+}
+#[cfg(all(target_os = "linux", feature = "codex"))]
+struct ConversationApproval {
+    id: serde_json::Value,
+    thread: String,
+    turn: String,
+    method: String,
+    details: String,
+    decisions: Vec<ApprovalDecision>,
+}
+#[cfg(all(target_os = "linux", feature = "codex"))]
+struct ConversationPanel {
+    config: CodexConfig,
+    adapter: Option<CodexAdapter>,
+    visible: bool,
+    ready: bool,
+    starting: bool,
+    active_turn: Option<String>,
+    thread: Option<String>,
+    disconnecting: bool,
+    prompt: String,
+    messages: Vec<ConversationMessage>,
+    approvals: Vec<ConversationApproval>,
+    status: String,
+    error: Option<String>,
+}
+#[cfg(all(target_os = "linux", feature = "codex"))]
+impl ConversationPanel {
+    const BYTE_LIMIT: usize = 2 * 1024 * 1024;
+    fn new(config: CodexConfig) -> Self {
+        Self {
+            config,
+            adapter: None,
+            visible: true,
+            ready: false,
+            starting: false,
+            active_turn: None,
+            thread: None,
+            disconnecting: false,
+            prompt: String::new(),
+            messages: Vec::new(),
+            approvals: Vec::new(),
+            status: "Disconnected".into(),
+            error: None,
+        }
+    }
+    fn busy(&self) -> bool {
+        self.starting || self.active_turn.is_some()
+    }
+    fn bytes(&self) -> usize {
+        self.messages
+            .iter()
+            .map(|message| {
+                message.text.len()
+                    + message.key.as_ref().map_or(0, |(thread, turn, item)| {
+                        thread.len() + turn.len() + item.len()
+                    })
+            })
+            .sum::<usize>()
+            + self
+                .approvals
+                .iter()
+                .map(|approval| {
+                    approval.details.len()
+                        + approval.thread.len()
+                        + approval.turn.len()
+                        + approval.method.len()
+                        + approval.id.to_string().len()
+                })
+                .sum::<usize>()
+    }
+    fn disconnect(&mut self) {
+        if self.disconnecting {
+            return;
+        }
+        if let Some(adapter) = &self.adapter {
+            match adapter.try_send(CodexRequest::Disconnect) {
+                Ok(()) => {
+                    self.disconnecting = true;
+                    self.status = "Disconnecting…".into();
+                }
+                Err(error) => self.error = Some(error),
+            }
+        }
+    }
+    fn limit_exceeded(&mut self) {
+        self.error=Some("Conversation display limit reached. Disconnecting; additional output is not displayed. Clear the conversation before reconnecting.".into());
+        self.disconnect();
+    }
+    fn message(&mut self, key: (String, String, String), text: String, replace: bool) {
+        let existing = self
+            .messages
+            .iter()
+            .position(|message| message.key.as_ref() == Some(&key));
+        let previous = existing.map_or(0, |index| {
+            if replace {
+                self.messages[index].text.len()
+            } else {
+                0
+            }
+        });
+        if self.bytes().saturating_sub(previous)
+            + text.len()
+            + key.0.len()
+            + key.1.len()
+            + key.2.len()
+            > Self::BYTE_LIMIT
+            || (existing.is_none() && self.messages.len() >= 256)
+        {
+            self.limit_exceeded();
+            return;
+        }
+        if let Some(index) = existing {
+            if replace {
+                self.messages[index].text = text;
+            } else {
+                self.messages[index].text.push_str(&text);
+            }
+        } else {
+            self.messages.push(ConversationMessage {
+                role: "Codex",
+                key: Some(key),
+                text,
+            });
+        }
+    }
+    fn poll(&mut self, ctx: &egui::Context) {
+        for _ in 0..64 {
+            let Some(event) = self.adapter.as_ref().and_then(CodexAdapter::try_recv) else {
+                return;
+            };
+            match event {
+                CodexEvent::Connecting => self.status = "Connecting…".into(),
+                CodexEvent::Ready { thread } => {
+                    self.thread = Some(thread.clone());
+                    self.config.resume_thread = Some(thread);
+                    self.ready = true;
+                    self.status = "Ready".into();
+                }
+                CodexEvent::TurnStarted { thread, turn } => {
+                    self.thread = Some(thread);
+                    self.starting = false;
+                    self.active_turn = Some(turn);
+                    self.status = "Streaming…".into();
+                }
+                CodexEvent::Delta {
+                    thread,
+                    turn,
+                    item,
+                    text,
+                } => self.message((thread, turn, item), text, false),
+                CodexEvent::MessageComplete {
+                    thread,
+                    turn,
+                    item,
+                    text,
+                } => self.message((thread, turn, item), text, true),
+                CodexEvent::TurnCompleted {
+                    thread,
+                    turn,
+                    status,
+                } => {
+                    if self.thread.as_ref() == Some(&thread)
+                        && self.active_turn.as_ref() == Some(&turn)
+                    {
+                        self.starting = false;
+                        self.active_turn = None;
+                        self.approvals.clear();
+                        self.status = format!("Turn {status}");
+                    }
+                }
+                CodexEvent::Approval {
+                    id,
+                    thread,
+                    turn,
+                    method,
+                    details,
+                    decisions,
+                } => {
+                    let details = details.to_string();
+                    if self.bytes()
+                        + details.len()
+                        + thread.len()
+                        + turn.len()
+                        + method.len()
+                        + id.to_string().len()
+                        > Self::BYTE_LIMIT
+                        || self.approvals.len() >= 16
+                    {
+                        self.limit_exceeded();
+                    } else {
+                        self.approvals.push(ConversationApproval {
+                            id,
+                            thread,
+                            turn,
+                            method,
+                            details,
+                            decisions,
+                        });
+                    }
+                }
+                CodexEvent::ApprovalResolved { id, thread } => self
+                    .approvals
+                    .retain(|approval| approval.id != id || approval.thread != thread),
+                CodexEvent::Error(error) => {
+                    self.error = Some(error);
+                    if self.active_turn.is_none() {
+                        self.starting = false;
+                    }
+                }
+                CodexEvent::Disconnected(error) => {
+                    // The worker reports this only after its child has been killed/reaped.
+                    self.adapter = None;
+                    self.ready = false;
+                    self.starting = false;
+                    self.active_turn = None;
+                    self.approvals.clear();
+                    self.disconnecting = false;
+                    self.status = "Disconnected".into();
+                    self.error = Some(match self.error.take() {
+                        Some(previous) if previous.starts_with("Conversation display limit") => {
+                            format!("{previous}\n{error}")
+                        }
+                        _ => error,
+                    });
+                    return;
+                }
+            }
+        }
+        ctx.request_repaint();
+    }
+    fn show(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.heading("Codex");
+        ui.label(&self.status);
+        if let Some(thread) = &self.thread {
+            ui.label("Thread (resume ID)");
+            ui.add(egui::Label::new(thread).selectable(true).wrap());
+        }
+        ui.horizontal_wrapped(|ui| {
+            if self.adapter.is_none()
+                && ui
+                    .button(if self.config.resume_thread.is_some() {
+                        "Reconnect / resume"
+                    } else {
+                        "Connect"
+                    })
+                    .clicked()
+            {
+                if self.bytes() >= Self::BYTE_LIMIT {
+                    self.error = Some("Clear the conversation before connecting.".into());
+                } else {
+                    let context = ctx.clone();
+                    match CodexAdapter::spawn(self.config.clone(), move || {
+                        context.request_repaint()
+                    }) {
+                        Ok(adapter) => {
+                            self.adapter = Some(adapter);
+                            self.status = "Connecting…".into();
+                            self.ready = false;
+                            self.disconnecting = false;
+                            self.error = None;
+                        }
+                        Err(error) => self.error = Some(error.to_string()),
+                    }
+                }
+            }
+            if self.adapter.is_some()
+                && ui
+                    .add_enabled(!self.disconnecting, egui::Button::new("Disconnect"))
+                    .clicked()
+            {
+                self.disconnect();
+            }
+            if !self.busy()
+                && self.approvals.is_empty()
+                && ui.button("Clear displayed messages").clicked()
+            {
+                self.messages.clear();
+                self.error = None;
+            }
+            if self.adapter.is_none() && ui.button("New thread").clicked() {
+                self.config.resume_thread = None;
+                self.thread = None;
+                self.messages.clear();
+                self.error = None;
+                self.status = "Disconnected — new thread on Connect".into();
+            }
+        });
+        if let Some(error) = &self.error {
+            ui.colored_label(egui::Color32::LIGHT_RED, error);
+        }
+        egui::ScrollArea::vertical()
+            .id_salt("codex-transcript")
+            .stick_to_bottom(true)
+            .max_height((ui.available_height() - 230.0).max(100.0))
+            .show(ui, |ui| {
+                for message in &self.messages {
+                    ui.strong(message.role);
+                    ui.add(egui::Label::new(&message.text).selectable(true).wrap());
+                    ui.separator();
+                }
+            });
+        let mut answer = None;
+        for approval in &self.approvals {
+            ui.group(|ui| {
+                ui.strong("Approval required");
+                ui.label(&approval.method);
+                egui::ScrollArea::vertical()
+                    .id_salt(("approval", approval.id.to_string()))
+                    .max_height(150.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(&approval.details).monospace())
+                                .selectable(true)
+                                .wrap(),
+                        );
+                    });
+                ui.horizontal_wrapped(|ui| {
+                    for decision in &approval.decisions {
+                        let label = match decision {
+                            ApprovalDecision::Accept => "Allow once",
+                            ApprovalDecision::Decline => "Decline",
+                            ApprovalDecision::Cancel
+                                if approval.method == "mcpServer/elicitation/request" =>
+                            {
+                                "Cancel request"
+                            }
+                            ApprovalDecision::Cancel => "Cancel turn",
+                        };
+                        if ui
+                            .add_enabled(!self.disconnecting, egui::Button::new(label))
+                            .clicked()
+                        {
+                            answer = Some((approval.id.clone(), *decision));
+                        }
+                    }
+                });
+            });
+        }
+        if let Some((id, decision)) = answer {
+            if let Some(adapter) = &self.adapter {
+                match adapter.try_send(CodexRequest::AnswerApproval {
+                    id: id.clone(),
+                    decision,
+                }) {
+                    Ok(()) => self.approvals.retain(|approval| approval.id != id),
+                    Err(error) => self.error = Some(error),
+                }
+            }
+        }
+        ui.separator();
+        ui.add(
+            egui::TextEdit::multiline(&mut self.prompt)
+                .hint_text("Message Codex")
+                .desired_rows(4)
+                .desired_width(f32::INFINITY)
+                .char_limit(256 * 1024),
+        );
+        if self.prompt.len() > 256 * 1024 {
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                "Prompt exceeds 256 KiB; shorten it before sending.",
+            );
+        }
+        ui.horizontal_wrapped(|ui| {
+            let can_send = self.ready
+                && !self.busy()
+                && !self.disconnecting
+                && !self.prompt.trim().is_empty()
+                && self.prompt.len() <= 256 * 1024;
+            if ui
+                .add_enabled(can_send, egui::Button::new("Send"))
+                .clicked()
+            {
+                if self.bytes() + self.prompt.len() > Self::BYTE_LIMIT || self.messages.len() >= 256
+                {
+                    self.limit_exceeded();
+                } else if let Some(adapter) = &self.adapter {
+                    match adapter.try_send(CodexRequest::SendPrompt(self.prompt.clone())) {
+                        Ok(()) => {
+                            self.messages.push(ConversationMessage {
+                                role: "You",
+                                key: None,
+                                text: std::mem::take(&mut self.prompt),
+                            });
+                            self.starting = true;
+                            self.status = "Starting turn…".into();
+                            self.error = None;
+                        }
+                        Err(error) => self.error = Some(error),
+                    }
+                }
+            }
+            if ui
+                .add_enabled(
+                    self.busy() && !self.disconnecting,
+                    egui::Button::new("Interrupt"),
+                )
+                .clicked()
+            {
+                if let Some(adapter) = &self.adapter {
+                    match adapter.try_send(CodexRequest::Interrupt) {
+                        Ok(()) => self.status = "Interrupt requested…".into(),
+                        Err(error) => self.error = Some(error),
+                    }
+                }
+            }
+        });
     }
 }

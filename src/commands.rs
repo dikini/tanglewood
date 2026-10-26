@@ -18,6 +18,7 @@ pub enum ImportDestination {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub enum Command {
+    EnableSync,
     SetMirrorEnabled {
         enabled: bool,
     },
@@ -68,7 +69,14 @@ pub struct CommandDescriptor {
     pub mutation: bool,
     pub local_only: bool,
 }
-const COMMANDS: [CommandDescriptor; 11] = [
+const COMMANDS: [CommandDescriptor; 12] = [
+    CommandDescriptor {
+        name: "sync.enable",
+        wire_variant: "EnableSync",
+        available: cfg!(feature = "sync"),
+        mutation: true,
+        local_only: true,
+    },
     CommandDescriptor {
         name: "note.create",
         wire_variant: "CreateNote",
@@ -157,17 +165,18 @@ impl CommandDescriptor {
 impl Command {
     pub fn descriptor(&self) -> CommandDescriptor {
         let index = match self {
-            Self::CreateNote { .. } => 0,
-            Self::ReadNote { .. } => 1,
-            Self::EditNote { .. } => 2,
-            Self::RenameNote { .. } => 3,
-            Self::TrashNote { .. } => 4,
-            Self::RestoreNote { .. } => 5,
-            Self::SearchNotes { .. } => 6,
-            Self::SetMirrorEnabled { .. } => 7,
-            Self::ImportMarkdown { .. } => 8,
-            Self::ExportMarkdown { .. } => 9,
-            Self::RescanMirror => 10,
+            Self::EnableSync => 0,
+            Self::CreateNote { .. } => 1,
+            Self::ReadNote { .. } => 2,
+            Self::EditNote { .. } => 3,
+            Self::RenameNote { .. } => 4,
+            Self::TrashNote { .. } => 5,
+            Self::RestoreNote { .. } => 6,
+            Self::SearchNotes { .. } => 7,
+            Self::SetMirrorEnabled { .. } => 8,
+            Self::ImportMarkdown { .. } => 9,
+            Self::ExportMarkdown { .. } => 10,
+            Self::RescanMirror => 11,
         };
         COMMANDS[index]
     }

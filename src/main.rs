@@ -14,6 +14,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut startup = Vec::new();
     let mut mcp_path = None;
     let mut mcp_write = false;
+    let mut codex_enabled = false;
+    let mut codex_cwd = None;
+    let mut codex_resume = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--vault" => {
@@ -28,6 +31,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 ))
             }
             "--mcp-write" => mcp_write = true,
+            "--codex" => codex_enabled = true,
+            "--codex-cwd" => {
+                codex_cwd = Some(PathBuf::from(
+                    args.next().ok_or("--codex-cwd needs a directory")?,
+                ))
+            }
+            "--codex-resume" => {
+                codex_resume = Some(args.next().ok_or("--codex-resume needs a thread ID")?)
+            }
             "--mirror" => {
                 startup.push(tanglewood::commands::Command::SetMirrorEnabled { enabled: true })
             }
@@ -35,6 +47,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 startup.push(tanglewood::commands::Command::SetMirrorEnabled { enabled: false })
             }
             "--rescan" => startup.push(tanglewood::commands::Command::RescanMirror),
+            "--enable-sync" => startup.push(tanglewood::commands::Command::EnableSync),
             "--import" => {
                 let source_path = args.next().ok_or("--import needs SOURCE and NOTE_PATH")?;
                 let path = args.next().ok_or("--import needs SOURCE and NOTE_PATH")?;
@@ -56,7 +69,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--help" | "-h" => {
                 println!(
-                    "tanglewood [--vault DIRECTORY] [--headless] [--mirror|--no-mirror] [--rescan] [--import SOURCE NOTE_PATH] [--export NOTE_UUID DESTINATION] [--mcp-socket SOCKET] [--mcp-write]\nHeadless mode opens the vault and lists note paths. Build with --features gui for the editor."
+                    "tanglewood [--vault DIRECTORY] [--headless] [--mirror|--no-mirror] [--rescan] [--enable-sync] [--import SOURCE NOTE_PATH] [--export NOTE_UUID DESTINATION] [--mcp-socket SOCKET] [--mcp-write] [--codex [--codex-cwd DIRECTORY] [--codex-resume THREAD]]\nHeadless mode opens the vault and lists note paths. Build with --features gui for the editor."
                 );
                 return Ok(());
             }
@@ -78,6 +91,38 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if mcp_write && mcp_path.is_none() {
         return Err("--mcp-write requires --mcp-socket".into());
     }
+    if codex_enabled
+        && (!cfg!(all(target_os = "linux", feature = "gui", feature = "codex"))
+            || headless
+            || mcp_path.is_none())
+    {
+        return Err(
+            "--codex needs Linux, --features gui,codex, a GUI session and --mcp-socket".into(),
+        );
+    }
+    if !codex_enabled && (codex_cwd.is_some() || codex_resume.is_some()) {
+        return Err("Codex options require --codex".into());
+    }
+    #[cfg(all(target_os = "linux", feature = "gui", feature = "codex"))]
+    let codex_config = if codex_enabled {
+        let cwd = match codex_cwd {
+            Some(path) => std::fs::canonicalize(path)?,
+            None => {
+                let directory = vault.join("codex-context");
+                std::fs::create_dir_all(&directory)?;
+                std::fs::canonicalize(directory)?
+            }
+        };
+        Some(tanglewood::codex::CodexConfig {
+            executable: PathBuf::from("codex"),
+            cwd,
+            mcp_bridge: std::env::current_exe()?.with_file_name("tanglewood-mcp"),
+            socket: std::path::absolute(mcp_path.as_ref().expect("validated MCP socket"))?,
+            resume_thread: codex_resume,
+        })
+    } else {
+        None
+    };
     let mut app = tanglewood::App::open(&vault)?;
     for command in startup {
         if let tanglewood::commands::CommandResult::Accepted { request_id } =
@@ -152,6 +197,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 #[cfg(all(target_os = "linux", feature = "mcp"))]
                 let editor = match owner {
                     Some(socket) => editor.with_mcp(socket),
+                    None => editor,
+                };
+                #[cfg(all(target_os = "linux", feature = "gui", feature = "codex"))]
+                let editor = match codex_config {
+                    Some(config) => editor.with_codex(config),
                     None => editor,
                 };
                 Ok(Box::new(editor))

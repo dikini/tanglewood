@@ -23,6 +23,14 @@ pub struct ExportStatus {
     pub pending: bool,
     pub error: Option<String>,
 }
+#[derive(Clone, Debug)]
+pub struct SyncStatus {
+    pub enabled: bool,
+    pub migrating: bool,
+    pub accepted_generation: u64,
+    pub persisted_generation: u64,
+    pub error: Option<String>,
+}
 enum PendingIo {
     Configure,
     Import(ImportDestination),
@@ -39,9 +47,33 @@ use std::{
 };
 use uuid::Uuid;
 
+#[cfg(feature = "sync")]
+struct Migration {
+    request_id: Uuid,
+    candidate: Option<crate::sync::Replica>,
+    remaining: VecDeque<NoteRecord>,
+    committing: bool,
+    history: Option<crate::sync::HistoryBundle>,
+}
 /// The application thread exclusively owns the ECS World.
 #[derive(Default)]
 pub struct App {
+    #[cfg(feature = "sync")]
+    replica: Option<crate::sync::Replica>,
+    #[cfg(feature = "sync")]
+    migration: Option<Migration>,
+    #[cfg(feature = "sync")]
+    generation: u64,
+    #[cfg(feature = "sync")]
+    persisted_generation: u64,
+    #[cfg(feature = "sync")]
+    history_inflight: Option<(u64, crate::sync::HistoryBundle)>,
+    #[cfg(feature = "sync")]
+    durable_history: Option<crate::sync::HistoryBundle>,
+    #[cfg(feature = "sync")]
+    history_error: Option<String>,
+    #[cfg(feature = "sync")]
+    sync_conflicts: HashMap<NoteId, crate::sync::MergeConflicts>,
     world: World,
     ids: HashMap<NoteId, Entity>,
     // Join file work before the following store releases the vault lock.
@@ -67,6 +99,8 @@ impl App {
     }
     pub fn open(directory: &Path) -> Result<Self, StoreError> {
         let (store, state) = Store::open_state(directory)?;
+        #[cfg(feature = "sync")]
+        let history = state.history.clone();
         let mut app = Self {
             store: Some(store),
             files: Some(
@@ -104,7 +138,224 @@ impl App {
                 .id();
             app.ids.insert(id, entity);
         }
+        #[cfg(feature = "sync")]
+        if let Some(history) = history {
+            let replica = crate::sync::Replica::load(&history)
+                .map_err(|error| StoreError::Storage(error.to_string()))?;
+            let projected = replica
+                .project()
+                .map_err(|error| StoreError::Storage(error.to_string()))?;
+            if projected.len() != app.ids.len()
+                || projected.iter().any(|note| {
+                    !app.note(note.id).is_ok_and(|view| {
+                        view.note.text == note.text
+                            && view.note.path == note.path
+                            && view.note.trashed == note.trashed
+                    })
+                })
+            {
+                return Err(StoreError::Storage(
+                    "CRDT projections disagree with stored records".into(),
+                ));
+            }
+            app.sync_conflicts = projected
+                .into_iter()
+                .map(|note| (note.id, note.conflicts))
+                .collect();
+            app.replica = Some(replica);
+            app.durable_history = Some(history);
+        }
         Ok(app)
+    }
+    pub fn sync_enabled(&self) -> bool {
+        #[cfg(feature = "sync")]
+        {
+            self.replica.is_some()
+        }
+        #[cfg(not(feature = "sync"))]
+        {
+            false
+        }
+    }
+    pub fn sync_status(&self) -> SyncStatus {
+        #[cfg(feature = "sync")]
+        {
+            SyncStatus {
+                enabled: self.replica.is_some(),
+                migrating: self.migration.is_some(),
+                accepted_generation: self.generation,
+                persisted_generation: self.persisted_generation,
+                error: self.history_error.clone(),
+            }
+        }
+        #[cfg(not(feature = "sync"))]
+        {
+            SyncStatus {
+                enabled: false,
+                migrating: false,
+                accepted_generation: 0,
+                persisted_generation: 0,
+                error: None,
+            }
+        }
+    }
+    #[cfg(feature = "sync")]
+    pub(crate) fn durable_history(&self) -> Option<&crate::sync::HistoryBundle> {
+        self.durable_history.as_ref()
+    }
+    #[cfg(feature = "sync")]
+    fn tick_migration(&mut self) {
+        let Some(mut migration) = self.migration.take() else {
+            return;
+        };
+        if migration.committing {
+            self.migration = Some(migration);
+            return;
+        }
+        if migration.candidate.is_none() {
+            if let Some(error) = self.notes().into_iter().find_map(|view| view.save.error) {
+                self.io_status
+                    .insert(migration.request_id, IoStatus::Failed(error));
+                return;
+            }
+            if !self.pending.is_empty() || !self.inflight.is_empty() {
+                self.migration = Some(migration);
+                return;
+            }
+            match crate::sync::Replica::bootstrap(&[]) {
+                Ok(candidate) => migration.candidate = Some(candidate),
+                Err(error) => {
+                    self.io_status
+                        .insert(migration.request_id, IoStatus::Failed(error.to_string()));
+                    return;
+                }
+            }
+            migration.remaining = self.notes().into_iter().map(|view| view.note).collect();
+        }
+        for _ in 0..8 {
+            let Some(note) = migration.remaining.pop_front() else {
+                break;
+            };
+            if let Err(error) = migration.candidate.as_mut().unwrap().insert(&note) {
+                self.io_status
+                    .insert(migration.request_id, IoStatus::Failed(error.to_string()));
+                return;
+            }
+        }
+        if migration.remaining.is_empty() {
+            let history = migration.candidate.as_mut().unwrap().save();
+            self.storage_jobs.push_back(StoreRequest::Migrate {
+                request_id: migration.request_id,
+                history: history.clone(),
+                notes: self.notes().into_iter().map(|view| view.note).collect(),
+            });
+            migration.history = Some(history);
+            migration.committing = true;
+        }
+        self.migration = Some(migration);
+    }
+    #[cfg(feature = "sync")]
+    fn tick_history(&mut self) {
+        if self.history_inflight.is_some()
+            || self.generation == self.persisted_generation
+            || self.history_error.is_some()
+        {
+            return;
+        }
+        let history = self.replica.as_mut().unwrap().save();
+        let notes: Vec<_> = self.pending.values().cloned().collect();
+        for note in self.pending.values() {
+            self.inflight.insert(note.id, note.revision);
+        }
+        self.pending.clear();
+        self.storage_jobs.push_back(StoreRequest::SaveHistory {
+            generation: self.generation,
+            history: history.clone(),
+            notes,
+            conflicts: self
+                .sync_conflicts
+                .iter()
+                .map(|(id, conflict)| (*id, conflict.clone()))
+                .collect(),
+        });
+        self.history_inflight = Some((self.generation, history));
+    }
+    #[cfg(feature = "sync")]
+    fn refresh_projection(&mut self) -> Result<(), CommandError> {
+        let Some(replica) = &self.replica else {
+            return Ok(());
+        };
+        let notes = replica
+            .project()
+            .map_err(|error| CommandError::Unavailable(error.to_string()))?;
+        for note in notes {
+            let metadata_changed = self.sync_conflicts.get(&note.id) != Some(&note.conflicts);
+            self.sync_conflicts.insert(note.id, note.conflicts);
+            if let Ok(mut view) = self.note(note.id) {
+                if metadata_changed
+                    || view.note.text != note.text
+                    || view.note.path != note.path
+                    || view.note.trashed != note.trashed
+                {
+                    view.note.text = note.text;
+                    view.note.path = note.path;
+                    view.note.trashed = note.trashed;
+                    view.note.revision = Revision::fresh();
+                    view.save.accepted = view.note.revision;
+                    view.save.error = None;
+                    self.world
+                        .entity_mut(self.ids[&note.id])
+                        .insert((view.note.clone(), view.save));
+                    self.pending.insert(note.id, view.note);
+                }
+            } else {
+                let revision = Revision::fresh();
+                let record = NoteRecord {
+                    id: note.id,
+                    path: note.path,
+                    text: note.text,
+                    trashed: note.trashed,
+                    revision,
+                };
+                let entity = self
+                    .world
+                    .spawn((
+                        record.clone(),
+                        SaveState {
+                            accepted: revision,
+                            persisted: None,
+                            error: None,
+                        },
+                    ))
+                    .id();
+                self.ids.insert(note.id, entity);
+                self.pending.insert(note.id, record);
+            }
+        }
+        Ok(())
+    }
+    /// Private owner input for a future authenticated adapter. The returned
+    /// generation is accepted only; durable receipt waits for persistence.
+    #[cfg(feature = "sync")]
+    pub(crate) fn merge_history(
+        &mut self,
+        history: &crate::sync::HistoryBundle,
+    ) -> Result<u64, CommandError> {
+        if self.migration.is_some() {
+            return Err(CommandError::Busy);
+        }
+        let mut candidate = self
+            .replica
+            .as_ref()
+            .ok_or_else(|| CommandError::Unavailable("vault not migrated".into()))?
+            .clone();
+        candidate
+            .merge(history)
+            .map_err(|error| CommandError::Unavailable(error.to_string()))?;
+        self.replica = Some(candidate);
+        self.generation += 1;
+        self.refresh_projection()?;
+        Ok(self.generation)
     }
     pub fn io_status(&self, request_id: Uuid) -> Option<&IoStatus> {
         self.io_status.get(&request_id)
@@ -126,6 +377,68 @@ impl App {
             self.control_inflight = self.control_inflight.saturating_sub(1);
         }
         match event {
+            #[cfg(feature = "sync")]
+            StoreEvent::Migrated { request_id, result } => {
+                if let Some(mut migration) = self.migration.take() {
+                    if migration.request_id == request_id {
+                        match result {
+                            Ok(_) => {
+                                self.replica = migration.candidate.take();
+                                self.sync_conflicts = self
+                                    .replica
+                                    .as_ref()
+                                    .unwrap()
+                                    .project()
+                                    .unwrap()
+                                    .into_iter()
+                                    .map(|note| (note.id, note.conflicts))
+                                    .collect();
+                                self.durable_history = migration.history.take();
+                                if self.mirror_enabled {
+                                    for view in self.notes() {
+                                        self.exports.insert(view.note.id, view.note);
+                                    }
+                                }
+                                self.io_status.insert(request_id, IoStatus::Completed);
+                            }
+                            Err(error) => {
+                                self.io_status.insert(request_id, IoStatus::Failed(error));
+                            }
+                        }
+                    }
+                }
+            }
+            #[cfg(feature = "sync")]
+            StoreEvent::HistorySaved {
+                generation,
+                notes,
+                result,
+            } => {
+                if self
+                    .history_inflight
+                    .as_ref()
+                    .is_some_and(|(submitted, _)| *submitted == generation)
+                {
+                    let (_, history) = self.history_inflight.take().unwrap();
+                    match &result {
+                        Ok(_) => {
+                            self.persisted_generation = generation;
+                            self.durable_history = Some(history);
+                            self.history_error = None;
+                        }
+                        Err(error) => self.history_error = Some(error.clone()),
+                    }
+                    for note in notes {
+                        self.apply_ack(SaveAck {
+                            id: note.id,
+                            revision: note.revision,
+                            note,
+                            result: result.as_ref().map(|_| ()).map_err(Clone::clone),
+                            export_pending: result.as_ref().copied().unwrap_or(false),
+                        });
+                    }
+                }
+            }
             StoreEvent::Saved(ack) => self.apply_ack(ack),
             StoreEvent::Configured {
                 request_id,
@@ -579,6 +892,14 @@ impl App {
             self.apply_store_event(ack);
         }
         self.tick_files();
+        #[cfg(feature = "sync")]
+        {
+            self.tick_migration();
+            if self.replica.is_some() {
+                self.tick_history();
+                return;
+            }
+        }
         // A rename cycle must never be split across save transactions, and a
         // later batch must not overtake the paths owned by an earlier batch.
         if !self.inflight.is_empty() || self.pending.is_empty() {
@@ -641,6 +962,10 @@ impl App {
         }
     }
     pub fn retry_saves(&mut self) {
+        #[cfg(feature = "sync")]
+        {
+            self.history_error = None;
+        }
         self.export_errors.clear();
         for entity in self.ids.values() {
             if let Some(mut save) = self.world.get_mut::<SaveState>(*entity) {
@@ -662,7 +987,17 @@ impl App {
             if let Some(error) = self.notes().into_iter().find_map(|view| view.save.error) {
                 return Err(StoreError::Storage(error));
             }
-            if self.pending.is_empty() && self.inflight.is_empty() {
+            #[cfg(feature = "sync")]
+            if let Some(error) = &self.history_error {
+                return Err(StoreError::Storage(error.clone()));
+            }
+            let source_idle = self.pending.is_empty() && self.inflight.is_empty();
+            #[cfg(feature = "sync")]
+            let source_idle = source_idle
+                && self.migration.is_none()
+                && self.history_inflight.is_none()
+                && self.generation == self.persisted_generation;
+            if source_idle {
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -709,10 +1044,48 @@ impl App {
         command: Command,
         caller: Caller,
     ) -> Result<CommandResult, CommandError> {
+        if !command.descriptor().available {
+            return Err(CommandError::Unavailable(command.descriptor().name.into()));
+        }
         if !command.descriptor().allowed(caller) {
             return Err(CommandError::Unauthorized);
         }
+        #[cfg(feature = "sync")]
+        if self.migration.is_some()
+            && command.is_mutation()
+            && !matches!(
+                command,
+                Command::SetMirrorEnabled { .. } | Command::ExportMarkdown { .. }
+            )
+        {
+            return Err(CommandError::Busy);
+        }
         match command {
+            Command::EnableSync => {
+                #[cfg(feature = "sync")]
+                {
+                    if self.io_pending.values().any(|pending| {
+                        matches!(pending, PendingIo::Import(_) | PendingIo::Rescan { .. })
+                    }) {
+                        return Err(CommandError::Busy);
+                    }
+                    let request_id = self.accept_io()?;
+                    if self.replica.is_some() {
+                        self.io_status.insert(request_id, IoStatus::Completed);
+                    } else {
+                        self.migration = Some(Migration {
+                            request_id,
+                            candidate: None,
+                            remaining: VecDeque::new(),
+                            committing: false,
+                            history: None,
+                        });
+                    }
+                    Ok(CommandResult::Accepted { request_id })
+                }
+                #[cfg(not(feature = "sync"))]
+                Err(CommandError::Unavailable("sync feature is disabled".into()))
+            }
             Command::SetMirrorEnabled { enabled } => {
                 let request_id = self.accept_io()?;
                 #[cfg(not(target_os = "linux"))]
@@ -791,6 +1164,15 @@ impl App {
                     revision,
                     trashed: false,
                 };
+                #[cfg(feature = "sync")]
+                if let Some(replica) = &self.replica {
+                    let mut candidate = replica.clone();
+                    candidate
+                        .insert(&record)
+                        .map_err(|error| CommandError::Unavailable(error.to_string()))?;
+                    self.replica = Some(candidate);
+                    self.generation += 1;
+                }
                 let entity = self
                     .world
                     .spawn((
@@ -804,6 +1186,8 @@ impl App {
                     .id();
                 self.ids.insert(id, entity);
                 self.pending.insert(id, self.view(id)?.note);
+                #[cfg(feature = "sync")]
+                self.refresh_projection()?;
                 Ok(CommandResult::Note(self.view(id)?))
             }
             Command::ReadNote { id } => Ok(CommandResult::Note(self.view(id)?)),
@@ -839,6 +1223,10 @@ impl App {
                         current: view.note.revision,
                     });
                 }
+                #[cfg(feature = "sync")]
+                let engine_command = mutation.clone();
+                #[cfg(feature = "sync")]
+                let original_len = view.note.text.len();
                 match mutation {
                     Command::EditNote { mut edits, .. } => {
                         if view.note.trashed {
@@ -855,6 +1243,30 @@ impl App {
                     Command::RestoreNote { .. } => view.note.trashed = false,
                     _ => unreachable!(),
                 }
+                #[cfg(feature = "sync")]
+                if let Some(replica) = &self.replica {
+                    let mut candidate = replica.clone();
+                    let result = match engine_command {
+                        Command::EditNote { edits, .. }
+                            if edits.len() == 1
+                                && edits[0].start == 0
+                                && edits[0].end == original_len =>
+                        {
+                            candidate.replace_text(id, &edits[0].replacement)
+                        }
+                        Command::EditNote { edits, .. } => candidate.edit(id, &edits),
+                        Command::RenameNote { path, .. } => candidate.rename(id, &path),
+                        Command::TrashNote { .. } => candidate.trash(id, true),
+                        Command::RestoreNote { .. } => candidate.trash(id, false),
+                        _ => unreachable!(),
+                    };
+                    result.map_err(|error| CommandError::Unavailable(error.to_string()))?;
+                    candidate
+                        .project()
+                        .map_err(|error| CommandError::Unavailable(error.to_string()))?;
+                    self.replica = Some(candidate);
+                    self.generation += 1;
+                }
                 let revision = Revision::fresh();
                 view.note.revision = revision;
                 view.save.accepted = revision;
@@ -864,7 +1276,9 @@ impl App {
                     .entity_mut(entity)
                     .insert((view.note.clone(), view.save.clone()));
                 self.pending.insert(id, view.note.clone());
-                Ok(CommandResult::Note(view))
+                #[cfg(feature = "sync")]
+                self.refresh_projection()?;
+                Ok(CommandResult::Note(self.view(id)?))
             }
         }
     }
@@ -929,6 +1343,335 @@ mod tests {
             assert!(Instant::now() < deadline, "I/O request stuck");
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+    #[cfg(feature = "sync")]
+    #[test]
+    fn explicit_migration_commands_remote_ack_and_restart_preserve_authority() {
+        let directory = std::env::temp_dir().join(format!("tanglewood-migrate-{}", Uuid::new_v4()));
+        let mut app = App::open(&directory).unwrap();
+        let initial = note(
+            app.execute(
+                Command::CreateNote {
+                    path: "a.md".into(),
+                    text: "α 🦀\r\n".into(),
+                },
+                Caller::Local,
+            )
+            .unwrap(),
+        );
+        assert!(!app.sync_enabled());
+        assert_eq!(
+            app.execute(Command::EnableSync, Caller::AutomationReadWrite)
+                .unwrap_err(),
+            CommandError::Unauthorized
+        );
+        let migration = request(&mut app, Command::EnableSync);
+        assert_eq!(
+            app.execute(
+                Command::RenameNote {
+                    id: initial.note.id,
+                    expected: initial.note.revision,
+                    path: "busy.md".into()
+                },
+                Caller::Local
+            )
+            .unwrap_err(),
+            CommandError::Busy
+        );
+        assert_eq!(wait_io(&mut app, migration), IoStatus::Completed);
+        assert_eq!(app.note(initial.note.id).unwrap().note, initial.note);
+        let mirror = request(&mut app, Command::SetMirrorEnabled { enabled: true });
+        assert_eq!(wait_io(&mut app, mirror), IoStatus::Completed);
+        app.flush_files().unwrap();
+        let durable = app.durable_history().unwrap().clone();
+        let connection = rusqlite::Connection::open_with_flags(
+            directory.join("notes.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let backup: String = connection
+            .query_row("SELECT backup_path FROM sync_meta", [], |row| row.get(0))
+            .unwrap();
+        let backup = rusqlite::Connection::open_with_flags(
+            backup,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let (text, id, revision): (String, String, String) = backup
+            .query_row("SELECT text,id,revision FROM notes", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(
+            (text, id, revision),
+            (
+                initial.note.text.clone(),
+                initial.note.id.0.to_string(),
+                initial.note.revision.0.to_string()
+            )
+        );
+        drop(backup);
+        drop(connection);
+        app.shutdown().unwrap();
+        drop(app);
+        let mut app = App::open(&directory).unwrap();
+        assert_eq!(app.durable_history().unwrap().device_id, durable.device_id);
+        assert_eq!(app.durable_history().unwrap().vault_id, durable.vault_id);
+        let id = initial.note.id;
+        let edited = note(
+            app.execute(
+                Command::EditNote {
+                    id,
+                    expected: initial.note.revision,
+                    edits: vec![TextEdit {
+                        start: 3,
+                        end: 7,
+                        replacement: "L🦀".into(),
+                    }],
+                },
+                Caller::Local,
+            )
+            .unwrap(),
+        );
+        assert!(matches!(
+            app.execute(
+                Command::EditNote {
+                    id,
+                    expected: initial.note.revision,
+                    edits: vec![]
+                },
+                Caller::Local
+            ),
+            Err(CommandError::StaleRevision { .. })
+        ));
+        app.flush().unwrap();
+        let old_durable = app.durable_history().unwrap().clone();
+        let mut peer = crate::sync::Replica::join(&old_durable).unwrap();
+        peer.edit(
+            id,
+            &[TextEdit {
+                start: 0,
+                end: 2,
+                replacement: "β".into(),
+            }],
+        )
+        .unwrap();
+        peer.rename(id, "remote.md").unwrap();
+        peer.trash(id, true).unwrap();
+        let local = note(
+            app.execute(
+                Command::EditNote {
+                    id,
+                    expected: edited.note.revision,
+                    edits: vec![TextEdit {
+                        start: 0,
+                        end: 0,
+                        replacement: "local ".into(),
+                    }],
+                },
+                Caller::Local,
+            )
+            .unwrap(),
+        );
+        let trashed_local = note(
+            app.execute(
+                Command::TrashNote {
+                    id,
+                    expected: local.note.revision,
+                },
+                Caller::Local,
+            )
+            .unwrap(),
+        );
+        let restored_local = note(
+            app.execute(
+                Command::RestoreNote {
+                    id,
+                    expected: trashed_local.note.revision,
+                },
+                Caller::Local,
+            )
+            .unwrap(),
+        );
+        app.execute(
+            Command::RenameNote {
+                id,
+                expected: restored_local.note.revision,
+                path: "local.md".into(),
+            },
+            Caller::Local,
+        )
+        .unwrap();
+        let local = app.note(id).unwrap();
+        let accepted_generation = app.merge_history(&peer.save()).unwrap();
+        let merged = app.note(id).unwrap();
+        assert_ne!(merged.note.revision, local.note.revision);
+        assert!(merged.note.trashed);
+        assert!(merged.note.text.contains("local "));
+        assert!(merged.note.text.contains("β"));
+        assert_eq!(app.durable_history().unwrap().catalog, old_durable.catalog);
+        assert!(app.persisted_generation < accepted_generation);
+        app.flush().unwrap();
+        assert!(app.persisted_generation >= accepted_generation);
+        let connection = rusqlite::Connection::open_with_flags(
+            directory.join("notes.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let (revision, text, trashed): (String, String, bool) = connection
+            .query_row(
+                "SELECT revision,text,trashed FROM pending_exports WHERE id=?1",
+                [id.0.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (revision, text, trashed),
+            (
+                merged.note.revision.0.to_string(),
+                merged.note.text.clone(),
+                true
+            )
+        );
+        let bytes: Vec<u8> = connection
+            .query_row(
+                "SELECT metadata FROM sync_conflicts WHERE note_id=?1",
+                [id.0.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let metadata: crate::sync::MergeConflicts = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(metadata.paths, vec!["local.md", "remote.md"]);
+        assert_eq!(metadata.tombstones, vec![false, true]);
+        drop(connection);
+
+        let restored = note(
+            app.execute(
+                Command::RestoreNote {
+                    id,
+                    expected: merged.note.revision,
+                },
+                Caller::Local,
+            )
+            .unwrap(),
+        );
+        let source = directory.join("import.md");
+        std::fs::write(&source, "imported β 🦀\r\n").unwrap();
+        let importing = request(
+            &mut app,
+            Command::ImportMarkdown {
+                source_path: source.to_string_lossy().into(),
+                destination: ImportDestination::Replace {
+                    id,
+                    expected: restored.note.revision,
+                },
+            },
+        );
+        assert_eq!(wait_io(&mut app, importing), IoStatus::Completed);
+        let current = app.note(id).unwrap();
+        let renamed = note(
+            app.execute(
+                Command::RenameNote {
+                    id,
+                    expected: current.note.revision,
+                    path: "final.md".into(),
+                },
+                Caller::Local,
+            )
+            .unwrap(),
+        );
+        let created = note(
+            app.execute(
+                Command::CreateNote {
+                    path: "created.md".into(),
+                    text: "new note".into(),
+                },
+                Caller::Local,
+            )
+            .unwrap(),
+        );
+        let trashed = note(
+            app.execute(
+                Command::TrashNote {
+                    id: created.note.id,
+                    expected: created.note.revision,
+                },
+                Caller::Local,
+            )
+            .unwrap(),
+        );
+        app.execute(
+            Command::RestoreNote {
+                id: created.note.id,
+                expected: trashed.note.revision,
+            },
+            Caller::Local,
+        )
+        .unwrap();
+        app.flush().unwrap();
+        let expected = app.notes();
+        let history = app.durable_history().unwrap().clone();
+        app.shutdown().unwrap();
+        drop(app);
+        let mut app = App::open(&directory).unwrap();
+        assert_eq!(app.notes(), expected);
+        assert_eq!(app.note(id).unwrap().note, renamed.note);
+        assert_eq!(
+            crate::sync::Replica::load(app.durable_history().unwrap())
+                .unwrap()
+                .project()
+                .unwrap(),
+            crate::sync::Replica::load(&history)
+                .unwrap()
+                .project()
+                .unwrap()
+        );
+        // Invalid persistence identity cannot acknowledge or lose accepted data.
+        app.replica = Some(crate::sync::Replica::join(&history).unwrap());
+        let current = app.note(id).unwrap();
+        let failed = note(
+            app.execute(
+                Command::EditNote {
+                    id,
+                    expected: current.note.revision,
+                    edits: vec![TextEdit {
+                        start: 0,
+                        end: 0,
+                        replacement: "unsaved ".into(),
+                    }],
+                },
+                Caller::Local,
+            )
+            .unwrap(),
+        );
+        assert!(app.flush().is_err());
+        assert_eq!(app.note(id).unwrap().note, failed.note);
+        assert_ne!(
+            app.note(id).unwrap().save.persisted,
+            Some(failed.note.revision)
+        );
+        assert_eq!(app.durable_history().unwrap().device_id, history.device_id);
+        drop(app);
+        let (store, _) = Store::open(&directory).unwrap();
+        let record = renamed.note;
+        store.try_save(record).unwrap();
+        assert!(
+            store
+                .flush()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event,StoreEvent::Saved(ack) if ack.result.is_err()))
+        );
+        drop(store);
+        if let Some(destination) = std::env::var_os("TANGLEWOOD_MIGRATION_FIXTURE") {
+            std::fs::create_dir_all(&destination).unwrap();
+            std::fs::copy(
+                directory.join("notes.sqlite3"),
+                Path::new(&destination).join("notes.sqlite3"),
+            )
+            .unwrap();
+        }
+        std::fs::remove_dir_all(directory).unwrap();
     }
     #[test]
     fn identical_text_mirror_swap_keeps_both_files_and_durable_conflicts() {

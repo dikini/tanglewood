@@ -1,42 +1,26 @@
 # MVP execution status
 
-Active goal from 2026-10-26. Authority: `plan/tanglewood-mvp.md`; scope: `mvp-goal.md`.
-Latest integrated checkpoint: **5a40e2c**, unsigned (`%G? = N`), Linux source editor/core/storage/document contracts.
+Active goal from 2026-10-26. Authority: `plan/tanglewood-mvp.md`; scope: `mvp-goal.md`. Latest committed checkpoint: **2dcef01**, unsigned. Next checkpoint ready: authoritative CRDT migration, Codex integration, authenticated LAN transport preparation.
 
-## Scope
+## Scope and evidence
 
-Required increments 0–4 remain intact: Linux + Android notes, durable portability/mirror, CRDT/LAN, MCP/Codex, extension contracts and delivery evidence. Optional D-Bus and external filter process execution deferred to prioritize required work. Block editing/general plugins and other plan-deferred features remain deferred.
+Required increments 0–4 remain intact. Optional D-Bus and external filter process runner are deferred to prioritize required delivery. Block editing/general plugin management remain deferred.
 
-| Task | Ownership / state | Evidence and next dependency |
+| Task | State | Evidence / remaining dependency |
 | --- | --- | --- |
-| C0 shared contracts | done; PM integrated | Stable UUID/revision, UTF-8 commands/policy, single ECS owner; reviewed |
-| S1 SQLite durability | done; PM integrated | Restart, lock, stale acknowledgements, atomic 40-note path cycle; reviewed |
-| D1 reader/extensions | done; PM integrated | Native source origins/fence attrs/callout/source fallback fixture; reviewed |
-| U1 Linux editor | done; PM integrated | Source drafts, nav/search/preview/links/backlinks/save/error/close; real window edit/save/restart |
-| P0/P1 Android | source preparation reviewed; runtime blocked | NativeActivity/app-private path prepared. No SDK/NDK/adb/device/target. APK/input/clipboard/lifecycle/restart unverified; required SAF picker unimplemented |
-| F2 mirror/portability | reviewed; next checkpoint pending | Async local-only import/export/rescan, durable outbox/baselines/conflicts. Identical-text rename cleanup bug fixed with conservative ownership conflicts; recovery through public renames tested |
-| A4a MCP | reviewed; next checkpoint pending | rmcp stdio -> private Unix socket -> sole App. Shared schema/policy; exact durable replies; actual stdio create/restart smoke passed |
-| Y3a engine | isolated preparation reviewed | Automerge0.7.4 UnicodeCodePoint histories/merge scenario passed. Duplicate catalog UUID spellings now reject; targeted scenario passed. Not yet a sync milestone |
-| Y3b migration/LAN | required, not implemented | Backup + authoritative histories/projections/outbox; command integration; then pinned QUIC pairing/reconnect/two-device evidence |
-| A4b Codex | adapter preparation; review | codex-cli0.163.0 schema pinned, focused protocol fixture passed. Panel/live turn/tools/cancel/approvals/disconnect evidence still required |
+| Shared core, SQLite, Linux editor | Integrated, reviewed | Stable IDs/revisions, single ECS owner, restart/lock/batch durability; actual Linux edit/save/restart |
+| Markdown/extensions | Integrated, reviewed | Derived views/source origins/fence attributes/callout/fallback and Pandoc example |
+| Mirror/import/export | Integrated, reviewed | Durable outbox/baselines/recoverable conflicts; actual CLI import/rescan/export/restart |
+| MCP | Integrated, reviewed | Single-writer Unix bridge, shared schema/policy, exact persisted replies; actual stdio create/restart |
+| Authoritative CRDT migration | Ready for checkpoint, reviewed | Backup, schema-3 histories/projections/outbox, generation acknowledgement; CLI migration/restart preserves IDs/revisions/identity |
+| Codex | Ready for checkpoint, reviewed | Streamed live note read/edit/read with explicit scoped approvals; cancel/disconnect/restart; actual panel responsiveness |
+| LAN | Transport ready, reviewed; owner integration next | Pinned mutual TLS/UDP, pairing/revocation/frame bounds passed. Join, per-document owner protocol, durability barriers, reconnect and integrated scenario required |
+| Android | Picker/packaging source in progress | NativeActivity/app-private storage prepared. No SDK/NDK/adb/target/device; APK, input/clipboard/lifecycle/restart/network acceptance open |
 
-## Latest evidence
+Exact checks and boundaries: `integration-evidence.md`, `linux-smoke.md`, `codex-live-evidence.md`, `crdt-migration.md`, `lan-sync.md`. Combined 14 library scenarios passed; focused LAN delta passed after fixes; combined build and Clippy exit 0. No host check proves Android or hardware LAN.
 
-See `integration-evidence.md` and `linux-smoke.md` for exact scope.
+## Ownership and resume point
 
-- `cargo fmt --check`: passed before new Codex module; rerun at next relevant checkpoint.
-- `RUSTC_WRAPPER= cargo test --locked --lib --no-default-features --features sync,mcp --offline`: **10 passed**, Unix socket scenario with approved escalation. Combined run preceded tiny catalog-identity fix; targeted `sync::tests` passed after that delta.
-- `RUSTC_WRAPPER= cargo clippy --locked --all-targets --features gui,mcp,sync --offline`: exit 0, style/large concrete queue error and unused pre-integration CRDT operation warnings.
-- `RUSTC_WRAPPER= cargo build --locked --bins --features gui,mcp,sync --offline`: passed.
-- Actual Linux GUI create/multiline Markdown/preview/Saved/process restart recovered identical source. Isolated Xvfb requires approved escalation; temporary processes stopped.
-- Actual CLI import -> mirror -> external-only rescan -> export -> restart retained Unicode source bytes.
-- Actual rmcp stdio initialize/list/create -> Unix owner returned accepted=persisted revision; SQLite bytes and restart verified. Socket fixture covers read-only/policy/schema/stale/original acknowledgement.
-- Codex adapter fixture: one passed (feature codex); no live generation. Login status reports ChatGPT; no credentials read or logged.
+PM owns manifest/lock/main/status/index and checkpoint integration. Core's reviewed migration/transport source is frozen pending commit; its docs-only `lan-owner-integration.md` plan is ready. Next transfer: core owns App/store/commands/sync/lan/lib for that implementation, PM wires CLI after public contracts stabilize. Platform owns new Android picker/packaging files only until review; UI/android entry integration requires explicit transfer. Reviewer available for the next coherent scope. Only PM stages/commits; no publication authorized.
 
-## Current ownership and resume point
-
-PM owns manifest/lock/main/status/index; only PM stages/commits. Core owns migration proposal only in new docs; sync.rs identity fix is frozen and independently ready. F2 app/store/files/commands/notes are frozen and reviewed. Platform handed back mcp/bridge/UI and is holding Codex source frozen for reviewer. Reviewer covers isolated engine delta and Codex preparation. No Cargo overlap: core targeted identity fix passed; PM checkpoint checks already recorded; coordinate any further check.
-
-Next: commit reviewed F2/A4a/Android/engine preparation unsigned, then release App/store to authoritative CRDT migration and UI to Codex panel. Codex unreviewed source stays outside that checkpoint. Preserve pending work; no reset/stash/clean. No external publication authorized.
-
-Android target-availability question is pending asynchronously; finish independent work. Host compilation does not close Android, networking or live AI gates. Goal remains active and incomplete.
+Next: commit reviewed checkpoint, implement durable LAN owner/join, integrate Android picker/packaging and obtain available platform evidence. Android device-availability question remains pending; finish independent work meanwhile. Goal remains active and incomplete.

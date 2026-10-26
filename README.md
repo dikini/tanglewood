@@ -57,6 +57,18 @@ are required boundaries throughout implementation.
 Linux automation uses an optional [MCP stdio bridge](docs/mcp.md) into the running
 app; it never opens a second vault writer. Enable it with `--features gui,mcp`,
 `--mcp-socket /private/directory/owner.sock`, and optionally `--mcp-write`.
-Default MCP policy is read-only. Codex integration remains under implementation.
-The optional `sync` feature currently provides a tested CRDT engine; persistent
-migration and authenticated LAN transport are not yet available.
+Default MCP policy is read-only. The Linux Codex adapter and conversation panel are implemented. Build both
+binaries with `cargo build --bins --features gui,codex`, then add `--codex`
+to an editor launch with `--mcp-socket`. Use `--mcp-write` only when note mutation
+is intended. The panel connects lazily and requires explicit one-action approvals.
+See [Codex setup](docs/codex.md) and [actual live evidence](docs/codex-live-evidence.md).
+The optional `sync` feature provides explicit authoritative CRDT migration:
+
+```sh
+cargo run --locked --features sync -- --headless --vault /path/to/vault --enable-sync
+```
+
+Migration first makes a recoverable SQLite backup and preserves note IDs.
+Afterward use a binary with `sync` support; an unsupported binary refuses the
+vault rather than editing projections. Authenticated QUIC transport is prepared
+behind `lan`, but App joining/synchronization is still being integrated.

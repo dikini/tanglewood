@@ -18,3 +18,16 @@ SAF picker, CRDT storage migration, LAN pairing/reconnect and live Codex remain
 open. A library feature build is not evidence for those gates.
 
 The subsequent isolated catalog-identity fix rejects noncanonical UUID aliases and verifies malformed merge rollback without changing saved histories. Targeted `sync::tests` passed after this delta; the broader unchanged scenarios were not repeated.
+
+## Authoritative histories, Codex, and LAN transport checkpoint
+
+- `cargo fmt --check`: passed.
+- `RUSTC_WRAPPER= cargo test --locked --lib --no-default-features --features gui,codex,lan --offline`: 14 passed with approved Unix/UDP loopback access. After the reviewed LAN revocation/frame-size fixes, focused `lan::tests` passed again; unchanged scenarios were not repeated.
+- `RUSTC_WRAPPER= cargo clippy --locked --all-targets --features gui,codex,lan --offline`: exit 0; existing style, large queue error, and pending integration dead-code warnings remain.
+- `RUSTC_WRAPPER= cargo build --locked --bins --example codex_smoke --features gui,codex,lan --offline`: passed.
+- Actual CLI import → enable-sync → restart → repeated enable-sync preserved note UUID/revision/Unicode bytes, schema 3 and vault/device identity, and produced a recoverable pre-CRDT backup (`/tmp/tanglewood-migration-cli-geu25coz`). A no-sync executable refused the migrated fixture without changing its database hash.
+- Authoritative history migration/commands/remote merge generation scenario passed; independent review ready. See `crdt-migration.md`.
+- Actual authenticated Codex streamed read/edit/read, three individually scoped tool approvals, persisted edit, interrupted turn, disconnect and subsequent editing/restart passed. Actual panel Connect/Ready/Disconnect left source editing/autosave responsive. See `codex-live-evidence.md` for exact boundaries. Independent review ready.
+- LAN transport fixture passed real mutual-TLS UDP pairing, unknown peer rejection, persisted unpair/session race regression, Automerge message transport and maximum serialized payload. Independent review ready. This is transport preparation: App owner sync, join/durable receipts, hardware LAN and Android networking remain open.
+
+Android picker/packaging source is under development outside this checkpoint. No Android APK/device validation is claimed.
