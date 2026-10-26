@@ -7,6 +7,8 @@ pub use app::App;
 pub mod store;
 
 pub mod extensions;
+#[cfg(feature = "documents")]
+pub mod illustration;
 pub mod markdown;
 
 #[cfg(feature = "gui")]
@@ -37,3 +39,8 @@ pub mod android_picker;
 
 #[cfg(all(feature = "gui", any(target_os = "android", test)))]
 pub mod android_input;
+
+#[cfg(feature = "documents")]
+pub mod document_jobs;
+#[cfg(feature = "documents")]
+pub mod pandoc;

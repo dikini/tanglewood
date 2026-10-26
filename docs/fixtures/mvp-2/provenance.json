@@ -1,0 +1,26 @@
+{
+  "upstream": "https://github.com/dikini/illustration-md",
+  "commit": "9f38098d2355d4d77e41a538b48354fa8145d92a",
+  "local_checkout": "/home/dikini/Projects/illustration-md",
+  "source": "source.md combines unchanged diagrams metadata and brief fences from examples/custom/README.md and examples/comics/pages/choosing-a-result/README.md; adds local callout proof.",
+  "artwork": "Exact upstream saved SVG/PNG and sidecars, no regeneration or provenance relabeling. Construction references remain opaque; authoring assets/tools not required for preparation.",
+  "license": "Upstream has no blanket project license; preserved notices record third-party font terms. This is local user-authorized research, no redistribution grant or external publication claim.",
+  "files": {
+    "assets/fig-add-inputs/figure.svg": {
+      "bytes": 13349,
+      "sha256": "af450d6b40c07dce0aa605716d24fbc81933c60841a2f00a949b81b132e3c609"
+    },
+    "assets/fig-add-inputs/illustration.json": {
+      "bytes": 2033,
+      "sha256": "40a46fa9ceb2cd8a2164c785da502f937a6055294f7e1ed0e8160166382c42ae"
+    },
+    "assets/fig-choosing-a-result/comic.json": {
+      "bytes": 977,
+      "sha256": "9dc361149661acb43ac829c21cfe9bb17b29ca68a2e8c23179f068839b3178a2"
+    },
+    "assets/fig-choosing-a-result/strip.png": {
+      "bytes": 3660354,
+      "sha256": "e67d959ff7036f0f56e42bfdcde1cfe6e542385acb99dec83fdf810239c46b3c"
+    }
+  }
+}

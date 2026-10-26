@@ -3,11 +3,19 @@ use std::collections::HashMap;
 
 use eframe::egui;
 
+mod document;
+mod editor;
+mod processing;
+mod theme;
+use editor::Draft;
+#[cfg(test)]
+use editor::contiguous_edit;
+
 use crate::{
     App,
     commands::{Caller, Command, CommandResult},
-    markdown::{self, BlockKind, Document, Inline, RenderBlock},
-    notes::{NoteId, NoteView, Revision, TextEdit},
+    markdown::{self, Document},
+    notes::{NoteId, NoteView, Revision},
 };
 
 fn field_single(ui: &mut egui::Ui, text: &mut String, name: &str) -> egui::Response {
@@ -50,15 +58,6 @@ fn field_multi(ui: &mut egui::Ui, text: &mut String, name: &str) -> egui::Respon
     }
 }
 
-struct Draft {
-    text: String,
-    base_text: String,
-    revision: Revision,
-    widget_generation: u64,
-    conflict: bool,
-    composing: bool,
-}
-
 pub struct TanglewoodUi {
     pub app: App,
     selected: Option<NoteId>,
@@ -72,6 +71,8 @@ pub struct TanglewoodUi {
     error: Option<String>,
     show_notes: bool,
     closing: bool,
+    theme_installed: bool,
+    processing: processing::Processing,
     #[cfg(feature = "lan")]
     lan_panel: LanPanel,
     #[cfg(target_os = "android")]
@@ -95,10 +96,12 @@ impl TanglewoodUi {
             new_path: "Untitled.md".into(),
             rename_path: String::new(),
             show_trash: false,
-            show_preview: false,
+            show_preview: true,
             error: None,
             show_notes: !cfg!(target_os = "android"),
             closing: false,
+            theme_installed: false,
+            processing: processing::Processing::default(),
             #[cfg(feature = "lan")]
             lan_panel: LanPanel::default(),
             #[cfg(target_os = "android")]
@@ -240,6 +243,12 @@ impl TanglewoodUi {
             self.show_notes = false;
         }
         if self.selected != Some(id) {
+            if self
+                .selected
+                .is_some_and(|old| !self.prepare_transition(old))
+            {
+                return;
+            }
             if let Some(previous) = self.selected.and_then(|old| self.drafts.get_mut(&old)) {
                 if previous.composing {
                     // Focus changed mid-composition: retain the text for explicit recovery.
@@ -248,41 +257,61 @@ impl TanglewoodUi {
                 }
             }
         }
+        if self.selected != Some(id) {
+            self.show_preview = self
+                .drafts
+                .get(&id)
+                .is_none_or(|draft| draft.can_change_mode());
+        }
         self.selected = Some(id);
         if let Ok(view) = self.app.note(id) {
             self.rename_path = view.note.path;
         }
     }
 
+    fn prepare_transition(&mut self, id: NoteId) -> bool {
+        #[cfg(target_os = "android")]
+        if let Some(draft) = self.drafts.get_mut(&id) {
+            let input = crate::android_input::prepare_transition(
+                egui::Id::new(("source", id.0, draft.widget_generation)),
+                &mut draft.text,
+            );
+            if input.conflict || draft.composing {
+                draft.conflict = true;
+                draft.composing = input.composing;
+                if self.selected == Some(id) {
+                    self.show_preview = false;
+                }
+                self.error=Some("Pending input retained in the original draft. Copy/review it before Cancel; transition paused.".into());
+                return false;
+            }
+        }
+        #[cfg(not(target_os = "android"))]
+        let _ = id;
+        true
+    }
     fn adopt(&mut self, view: &NoteView) {
+        if !self.prepare_transition(view.note.id) {
+            return;
+        }
         let generation = self
             .drafts
             .get(&view.note.id)
             .map_or(0, |draft| draft.widget_generation + 1);
-        self.drafts.insert(
-            view.note.id,
-            Draft {
-                text: view.note.text.clone(),
-                base_text: view.note.text.clone(),
-                revision: view.note.revision,
-                widget_generation: generation,
-                conflict: false,
-                composing: false,
-            },
-        );
+        self.drafts
+            .insert(view.note.id, Draft::new(view, generation));
     }
 
     fn dispatch(&mut self, command: Command) {
         match self.app.execute(command, Caller::Local) {
             Ok(CommandResult::Note(view)) => {
                 self.error = None;
-                if let Some(draft) = self.drafts.get_mut(&view.note.id) {
-                    // Accepted text is now the draft base; persistence remains independently visible.
-                    if draft.text == view.note.text {
-                        draft.base_text = view.note.text.clone();
-                        draft.revision = view.note.revision;
-                        draft.conflict = false;
-                    }
+                if self
+                    .drafts
+                    .get(&view.note.id)
+                    .is_some_and(|draft| draft.proposed_text() == view.note.text)
+                {
+                    self.adopt(&view);
                 }
                 self.select(view.note.id);
             }
@@ -312,7 +341,7 @@ impl TanglewoodUi {
             }
             match self.drafts.get_mut(&view.note.id) {
                 Some(draft) if draft.revision != view.note.revision => {
-                    if draft.text == draft.base_text {
+                    if draft.can_change_mode() {
                         self.adopt(view);
                     } else {
                         draft.conflict = true;
@@ -539,6 +568,10 @@ impl LanPanel {
 
 impl eframe::App for TanglewoodUi {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !self.theme_installed {
+            theme::install(ctx);
+            self.theme_installed = true;
+        }
         self.app.tick();
         #[cfg(target_os = "android")]
         self.poll_picker(ctx);
@@ -567,6 +600,8 @@ impl eframe::App for TanglewoodUi {
         let mut adopt = None;
         let mut retry = false;
         let mut navigate = None;
+        let mut edit_range = None;
+        let mut read_requested = false;
         if ctx.input(|input| input.viewport().close_requested()) {
             self.closing = true;
         }
@@ -575,13 +610,22 @@ impl eframe::App for TanglewoodUi {
         }
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.heading("Tanglewood");
+                ui.strong("Tanglewood");
                 #[cfg(target_os = "android")]
                 crate::android_input::menu(ui);
-                let opened_notes =
-                    ui.toggle_value(&mut self.show_notes, "Notes").changed() && self.show_notes;
+                let opened_notes = {
+                    let clicked = theme::button(ui, theme::Icon::Notes, "Notes", true).clicked();
+                    if clicked {
+                        self.show_notes = !self.show_notes;
+                    }
+                    clicked
+                } && self.show_notes;
                 #[cfg(target_os = "android")]
                 if opened_notes {
+                    let retired = self.selected.is_none_or(|id| self.prepare_transition(id));
+                    if !retired {
+                        self.show_notes = false;
+                    }
                     if let Some(draft) = self.selected.and_then(|id| self.drafts.get_mut(&id)) {
                         if draft.composing {
                             draft.composing = false;
@@ -591,24 +635,36 @@ impl eframe::App for TanglewoodUi {
                 }
                 #[cfg(not(target_os = "android"))]
                 let _ = opened_notes;
-                ui.checkbox(&mut self.show_preview, "Preview");
+                let can_mode = self
+                    .selected
+                    .and_then(|id| self.drafts.get(&id))
+                    .is_none_or(Draft::can_change_mode);
+                if theme::button(ui, theme::Icon::Preview, "Read", can_mode).clicked() {
+                    read_requested = true;
+                }
+                if theme::button(ui, theme::Icon::Source, "Whole source", can_mode).clicked() {
+                    edit_range = Some(None);
+                }
                 #[cfg(all(target_os = "linux", feature = "codex"))]
                 if let Some(panel) = &mut self.conversation {
                     ui.toggle_value(&mut panel.visible, "Codex");
                 }
-                if ui.button("Save now").clicked() {
-                    retry = true;
-                }
-                if ui.button("Retry saves").clicked() {
-                    retry = true;
-                }
+                ui.menu_button("More", |ui| {
+                    if ui.button("Retry saves").clicked() {
+                        retry = true;
+                    }
+                });
             });
             #[cfg(target_os = "android")]
             crate::android_input::notice(ui);
-            #[cfg(feature = "lan")]
-            self.lan_panel.show(ui, ctx, &mut self.app);
-            #[cfg(target_os = "android")]
-            ui.collapsing("Documents", |ui| self.picker_controls(ui));
+            ui.collapsing("Tools", |ui| {
+                #[cfg(feature = "lan")]
+                self.lan_panel.show(ui, ctx, &mut self.app);
+                #[cfg(target_os = "android")]
+                ui.collapsing("Documents", |ui| self.picker_controls(ui));
+                #[cfg(not(any(feature = "lan", target_os = "android")))]
+                ui.label("No additional tools enabled.");
+            });
             if let Some(error) = &self.error {
                 ui.colored_label(egui::Color32::LIGHT_RED, error);
             }
@@ -703,42 +759,67 @@ impl eframe::App for TanglewoodUi {
             for conflict in self.app.mirror_conflicts().iter().filter(|conflict| conflict.note.id == view.note.id) {
                 ui.colored_label(egui::Color32::YELLOW, format!("Retained mirror conflict: {} ({})", conflict.path, conflict.kind));
             }
+            self.processing.controls(ui);
+            self.processing.update(ctx, view);
             let draft = self.drafts.get_mut(&view.note.id).expect("refresh creates draft");
             if draft.conflict {
-                ui.colored_label(egui::Color32::YELLOW, "Note changed elsewhere. Your draft is retained; copy it before adopting the stored version.");
+                ui.colored_label(egui::Color32::YELLOW, "Note changed elsewhere or input was interrupted. Draft retained; copy it before Cancel adopts accepted source.");
             }
-            if draft.conflict || draft.text != draft.base_text {
-                if ui.button("Discard local draft and adopt current note").clicked() { adopt = Some(view.clone()); }
-            }
-            if draft.text != draft.base_text { ui.label("Local draft has changes not accepted by the application."); }
-            let source_id=egui::Id::new(("source",view.note.id.0,draft.widget_generation));
-            #[cfg(target_os="android")]
-            let native_change=crate::android_input::before(ctx,source_id,&mut draft.text);
-            #[cfg(target_os="android")]
-            { if native_change.active { draft.composing=native_change.composing; } draft.conflict |= native_change.conflict; }
-            let output=ui.add_enabled_ui(!view.note.trashed, |ui| egui::TextEdit::multiline(&mut draft.text)
-                .id(source_id).desired_width(f32::INFINITY).desired_rows(16).show(ui)).inner;
-            #[cfg(target_os="android")]
-            crate::android_input::after(ctx,&output,&draft.text);
-            let response=output.response;
-            #[cfg(target_os="android")]
-            let response = { let mut response=response; if native_change.changed || native_change.finished { response.mark_changed(); } response };
-            // Composition stays in the widget draft until the IME commits.
-            let mut ime_finished = false;
-            ctx.input(|input| {
-                for event in &input.events {
-                    match event {
-                        egui::Event::Ime(egui::ImeEvent::Preedit(text)) => draft.composing = !text.is_empty(),
-                        egui::Event::Ime(egui::ImeEvent::Commit(_)) | egui::Event::Ime(egui::ImeEvent::Disabled) => {
-                            draft.composing = false; ime_finished = true;
+            if !self.show_preview {
+                ui.label(if draft.range.is_some() { "Block source · exact original span" } else { "Whole document source" });
+                let source_id=egui::Id::new(("source",view.note.id.0,draft.widget_generation));
+                #[cfg(target_os="android")]
+                let native_change=crate::android_input::before(ctx,source_id,&mut draft.text);
+                #[cfg(target_os="android")]
+                { if native_change.active { draft.composing=native_change.composing; } draft.conflict |= native_change.conflict; }
+                let job = draft.layout(ctx);
+                let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, width: f32| {
+                    // TextEdit calls again after native/keyboard edits; never use old spans
+                    // against a changed buffer. The next frame refreshes the cached colors.
+                    let mut layout = if job.text == text.as_str() { job.clone() } else {
+                        egui::text::LayoutJob::simple(text.as_str().to_owned(), egui::TextStyle::Monospace.resolve(ui.style()), ui.visuals().text_color(), width)
+                    };
+                    layout.wrap.max_width=width;
+                    ui.fonts_mut(|fonts|fonts.layout_job(layout))
+                };
+                let output=ui.add_enabled_ui(!view.note.trashed, |ui| egui::TextEdit::multiline(&mut draft.text)
+                    .id(source_id).layouter(&mut layouter).desired_width(f32::INFINITY).desired_rows(16).show(ui)).inner;
+                #[cfg(target_os="android")]
+                crate::android_input::after(ctx,&output,&draft.text);
+                if output.response.has_focus() {
+                    ctx.input(|input| {
+                        for event in &input.events {
+                            match event {
+                                egui::Event::Ime(egui::ImeEvent::Preedit(text)) => draft.composing = !text.is_empty(),
+                                egui::Event::Ime(egui::ImeEvent::Commit(_)) | egui::Event::Ime(egui::ImeEvent::Disabled) => draft.composing = false,
+                                _ => {}
+                            }
                         }
-                        _ => {}
-                    }
+                    });
                 }
-            });
-            if (response.changed() || ime_finished) && draft.text != draft.base_text && !draft.conflict && !draft.composing && command.is_none() {
-                command = Some(Command::EditNote { id: view.note.id, expected: draft.revision,
-                    edits: vec![contiguous_edit(&draft.base_text, &draft.text)] });
+                ui.horizontal(|ui| {
+                    if theme::button(ui,theme::Icon::Ready,"Ready",!view.note.trashed && !draft.composing && !draft.conflict).clicked() {
+                        if let Some(edit)=draft.edit() {
+                            command=Some(Command::EditNote{id:view.note.id,expected:draft.revision,edits:vec![edit]});
+                        } else { read_requested=true; }
+                    }
+                    if theme::button(ui,theme::Icon::Cancel,"Cancel",true).clicked() { adopt=Some(view.clone()); self.show_preview=true; }
+                    if draft.composing { ui.label("Composing — finish input before Ready"); }
+                    else if draft.dirty() { ui.label("Draft · not submitted"); }
+                    else { ui.label("Unchanged"); }
+                });
+            } else if let Some((_, document)) = self.parsed.get(&view.note.id) {
+                self.processing.show(ui, view, &mut navigate);
+                ui.separator();
+                ui.label("Original source blocks");
+                for (index, block) in document.blocks.iter().enumerate() {
+                    if let Some(origin)=block.origin.as_ref().filter(|origin| origin.note == view.note.id && origin.revision == draft.revision && origin.revision == view.note.revision) {
+                        if ui.add_enabled(draft.can_change_mode() && !view.note.trashed,egui::Button::new(format!("Edit block {} source",index+1)).small()).clicked() {
+                            edit_range=Some(Some(origin.bytes.clone()));
+                        }
+                    }
+                    ui.add_space(8.0);
+                }
             }
             ui.separator();
             ui.label("Backlinks");
@@ -748,14 +829,6 @@ impl eframe::App for TanglewoodUi {
                     resolve_note_target(&notes, &other.note.path, target) == Some(view.note.id)))
                     && ui.link(&other.note.path).clicked() { select = Some(other.note.id); }
             }
-            if self.show_preview {
-                ui.separator(); ui.heading("Preview");
-                if let Some((_, document)) = self.parsed.get(&view.note.id) {
-                    egui::ScrollArea::vertical().id_salt("preview").show(ui, |ui| {
-                        for block in &document.blocks { render_block(ui, block, &mut navigate); }
-                    });
-                }
-            }
           });
         });
         }
@@ -763,11 +836,52 @@ impl eframe::App for TanglewoodUi {
             .iter()
             .find(|view| Some(view.note.id) == self.selected)
             .map(|view| view.note.path.clone());
+        if read_requested
+            && self
+                .selected
+                .and_then(|id| self.drafts.get(&id))
+                .is_none_or(Draft::can_change_mode)
+        {
+            let retired = self.selected.is_none_or(|id| self.prepare_transition(id));
+            if retired {
+                self.show_preview = true;
+            }
+        }
+        if let Some(range) = edit_range {
+            if let Some(id) = self.selected {
+                let retired = self.prepare_transition(id);
+                if let Some(draft) = self.drafts.get_mut(&id) {
+                    if retired && draft.choose_range(range) {
+                        self.show_preview = false;
+                    }
+                }
+            }
+        }
         if let Some(view) = adopt {
+            #[cfg(target_os = "android")]
+            if let Some(draft) = self.drafts.get(&view.note.id) {
+                crate::android_input::retire_widget(
+                    egui::Id::new(("source", view.note.id.0, draft.widget_generation)),
+                    true,
+                );
+            }
+            // Cancel is an explicit discard, including interrupted composition.
+            if let Some(draft) = self.drafts.get_mut(&view.note.id) {
+                draft.composing = false;
+                draft.conflict = false;
+            }
             self.adopt(&view);
         }
         if let Some(command) = command {
-            self.dispatch(command);
+            let ready = matches!(command, Command::EditNote { .. });
+            let transition_ok =
+                !ready || self.selected.is_none_or(|id| self.prepare_transition(id));
+            if transition_ok {
+                self.dispatch(command);
+            }
+            if ready && transition_ok && self.error.is_none() {
+                self.show_preview = true;
+            }
         }
         if let Some(id) = select {
             self.select(id);
@@ -785,14 +899,18 @@ impl eframe::App for TanglewoodUi {
                 self.error = Some(format!("Note link not found: {target}"));
             }
         }
+        if self.closing {
+            if let Some(id) = self.selected {
+                // A callback may have arrived after TextEdit's before() this frame.
+                // Drain it before deciding whether any local work blocks close.
+                self.prepare_transition(id);
+            }
+        }
         let current = self.app.notes();
         let pending = current
             .iter()
             .any(|view| view.save.persisted != Some(view.save.accepted));
-        let local_drafts = self
-            .drafts
-            .values()
-            .any(|draft| draft.text != draft.base_text || draft.composing);
+        let local_drafts = self.drafts.values().any(|draft| draft.unsubmitted());
         #[allow(unused_mut)]
         let mut conversation_pending = false;
         #[cfg(all(target_os = "linux", feature = "codex"))]
@@ -846,76 +964,6 @@ impl eframe::App for TanglewoodUi {
     }
 }
 
-fn render_block(ui: &mut egui::Ui, block: &RenderBlock, navigate: &mut Option<String>) {
-    match &block.kind {
-        BlockKind::Fence(fence) => {
-            ui.monospace(&fence.body);
-        }
-        BlockKind::Source(source) => {
-            ui.monospace(source);
-        }
-        BlockKind::Paragraph | BlockKind::Heading(_) => {
-            ui.horizontal_wrapped(|ui| {
-                let mut emphasis = false;
-                let mut strong = matches!(block.kind, BlockKind::Heading(_));
-                for inline in &block.inlines {
-                    match inline {
-                        Inline::Text(text) => {
-                            let mut text = egui::RichText::new(text);
-                            if emphasis {
-                                text = text.italics();
-                            }
-                            if strong {
-                                text = text.strong();
-                            }
-                            ui.label(text);
-                        }
-                        Inline::EmphasisStart => emphasis = true,
-                        Inline::EmphasisEnd => emphasis = false,
-                        Inline::StrongStart => strong = true,
-                        Inline::StrongEnd => strong = matches!(block.kind, BlockKind::Heading(_)),
-                        Inline::Code(text) => {
-                            ui.monospace(text);
-                        }
-                        Inline::Link {
-                            target,
-                            label,
-                            wiki,
-                        } => {
-                            if *wiki {
-                                if ui.link(label).clicked() {
-                                    *navigate = Some(target.clone());
-                                }
-                            } else {
-                                if target.contains("://") || target.starts_with("mailto:") {
-                                    ui.hyperlink_to(label, target);
-                                } else if ui.link(label).clicked() {
-                                    *navigate = Some(target.clone());
-                                }
-                            }
-                        }
-                        Inline::Break => {
-                            ui.end_row();
-                        }
-                    }
-                }
-            });
-        }
-        BlockKind::Quote => {
-            ui.group(|ui| {
-                for child in &block.children {
-                    render_block(ui, child, navigate);
-                }
-            });
-        }
-        BlockKind::Div => {
-            for child in &block.children {
-                render_block(ui, child, navigate);
-            }
-        }
-    }
-}
-
 /// Both wiki and Markdown note targets resolve relative to the referring note.
 /// A leading slash means vault root; anchors select the note but do not scroll yet.
 fn linked_path(source: &str, target: &str) -> Option<String> {
@@ -955,28 +1003,6 @@ fn resolve_note_target(notes: &[NoteView], source: &str, target: &str) -> Option
                     || view.note.path.strip_suffix(".md") == Some(path.as_str()))
         })
         .map(|view| view.note.id)
-}
-
-/// Small contiguous edit with byte offsets that remain UTF-8 boundaries.
-fn contiguous_edit(before: &str, after: &str) -> TextEdit {
-    let prefix = before
-        .chars()
-        .zip(after.chars())
-        .take_while(|(a, b)| a == b)
-        .map(|(ch, _)| ch.len_utf8())
-        .sum::<usize>();
-    let suffix = before[prefix..]
-        .chars()
-        .rev()
-        .zip(after[prefix..].chars().rev())
-        .take_while(|(a, b)| a == b)
-        .map(|(ch, _)| ch.len_utf8())
-        .sum::<usize>();
-    TextEdit {
-        start: prefix,
-        end: before.len() - suffix,
-        replacement: after[prefix..after.len() - suffix].to_owned(),
-    }
 }
 
 #[cfg(test)]

@@ -32,6 +32,7 @@ struct Route {
     session: Option<Session>,
     publish: Option<Snapshot>,
     show: bool,
+    hide: bool,
     action: Option<Action>,
     edit_target: Option<(u64, u64)>,
     next_epoch: u64,
@@ -99,6 +100,125 @@ pub fn end_owner(owner: i64) {
             *route = None;
         }
     }
+}
+fn retire_widget_route(route: &mut Route, widget: u64, discard: bool) -> bool {
+    if discard {
+        route.interruptions.retain(|item| item.widget != widget);
+    }
+    if route
+        .session
+        .as_ref()
+        .is_some_and(|session| session.state.widget == widget)
+    {
+        if discard {
+            route.session = None;
+        } else if !retire_session(route) {
+            return false;
+        }
+        route.show = false;
+        route.hide = true;
+    }
+    if route
+        .publish
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.widget == widget)
+    {
+        route.publish = None;
+    }
+    if route.action.is_some_and(|action| action.widget == widget) {
+        route.action = None;
+    }
+    if route.edit_target.is_some_and(|target| target.0 == widget) {
+        route.edit_target = None;
+    }
+    true
+}
+/// Retire exactly this input identity before a UI transaction changes buffers.
+/// A switch preserves pending/composing recovery; explicit Cancel may discard it.
+pub fn retire_widget(id: egui::Id, discard: bool) -> bool {
+    let wake = {
+        let Ok(mut guard) = ROUTE.lock() else {
+            return false;
+        };
+        let Some(route) = guard.as_mut() else {
+            return true;
+        };
+        if !retire_widget_route(route, id.value(), discard) {
+            return false;
+        }
+        route.wake.clone()
+    };
+    wake();
+    true
+}
+/// Drain uncertainty into its owning draft before changing widget identity.
+/// No focus exception is needed: this does not apply text to a different widget.
+fn transition_route(route: &mut Route, widget: u64, text: &mut String) -> EditOutcome {
+    let mut outcome = EditOutcome::default();
+    let mut recoveries = Vec::new();
+    while let Some(index) = route
+        .interruptions
+        .iter()
+        .position(|item| item.widget == widget)
+    {
+        recoveries.push(route.interruptions.remove(index));
+    }
+    if route
+        .session
+        .as_ref()
+        .is_some_and(|session| session.state.widget == widget)
+    {
+        let session = route.session.take().unwrap();
+        let latest = session.pending.as_ref().unwrap_or(&session.state);
+        if session.pending.is_some() || latest.composing != [-1, -1] {
+            recoveries.push(Recovery {
+                widget,
+                base: session.state.text.clone(),
+                text: latest.text.clone(),
+            });
+            outcome.composing = latest.composing != [-1, -1];
+        }
+        route.hide = true;
+        route.show = false;
+    }
+    for recovery in recoveries {
+        outcome.active = true;
+        outcome.conflict = true;
+        if *text == recovery.base {
+            outcome.changed |= *text != recovery.text;
+            *text = recovery.text;
+        } else {
+            route.recovery = Some(recovery.text);
+        }
+    }
+    // Session was consumed atomically with pending input; late callbacks cannot
+    // queue into the old identity. Matching recoveries now belong to the draft.
+    retire_widget_route(route, widget, true);
+    if outcome.conflict {
+        route.error = Some(
+            "Pending input recovered into the original draft; review/copy it before Cancel.".into(),
+        );
+    }
+    outcome
+}
+pub fn prepare_transition(id: egui::Id, text: &mut String) -> EditOutcome {
+    let (outcome, wake) = {
+        let Ok(mut guard) = ROUTE.lock() else {
+            return EditOutcome {
+                conflict: true,
+                ..Default::default()
+            };
+        };
+        let Some(route) = guard.as_mut() else {
+            return EditOutcome::default();
+        };
+        (
+            transition_route(route, id.value(), text),
+            route.wake.clone(),
+        )
+    };
+    wake();
+    outcome
 }
 /// Return scalar offset only at an exact UTF-16 boundary (never inside a surrogate pair).
 fn scalar_offset(text: &str, offset: i32) -> Result<usize, &'static str> {
@@ -389,6 +509,7 @@ mod android {
                 session: None,
                 publish: None,
                 show: false,
+                hide: false,
                 action: None,
                 edit_target: None,
                 next_epoch: 0,
@@ -411,7 +532,7 @@ mod android {
                 ROUTE.lock().ok().and_then(|mut route| {
                     let route = route.as_mut().filter(|route| route.owner == self.owner)?;
 
-                    let mut hide = false;
+                    let mut hide = std::mem::take(&mut route.hide);
                     let refocus = route.action.and_then(|action| {
                         route
                             .session
@@ -660,6 +781,7 @@ mod tests {
             session: Some(session),
             publish: None,
             show: false,
+            hide: false,
             action: None,
             edit_target: None,
             next_epoch: 7,
@@ -669,7 +791,12 @@ mod tests {
             recovery: None,
             wake: Arc::new(|| {}),
         };
-        assert!(retire_session(&mut route));
+        // Switching retires only the intended widget and rejects old callbacks.
+        assert!(retire_widget_route(&mut route, 2, false));
+        assert!(route.session.is_some());
+        assert!(retire_widget_route(&mut route, 1, false));
+        assert!(route.session.is_none());
+        assert!(route.hide);
         assert_eq!(route.interruptions[0].widget, 1);
         assert_eq!(route.interruptions[0].text, "a🌲é");
         assert_eq!(route.interruptions[0].base, "a🌲");
@@ -692,8 +819,39 @@ mod tests {
             kind: 2,
         });
         assert!(!edit_protects(&route, 1, 7, false));
+        // A clean draft plus late Java text must not be replaced on adoption or
+        // range change. Drain directly into that owning draft, not an old-ID queue.
+        route.interruptions.clear();
+        for _ in 0..12 {
+            let mut late = state.clone();
+            late.seq = 1;
+            late.text = "a🌲late".into();
+            late.selection = [7, 7];
+            route.session = Some(Session {
+                id: egui::Id::new("fixture"),
+                state: state.clone(),
+                pending: Some(late),
+            });
+            let mut draft = state.text.clone();
+            let outcome = transition_route(&mut route, 1, &mut draft);
+            assert!(outcome.changed && outcome.conflict);
+            assert_eq!(draft, "a🌲late");
+            assert!(route.session.is_none());
+            assert!(route.interruptions.is_empty());
+        }
+        route.interruptions.push(Recovery {
+            widget: 1,
+            base: state.text.clone(),
+            text: "a🌲é".into(),
+        });
         route.next_epoch = u64::MAX;
         assert_eq!(allocate_epoch(&mut route), None);
         assert_eq!(route.interruptions[0].text, "a🌲é");
+        // Explicit Cancel clears this widget's recovery and pending menu/publication.
+        route.publish = Some(state.clone());
+        route.edit_target = Some((1, 7));
+        assert!(retire_widget_route(&mut route, 1, true));
+        assert!(route.interruptions.is_empty());
+        assert!(route.publish.is_none() && route.action.is_none() && route.edit_target.is_none());
     }
 }

@@ -1,0 +1,66 @@
+[
+  {
+    "id": "fig-add-inputs",
+    "caption": "add : Int → Int → Int",
+    "image": [
+      [
+        "",
+        [
+          "authored-illustration"
+        ],
+        [
+          [
+            "fig-alt",
+            "Three separate blue squares labelled Int, connected left to right by two arrows."
+          ],
+          [
+            "width",
+            "65mm"
+          ]
+        ]
+      ],
+      [
+        {
+          "t": "Str",
+          "c": "Three separate blue squares labelled Int, connected left to right by two arrows."
+        }
+      ],
+      [
+        "assets/fig-add-inputs/figure.svg",
+        ""
+      ]
+    ]
+  },
+  {
+    "id": "fig-choosing-a-result",
+    "caption": "Alice and Bot separate a Boolean question from the result selected by match.",
+    "image": [
+      [
+        "",
+        [
+          "authored-comic"
+        ],
+        [
+          [
+            "fig-alt",
+            "Four panels under an ash tree. Alice asks whether 20 + 22 == 42 makes 42. Bot explains that equality gives a Bool. They trace the equality to true, then match true with true => 42 and false => 0 to select 42. Changing the equality to 20 + 22 == 41 gives false and selects 0."
+          ],
+          [
+            "width",
+            "170mm"
+          ]
+        ]
+      ],
+      [
+        {
+          "t": "Str",
+          "c": "Four panels under an ash tree. Alice asks whether 20 + 22 == 42 makes 42. Bot explains that equality gives a Bool. They trace the equality to true, then match true with true => 42 and false => 0 to select 42. Changing the equality to 20 + 22 == 41 gives false and selects 0."
+        }
+      ],
+      [
+        "assets/fig-choosing-a-result/strip.png",
+        ""
+      ]
+    ]
+  }
+]

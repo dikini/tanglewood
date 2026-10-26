@@ -1,5 +1,7 @@
 # Native reader and extension boundary
 
+MVP-2 adds a concrete processing path in `document_jobs`/`pandoc` alongside these original reader/filter contracts. See [the user guide](mvp-2.md) and [runner contract/evidence](plans/mvp-2-processing.md). General filtered output has no inferred source origins; the original source outline remains the editing boundary.
+
 `markdown::read(NoteId, Revision, &str)` builds owned renderer-independent blocks
 and inlines. The source is canonical; the reader does not serialize its model
 back to Markdown. Origins contain note ID, opaque revision and UTF-8 byte range.

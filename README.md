@@ -3,6 +3,8 @@
 A Rust notes application for Linux and Android, delivered against [the MVP plan](docs/plan/tanglewood-mvp.md).
 Implementation, acceptance evidence and limitations are recorded in [MVP status](docs/mvp-status.md)
 and [capabilities](docs/capabilities.md).
+The minimal MVP-2 editor/filter increment is described in [the user guide](docs/mvp-2.md)
+and tracked separately in [MVP-2 status](docs/mvp-2-status.md).
 
 ## Development
 
@@ -17,7 +19,7 @@ If this environment's configured sccache cannot start inside the sandbox, use
 `RUSTC_WRAPPER= cargo test --locked --lib --no-default-features`.
 Dependency downloads require network access; an offline run needs a populated cache.
 
-Launch the current Linux source editor with a selected vault:
+Launch the Linux editor with a selected vault:
 
 ```sh
 cargo run --locked --bin tanglewood --features gui -- --vault /path/to/vault
@@ -25,8 +27,9 @@ cargo run --locked --bin tanglewood --features gui -- --vault /path/to/vault
 
 Without `--vault`, storage defaults to `$XDG_DATA_HOME/tanglewood/vault` or
 `$HOME/.local/share/tanglewood/vault`. Use `--headless` to open and list a vault
-without graphics. One process may write a vault at a time. Source edits autosave;
-“Saved” means SQLite acknowledged that revision. Save failures retain accepted
+without graphics. One process may write a vault at a time. Source edits remain drafts
+until **Ready**; **Cancel** discards the unsubmitted draft. Accepted revisions save
+automatically; “Saved” means SQLite acknowledged that revision. Save failures retain accepted
 content in memory and show a retry action. Wait for Saved before terminating.
 The editor also provides search, rename/trash/restore, links/backlinks and preview.
 Explicit Markdown I/O and Linux directory mirroring are available through the shared
@@ -51,7 +54,9 @@ an API35 Android emulator; Unicode/composed input, selection/system clipboard,
 SAF, lifecycle/restart and Linux synchronization passed. See [Android evidence](docs/android-emulator-evidence.md).
 Use the [Android build instructions](docs/android-build.md) for the picker and foreground LAN.
 
-Optional D-Bus and external filter execution are deferred. Canonical Markdown,
+Optional D-Bus remains deferred. MVP-2 adds explicit Linux Pandoc/Lua/JSON processing
+and local saved-artwork preview; Android supports the documented Rust illustration
+preparation subset. Artwork transfer and publishing/export profiles are deferred. Canonical Markdown,
 single-writer command routing, persistence acknowledgement, and recoverable conflicts
 are required boundaries throughout implementation.
 

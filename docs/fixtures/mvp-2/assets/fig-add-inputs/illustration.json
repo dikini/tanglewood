@@ -1,0 +1,70 @@
+{
+  "version": 1,
+  "svg": "figure.svg",
+  "figure": {
+    "id": "fig-add-inputs",
+    "caption": "add : Int → Int → Int",
+    "description": "Three separate blue squares labelled Int, connected left to right by two arrows."
+  },
+  "construction": {
+    "kind": "custom-svg",
+    "source": "base.svg",
+    "roles": [
+      [
+        "rect",
+        "first"
+      ],
+      [
+        "path",
+        "first-arrow"
+      ],
+      [
+        "rect",
+        "second"
+      ],
+      [
+        "path",
+        "second-arrow"
+      ],
+      [
+        "rect",
+        "result"
+      ]
+    ],
+    "appearance": {
+      "stroke": "rough",
+      "roughness": 1.8,
+      "bowing": 1,
+      "font": "excalifont",
+      "seed": 1729
+    }
+  },
+  "interpretation": {
+    "problem": "Illustrate the signature literally as three blue boxes with arrows.",
+    "relationship": "Compare three positions; do not imply a function-valued subtree or evaluation timeline.",
+    "filter": "Outline lettering, preserve exact fills, roughen only the declared shape contours."
+  },
+  "renderer": {
+    "command": "node src/author.mjs --state 'examples/custom/assets/fig-add-inputs/illustration.json'",
+    "argv": [
+      "node",
+      "src/author.mjs",
+      "--state",
+      "examples/custom/assets/fig-add-inputs/illustration.json"
+    ],
+    "dependencies": {
+      "sourceSha256": "a57391b021e166e32de0dff9b75b4861e2b2b003bec660019cbff0ccdb8cc132",
+      "browser": "Chrome/152.0.7977.75",
+      "roughjs": "4.6.6",
+      "roughBundleSha256": "6853af8619532f3939b156cd16824d2e14f31e71d3df306ad5558eeafacab194",
+      "packageLockSha256": "42e9f94f0bc05a182129df789f5dd9cb071805c86a9586dc40059511b4b83118",
+      "fonts": {
+        "Excalifont-Latin.woff2": "e4423b318e11432aff2e6e865e300b7ca270f92321a3f56632268fede01c1b48",
+        "IBMPlexMono-Regular.ttf": "a3c50f7c0e063998cfaeae56c6169ece9e0feaffaef425aa038f85d037fb4b9b"
+      }
+    }
+  },
+  "provenance": {
+    "svgSha256": "af450d6b40c07dce0aa605716d24fbc81933c60841a2f00a949b81b132e3c609"
+  }
+}

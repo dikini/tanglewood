@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "png": "strip.png",
+  "construction": {
+    "kind": "generated-comic",
+    "series": "learn-ash",
+    "tool": "built-in image tool",
+    "model": "not exposed by tool",
+    "prompt": "prompt.txt",
+    "prompt_sha256": "d9b81a4b9e57588bec44230bcd55c56398a01023356ebca4b15e6963c3102688",
+    "references": [
+      {
+        "id": "alice-bot-v1",
+        "path": "shared/characters/alice-bot-v1.png",
+        "role": "primary character identity",
+        "sha256": "7b929bae8c1c4f7d01ef4d5324aa8938d39edc2b17189829b3c7349e70ce9989"
+      },
+      {
+        "id": "pencil-pilot-v1",
+        "path": "shared/style/pencil-pilot-v1.png",
+        "role": "pencil style and ash-tree setting; character sheet wins on identity",
+        "sha256": "f99a35a9f95d9319f88c44d154689bfd4fd8c636d8ae0d0ac608701c7dade7ef"
+      }
+    ],
+    "image_sha256": "e67d959ff7036f0f56e42bfdcde1cfe6e542385acb99dec83fdf810239c46b3c",
+    "pixels": [
+      1536,
+      1024
+    ]
+  }
+}
