@@ -12,11 +12,13 @@ fn main()->Result<(),Box<dyn std::error::Error>> {
   assert!(source[figure.source_bytes.clone()].contains(&format!("#{}",figure.id)));
  }
  assert_eq!(prepared.figures.len(),2);
+ let expected_metadata:serde_json::Value=serde_json::from_slice(&fs::read(root.join("expected-derived-metadata.json"))?)?;
+ assert_eq!(serde_json::to_value(&prepared.metadata)?,expected_metadata);
  // Actually decode the accepted comic on the device as a usable raster, not
  // just an envelope/header assertion. Renderer/APK wiring remains later work.
  let png=&input.assets.iter().find(|asset|asset.relative_path.ends_with("strip.png")).ok_or("PNG")?.bytes;
  let mut decoder=png::Decoder::new(Cursor::new(png)).read_info()?;let mut pixels=vec![0;decoder.output_buffer_size().ok_or("PNG size")?];let image=decoder.next_frame(&mut pixels)?;assert_eq!((image.width,image.height),(1536,1024));
  let mut missing=input;missing.assets.retain(|asset|!asset.relative_path.ends_with("figure.svg"));assert!(matches!(prepare(missing),Err(PreparationError::Missing(_))));
- println!("{}",serde_json::json!({"result":"PASS","platform":std::env::consts::OS,"architecture":std::env::consts::ARCH,"figures":prepared.figures,"semantic_matches_pinned_upstream":true,"missing_svg_rejected":true,"comic_decoded_pixels":[image.width,image.height],"source_unchanged":true}));
+ println!("{}",serde_json::json!({"result":"PASS","platform":std::env::consts::OS,"architecture":std::env::consts::ARCH,"figures":prepared.figures,"metadata":prepared.metadata,"semantic_matches_pinned_upstream":true,"missing_svg_rejected":true,"comic_decoded_pixels":[image.width,image.height],"source_unchanged":true}));
  Ok(())
 }

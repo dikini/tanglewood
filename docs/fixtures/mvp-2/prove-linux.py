@@ -15,6 +15,9 @@ for writer in ('json','html'):
  if writer=='html':command+=['--standalone','--embed-resources','--resource-path',str(snapshot),'--metadata','pagetitle=Saved artwork proof']
  output=subprocess.run(command,env=env,capture_output=True);assert output.returncode==0,output.stderr.decode();(work/f'output.{writer}').write_bytes(output.stdout)
  tree=json.loads((work/f'output.{writer}.prepared.json').read_text());figures=[node for node in tree['blocks'] if node['t']=='Figure'];assert len(figures)==2
+ metadata={'illustrations':{identifier:{key:value['c'] for key,value in entry['c'].items()} for identifier,entry in tree['meta']['illustrations']['c'].items()}}
+ assert metadata==json.loads((fixture/'expected-derived-metadata.json').read_text())
+ if writer=='json':(work/'derived-metadata.json').write_text(json.dumps(metadata,ensure_ascii=False,indent=2))
  assert any(node['t']=='Div' and node['c'][0][0]=='callout-proof' and node['c'][1][0]['t']=='BlockQuote' for node in tree['blocks'])
  semantic=[{'id':node['c'][0][0],'caption':node['c'][1][1][0]['c'][0]['c'],'image':node['c'][2][0]['c'][0]['c']} for node in figures]
  if writer=='json':(work/'semantic.json').write_text(json.dumps(semantic,ensure_ascii=False,indent=2))
@@ -27,4 +30,4 @@ rejected=subprocess.run(['/usr/bin/pandoc','-f','markdown','-t','json','--lua-fi
 assert rejected.returncode!=0 and b'existing local SVG' in rejected.stderr
 assert hashlib.sha256(source.read_bytes()).hexdigest()==before
 (work/'rejected.stderr').write_bytes(rejected.stderr)
-print(json.dumps({'result':'PASS','pandoc':subprocess.check_output(['/usr/bin/pandoc','--version']).decode().splitlines()[0],'upstream_commit':PIN,'source_sha256':before,'figures':2,'targets':['json','html'],'callout_before_prepare':True,'missing_svg_rejected':True,'source_unchanged':True,'evidence':str(work)},indent=2))
+print(json.dumps({'result':'PASS','pandoc':subprocess.check_output(['/usr/bin/pandoc','--version']).decode().splitlines()[0],'upstream_commit':PIN,'source_sha256':before,'figures':2,'targets':['json','html'],'callout_before_prepare':True,'explicit_image_metadata':True,'missing_svg_rejected':True,'source_unchanged':True,'evidence':str(work)},indent=2))

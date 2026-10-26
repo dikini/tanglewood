@@ -6,6 +6,7 @@ pub use app::App;
 
 pub mod store;
 
+pub mod document_world;
 pub mod extensions;
 #[cfg(feature = "documents")]
 pub mod illustration;

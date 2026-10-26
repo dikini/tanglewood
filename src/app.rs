@@ -76,7 +76,6 @@ pub struct App {
     lan_join: Option<JoinCommit>,
     #[cfg(feature = "lan")]
     lan_prepare_pending: bool,
-    #[cfg(feature = "lan")]
     vault_directory: Option<std::path::PathBuf>,
     #[cfg(feature = "sync")]
     replica: Option<crate::sync::Replica>,
@@ -123,7 +122,6 @@ impl App {
         let history = state.history.clone();
         let mut app = Self {
             store: Some(store),
-            #[cfg(feature = "lan")]
             vault_directory: Some(directory.to_path_buf()),
             #[cfg(feature = "lan")]
             lan_state: crate::lan_owner::LanState::with_preparation(state.preparation),
@@ -1203,6 +1201,41 @@ impl App {
     }
     pub fn note(&self, id: NoteId) -> Result<NoteView, CommandError> {
         self.view(id)
+    }
+    /// One shared, rebuildable parsed sub-world per accepted note revision.
+    pub fn parsed_document(
+        &mut self,
+        id: NoteId,
+    ) -> Result<std::sync::Arc<crate::document_world::DocumentWorld>, CommandError> {
+        use crate::document_world::{DocumentWorld, ParsedDocument};
+        let entity = *self.ids.get(&id).ok_or(CommandError::NotFound)?;
+        let record = self
+            .world
+            .get::<NoteRecord>(entity)
+            .ok_or(CommandError::NotFound)?;
+        let previous = self
+            .world
+            .get::<ParsedDocument>(entity)
+            .map(|document| document.0.clone());
+        if let Some(document) = previous
+            .as_ref()
+            .filter(|document| document.revision() == record.revision)
+        {
+            return Ok(document.clone());
+        }
+        let document = std::sync::Arc::new(DocumentWorld::parse(
+            id,
+            record.revision,
+            &record.text,
+            previous.as_deref(),
+        ));
+        self.world
+            .entity_mut(entity)
+            .insert(ParsedDocument(document.clone()));
+        Ok(document)
+    }
+    pub fn vault_directory(&self) -> Option<&Path> {
+        self.vault_directory.as_deref()
     }
     pub fn notes(&self) -> Vec<NoteView> {
         let mut notes: Vec<_> = self

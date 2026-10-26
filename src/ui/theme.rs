@@ -167,8 +167,9 @@ pub(super) fn control(ui: &egui::Ui, icon: Icon) -> egui::Button<'static> {
     } else {
         34.0
     };
-    egui::Button::image(image(ui, icon))
-        .frame(false)
+    egui::Button::new(image(ui, icon))
+        .frame(true)
+        .corner_radius(6)
         .min_size(egui::vec2(size, size))
 }
 pub(super) fn button(ui: &mut egui::Ui, icon: Icon, label: &str, enabled: bool) -> egui::Response {
@@ -181,8 +182,24 @@ pub(super) fn selected_button(
     enabled: bool,
     selected: bool,
 ) -> egui::Response {
+    let size = if cfg!(target_os = "android") {
+        44.0
+    } else {
+        34.0
+    };
     let response = ui
-        .add_enabled(enabled, control(ui, icon).selected(selected))
+        .scope(|ui| {
+            // Equal padding centres the 18px icon in the square hit target,
+            // independently of the surrounding panel's left-aligned layout.
+            ui.spacing_mut().button_padding = egui::Vec2::splat((size - 18.0) * 0.5);
+            ui.add_enabled(
+                enabled,
+                control(ui, icon)
+                    .selected(selected)
+                    .frame_when_inactive(selected),
+            )
+        })
+        .inner
         .on_hover_text(label);
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
     response

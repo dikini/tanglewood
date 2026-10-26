@@ -1,10 +1,18 @@
 //! Quiet native document presentation. Editing always targets original source.
-use crate::markdown::{BlockKind, Inline, RenderBlock};
+use crate::markdown::{BlockKind, Inline};
 use eframe::egui;
 use std::ops::Range;
 
-pub(super) fn render_block(ui: &mut egui::Ui, block: &RenderBlock, navigate: &mut Option<String>) {
-    match &block.kind {
+pub(super) fn render_node(
+    ui: &mut egui::Ui,
+    document: &crate::document_world::DocumentWorld,
+    entity: bevy_ecs::entity::Entity,
+    navigate: &mut Option<String>,
+) {
+    let Some(block) = document.node(entity) else {
+        return;
+    };
+    match block.kind {
         BlockKind::Fence(fence)
             if fence
                 .attributes
@@ -33,16 +41,16 @@ pub(super) fn render_block(ui: &mut egui::Ui, block: &RenderBlock, navigate: &mu
         }
         BlockKind::Fence(fence) => code(ui, &fence.body),
         BlockKind::Source(source) => render_source(ui, source, navigate),
-        BlockKind::Paragraph => prose(ui, &block.inlines, None, navigate),
-        BlockKind::Heading(level) => prose(ui, &block.inlines, Some(*level), navigate),
+        BlockKind::Paragraph => prose(ui, block.inlines, None, navigate),
+        BlockKind::Heading(level) => prose(ui, block.inlines, Some(*level), navigate),
         BlockKind::Quote => quote(ui, |ui| {
-            for child in &block.children {
-                render_block(ui, child, navigate);
+            for child in block.children {
+                render_node(ui, document, *child, navigate);
             }
         }),
         BlockKind::Div => {
-            for child in &block.children {
-                render_block(ui, child, navigate);
+            for child in block.children {
+                render_node(ui, document, *child, navigate);
             }
         }
     }
@@ -251,6 +259,7 @@ pub(super) fn editable_block(
     source: Option<Range<usize>>,
     render: impl FnOnce(&mut egui::Ui),
 ) -> Option<Range<usize>> {
+    let focus_id = super::navigation::block_id(&id);
     let mut clicked = false;
     let touch = cfg!(target_os = "android") || ui.input(|input| input.has_touch_screen());
     let size = if touch { 44.0 } else { 28.0 };
@@ -263,8 +272,10 @@ pub(super) fn editable_block(
                 egui::Layout::top_down(egui::Align::Min),
                 render,
             );
-            let (rect, response) = ui.allocate_exact_size(
-                egui::vec2(size, size),
+            let rect = ui.allocate_space(egui::vec2(size, size)).1;
+            let response = ui.interact(
+                rect,
+                focus_id,
                 if source.is_some() {
                     egui::Sense::click()
                 } else {
@@ -272,13 +283,28 @@ pub(super) fn editable_block(
                 },
             );
             if source.is_some() {
+                super::navigation::lock_arrows(&response);
+                if response.gained_focus() {
+                    ui.scroll_to_rect(content.response.rect, None);
+                }
+                if response.has_focus() {
+                    let offset = egui::vec2(-10.0, 0.0);
+                    let top = content.response.rect.left_top() + offset;
+                    let bottom = content.response.rect.left_bottom() + offset;
+                    ui.painter()
+                        .with_clip_rect(ui.clip_rect().expand2(egui::vec2(12.0, 0.0)))
+                        .line_segment(
+                            [top, bottom],
+                            egui::Stroke::new(
+                                2.0,
+                                ui.visuals().weak_text_color().gamma_multiply(0.6),
+                            ),
+                        );
+                }
                 response.widget_info(|| {
                     egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Edit block source")
                 });
-                let visible = touch
-                    || content.response.contains_pointer()
-                    || response.hovered()
-                    || response.has_focus();
+                let visible = touch || content.response.contains_pointer() || response.hovered();
                 if visible {
                     let color = if response.hovered() || response.has_focus() {
                         ui.visuals().text_color()
@@ -296,17 +322,9 @@ pub(super) fn editable_block(
                         center + egui::vec2(-6.0, 6.0),
                     ];
                     ui.painter().add(egui::Shape::line(points.to_vec(), stroke));
-                    if response.has_focus() {
-                        ui.painter().rect_stroke(
-                            rect.shrink(2.0),
-                            5.0,
-                            ui.visuals().selection.stroke,
-                            egui::StrokeKind::Inside,
-                        );
-                    }
                 }
                 clicked = response.clicked();
-                response.on_hover_text("Edit block source");
+                response.on_hover_text("Edit block source · Enter\nPrevious/next block · ↑/↓");
             }
         });
     });
@@ -574,7 +592,9 @@ pub(super) fn render_pandoc(
                     if let Some(figure) = verified_pandoc_figure(block, counts, figures, source) {
                         let range = editable.then(|| figure.source_bytes.clone());
                         if let Some(range) =
-                            editable_block(ui, "figure", range, |ui| artwork.figure(ui, figure))
+                            editable_block(ui, ("figure", &figure.id), range, |ui| {
+                                artwork.figure(ui, figure)
+                            })
                         {
                             *selected = Some(range);
                         }

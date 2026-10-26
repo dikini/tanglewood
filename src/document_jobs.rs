@@ -1,7 +1,7 @@
 //! One active document worker plus one replaceable pending immutable request.
 pub use crate::pandoc::ProcessingError;
 use crate::{
-    illustration::{self, AssetFile, PreparationInput, PreparedFigure},
+    illustration::{self, AssetFile, IllustrationMetadata, PreparationInput, PreparedFigure},
     notes::{NoteId, Revision},
     pandoc::{self, PandocConfig},
 };
@@ -37,12 +37,20 @@ pub struct ProcessedDocument {
     pub resources: Vec<AssetFile>,
     pub semantic: Option<serde_json::Value>,
     pub figures: Vec<PreparedFigure>,
+    pub metadata: IllustrationMetadata,
 }
 impl ProcessedDocument {
     /// Figure references are source-relative; resource keys are snapshot-root-relative.
     pub fn figure_resource(&self, figure: &PreparedFigure) -> Option<&AssetFile> {
+        let image = self.metadata.illustrations.get(&figure.id)?;
+        if image.image != figure.asset_path
+            || image.media_type != figure.kind.media_type()
+            || !pandoc::safe_path(&image.image)
+        {
+            return None;
+        }
         let parent = std::path::Path::new(&self.logical_path).parent()?;
-        let key = parent.join(&figure.asset_path).to_str()?.replace('\\', "/");
+        let key = parent.join(&image.image).to_str()?.replace('\\', "/");
         self.resources
             .iter()
             .find(|asset| asset.relative_path == key)
@@ -212,7 +220,7 @@ fn process(
     if cancel.load(Ordering::Acquire) {
         return Err(ProcessingError::Cancelled);
     }
-    let semantic = match config {
+    let mut semantic = match config {
         ProcessingConfig::NativeIllustrations => None,
         ProcessingConfig::Pandoc(config) => Some(pandoc::run(
             &snapshot.source,
@@ -223,16 +231,38 @@ fn process(
         )?),
     };
     // The named artwork subset must not become a general Markdown/YAML gate.
-    let figures = if has_artwork_fence(&snapshot.source) {
-        illustration::prepare(PreparationInput {
-            source: snapshot.source.clone(),
-            logical_path: snapshot.logical_path.clone(),
-            assets: snapshot.resources.clone(),
-        })?
-        .figures
+    let references = semantic
+        .as_ref()
+        .map(IllustrationMetadata::from_pandoc)
+        .transpose()?
+        .flatten();
+    let prepared = if has_artwork_fence(&snapshot.source) {
+        illustration::prepare_with_metadata(
+            PreparationInput {
+                source: snapshot.source.clone(),
+                logical_path: snapshot.logical_path.clone(),
+                assets: snapshot.resources.clone(),
+            },
+            references.as_ref(),
+        )?
     } else {
-        Vec::new()
+        if references
+            .as_ref()
+            .is_some_and(|meta| !meta.illustrations.is_empty())
+        {
+            return Err(illustration::PreparationError::Metadata(
+                "image references have no authored illustration fences".into(),
+            )
+            .into());
+        }
+        illustration::PreparedIllustrations {
+            figures: Vec::new(),
+            metadata: IllustrationMetadata::default(),
+        }
     };
+    if let Some(semantic) = &mut semantic {
+        prepared.metadata.write_pandoc(semantic);
+    }
     if cancel.load(Ordering::Acquire) {
         return Err(ProcessingError::Cancelled);
     }
@@ -241,11 +271,12 @@ fn process(
         logical_path: snapshot.logical_path,
         resources: snapshot.resources,
         semantic,
-        figures,
+        figures: prepared.figures,
+        metadata: prepared.metadata,
     })
 }
 
-fn has_artwork_fence(source: &str) -> bool {
+pub(crate) fn has_artwork_fence(source: &str) -> bool {
     use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag};
     Parser::new_ext(source, Options::all())
         .into_offset_iter()
@@ -279,6 +310,66 @@ mod tests {
             resources: Vec::new(),
         }
     }
+    #[test]
+    fn processed_metadata_is_the_renderer_resource_authority() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/fixtures/mvp-2");
+        let original = std::fs::read_to_string(root.join("with-image-references.md")).unwrap();
+        let mut request = snapshot(&original);
+        request.logical_path = "chapter/source.md".into();
+        for path in [
+            "assets/fig-add-inputs/figure.svg",
+            "assets/fig-choosing-a-result/strip.png",
+        ] {
+            request.resources.push(AssetFile {
+                relative_path: format!("chapter/{path}"),
+                bytes: std::fs::read(root.join(path)).unwrap(),
+            });
+        }
+        let mut result = process(
+            request,
+            ProcessingConfig::NativeIllustrations,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let expected: IllustrationMetadata = serde_json::from_slice(
+            &std::fs::read(root.join("expected-derived-metadata.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result.metadata, expected);
+        assert_eq!(result.source, original);
+        for figure in &result.figures {
+            let asset = result.figure_resource(figure).unwrap();
+            assert_eq!(
+                asset.relative_path,
+                format!(
+                    "chapter/{}",
+                    result.metadata.illustrations[&figure.id].image
+                )
+            );
+        }
+        let figure = result.figures[0].clone();
+        result.metadata.illustrations.remove(&figure.id);
+        assert!(result.figure_resource(&figure).is_none());
+        // A conventional file in the snapshot does not authorize a missing or
+        // inconsistent metadata entry, even when the figure's old path exists.
+        result.metadata = expected.clone();
+        result
+            .metadata
+            .illustrations
+            .get_mut(&figure.id)
+            .unwrap()
+            .media_type = "image/png".into();
+        assert!(result.figure_resource(&figure).is_none());
+        result.metadata = expected;
+        result
+            .metadata
+            .illustrations
+            .get_mut(&figure.id)
+            .unwrap()
+            .image = "missing.svg".into();
+        assert!(result.figure_resource(&figure).is_none());
+    }
+
     #[test]
     fn latest_request_and_resource_validation() {
         let mut jobs = DocumentJobs::default();

@@ -32,6 +32,14 @@ until **Ready**; **Cancel** discards the unsubmitted draft. Accepted revisions s
 automatically; “Saved” means SQLite acknowledged that revision. Save failures retain accepted
 content in memory and show a retry action. Wait for Saved before terminating.
 The editor also provides search, rename/trash/restore, links/backlinks and preview.
+In the native preview, F6 focuses the first document block directly, including
+from search or the notes list. Tab/Shift+Tab move between controls, with a visible
+outline on focused icon buttons. Tab also reaches block edit actions; while a block has focus,
+↑/↓ move between blocks, Home/End select the first/last, Enter edits its source,
+and Escape releases focus. A muted line spanning the block height in the left margin indicates the
+current block. The notes-pane divider shows a focus line and uses Left/Right to resize;
+focused scrollbars use Up/Down to scroll. Text fields retain their normal cursor keys. Ready/Cancel return
+focus to the block. Arbitrary Pandoc output has no inferred block navigation.
 Explicit Markdown I/O and Linux directory mirroring are available through the shared
 API and CLI. Imports/exports use local filesystem paths; note paths remain relative
 to the vault. The mirror lives in `<vault>/markdown`:
@@ -53,6 +61,8 @@ see [Linux evidence](docs/linux-smoke.md). The Java-capable x86_64 APK runs on
 an API35 Android emulator; Unicode/composed input, selection/system clipboard,
 SAF, lifecycle/restart and Linux synchronization passed. See [Android evidence](docs/android-emulator-evidence.md).
 Use the [Android build instructions](docs/android-build.md) for the picker and foreground LAN.
+
+Saved illustration/comic `image` references in YAML front matter load automatically from the note’s directory inside the vault. For a root note, `assets/figure.svg` resolves to `<vault>/assets/figure.svg`. An explicit external artwork-directory override remains available in Settings. Artwork bytes are local and are not transferred by note sync. See the [saved-reference example](docs/fixtures/mvp-2/with-image-references.md).
 
 Optional D-Bus remains deferred. MVP-2 adds explicit Linux Pandoc/Lua/JSON processing
 and local saved-artwork preview; Android supports the documented Rust illustration

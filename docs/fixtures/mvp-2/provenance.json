@@ -22,5 +22,6 @@
       "bytes": 3660354,
       "sha256": "e67d959ff7036f0f56e42bfdcde1cfe6e542385acb99dec83fdf810239c46b3c"
     }
-  }
+  },
+  "saved_reference_example": "with-image-references.md copies source.md and adds only explicit image and media-type fields to its diagrams metadata; prompt fences and upstream artwork are unchanged. This is a local Tanglewood example, not an upstream illustration-md change."
 }

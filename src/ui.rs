@@ -5,6 +5,7 @@ use eframe::egui;
 
 mod document;
 mod editor;
+mod navigation;
 mod processing;
 mod theme;
 use editor::Draft;
@@ -14,7 +15,7 @@ use editor::contiguous_edit;
 use crate::{
     App,
     commands::{Caller, Command, CommandResult},
-    markdown::{self, Document},
+    document_world::DocumentWorld,
     notes::{NoteId, NoteView, Revision},
 };
 
@@ -84,7 +85,7 @@ pub struct TanglewoodUi {
     pub app: App,
     selected: Option<NoteId>,
     drafts: HashMap<NoteId, Draft>,
-    parsed: HashMap<NoteId, (Revision, Document)>,
+    parsed: HashMap<NoteId, std::sync::Arc<DocumentWorld>>,
     query: String,
     new_path: String,
     rename_path: String,
@@ -119,6 +120,8 @@ pub struct TanglewoodUi {
 
 impl TanglewoodUi {
     pub fn new(app: App) -> Self {
+        let processing =
+            processing::Processing::for_vault(app.vault_directory().map(|path| path.to_path_buf()));
         Self {
             app,
             selected: None,
@@ -143,7 +146,7 @@ impl TanglewoodUi {
             io_request: None,
             io_message: String::new(),
             io_error: None,
-            processing: processing::Processing::default(),
+            processing,
             #[cfg(feature = "lan")]
             lan_panel: LanPanel::default(),
             #[cfg(target_os = "android")]
@@ -385,8 +388,23 @@ impl TanglewoodUi {
             .drafts
             .get(&view.note.id)
             .map_or(0, |draft| draft.widget_generation + 1);
+        let context = self
+            .app
+            .parsed_document(view.note.id)
+            .ok()
+            .filter(|document| {
+                document.revision() == view.note.revision && document.source() == view.note.text
+            })
+            .unwrap_or_else(|| {
+                std::sync::Arc::new(DocumentWorld::parse(
+                    view.note.id,
+                    view.note.revision,
+                    &view.note.text,
+                    None,
+                ))
+            });
         self.drafts
-            .insert(view.note.id, Draft::new(view, generation));
+            .insert(view.note.id, Draft::with_context(view, generation, context));
     }
 
     fn file_actions_available(&self) -> bool {
@@ -452,15 +470,14 @@ impl TanglewoodUi {
             if self
                 .parsed
                 .get(&view.note.id)
-                .is_none_or(|(revision, _)| *revision != view.note.revision)
+                .is_none_or(|document| document.revision() != view.note.revision)
             {
-                self.parsed.insert(
-                    view.note.id,
-                    (
-                        view.note.revision,
-                        markdown::read(view.note.id, view.note.revision, &view.note.text),
-                    ),
-                );
+                match self.app.parsed_document(view.note.id) {
+                    Ok(document) => {
+                        self.parsed.insert(view.note.id, document);
+                    }
+                    Err(error) => self.error = Some(error.to_string()),
+                }
             }
             match self.drafts.get_mut(&view.note.id) {
                 Some(draft) if draft.revision != view.note.revision => {
@@ -757,6 +774,7 @@ impl eframe::App for TanglewoodUi {
         let mut edit_range = None;
         let mut read_requested = false;
         let mut editor_action = None;
+        let mut return_to_block = None;
         let files_available = self.file_actions_available();
         if ctx.input(|input| input.viewport().close_requested()) {
             self.closing = true;
@@ -776,8 +794,17 @@ impl eframe::App for TanglewoodUi {
         let view = notes
             .iter()
             .find(|view| Some(view.note.id) == self.selected);
+        if navigation::enter_reader(ctx, self.show_preview && !self.show_settings
+            && !self.show_status && self.note_dialog.is_none()) {
+            if let Some(view) = view.filter(|view| !view.note.trashed) {
+                self.processing.focus_block(view.note.id, 0);
+                ctx.request_repaint();
+            }
+        }
         if let Some(view) = view {
-            self.processing.update(ctx, view);
+            if let Some(document) = self.parsed.get(&view.note.id) {
+                self.processing.update(ctx, view, document.clone());
+            }
         }
         egui::SidePanel::left("activity-rail")
             .resizable(false)
@@ -836,19 +863,10 @@ impl eframe::App for TanglewoodUi {
                         panel.visible = !panel.visible;
                     }
                 }
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
-                    if theme::selected_button(
-                        ui,
-                        theme::Icon::Settings,
-                        "Settings",
-                        true,
-                        self.show_settings && self.settings_page == SettingsPage::Processing,
-                    )
-                    .clicked()
-                    {
-                        self.settings_page = SettingsPage::Processing;
-                        self.show_settings = true;
-                    }
+                let bottom_controls_height = 2.0 * if mobile { 44.0 } else { 34.0 }
+                    + ui.spacing().item_spacing.y;
+                ui.add_space((ui.available_height() - bottom_controls_height).max(0.0));
+                ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
                     if theme::selected_button(
                         ui,
                         theme::Icon::Connections,
@@ -859,6 +877,18 @@ impl eframe::App for TanglewoodUi {
                     .clicked()
                     {
                         self.settings_page = SettingsPage::Connections;
+                        self.show_settings = true;
+                    }
+                    if theme::selected_button(
+                        ui,
+                        theme::Icon::Settings,
+                        "Settings",
+                        true,
+                        self.show_settings && self.settings_page == SettingsPage::Processing,
+                    )
+                    .clicked()
+                    {
+                        self.settings_page = SettingsPage::Processing;
                         self.show_settings = true;
                     }
                 });
@@ -925,7 +955,7 @@ impl eframe::App for TanglewoodUi {
                     } else {
                         String::new()
                     };
-                    egui::ScrollArea::vertical()
+                    let note_scroll = egui::ScrollArea::vertical()
                         .id_salt("note-list")
                         .auto_shrink([false, false])
                         .max_height((ui.available_height() - 32.0).max(1.0))
@@ -946,17 +976,15 @@ impl eframe::App for TanglewoodUi {
                                 if self.sidebar_view == SidebarView::Backlinks
                                     && !view.is_some_and(|selected| {
                                         other.note.id != selected.note.id
-                                            && self.parsed.get(&other.note.id).is_some_and(
-                                                |(_, doc)| {
-                                                    doc.links.iter().any(|target| {
-                                                        resolve_note_target(
-                                                            &notes,
-                                                            &other.note.path,
-                                                            target,
-                                                        ) == Some(selected.note.id)
-                                                    })
-                                                },
-                                            )
+                                            && self.parsed.get(&other.note.id).is_some_and(|doc| {
+                                                doc.links().iter().any(|target| {
+                                                    resolve_note_target(
+                                                        &notes,
+                                                        &other.note.path,
+                                                        target,
+                                                    ) == Some(selected.note.id)
+                                                })
+                                            })
                                     })
                                 {
                                     continue;
@@ -968,7 +996,8 @@ impl eframe::App for TanglewoodUi {
                                         [ui.available_width(), if mobile { 44.0 } else { 34.0 }],
                                         egui::Button::new("")
                                             .selected(selected)
-                                            .frame(selected)
+                                            .frame(true)
+                                            .frame_when_inactive(selected)
                                             .corner_radius(6),
                                     )
                                     .on_hover_text(&other.note.path);
@@ -1010,12 +1039,14 @@ impl eframe::App for TanglewoodUi {
                                 );
                             }
                         });
+                    navigation::scroll_focus(ctx, &note_scroll);
                     ui.label(
                         egui::RichText::new("Personal vault")
                             .small()
                             .color(theme::muted(ui)),
                     );
                 });
+            if !mobile { navigation::panel_focus(ctx, egui::Id::new("notes"), false, "Resize notes pane"); }
         }
         #[cfg(all(target_os = "linux", feature = "codex"))]
         if let Some(panel) = &mut self.conversation {
@@ -1056,7 +1087,24 @@ impl eframe::App for TanglewoodUi {
                             )
                             .truncate(),
                         );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            let can_mode = view.is_some_and(|view| {
+                                !view.note.trashed
+                                    && self
+                                        .drafts
+                                        .get(&view.note.id)
+                                        .is_some_and(Draft::can_change_mode)
+                            });
+                            if theme::button(
+                                ui,
+                                theme::Icon::Source,
+                                "Edit document source",
+                                can_mode,
+                            )
+                            .clicked()
+                            {
+                                edit_range = Some(None);
+                            }
                             let more = theme::button(ui, theme::Icon::More, "Note actions", true);
                             egui::Popup::menu(&more).show(|ui| {
                                 if let Some(view) = view {
@@ -1100,8 +1148,11 @@ impl eframe::App for TanglewoodUi {
                                         ui.close();
                                     }
                                     ui.menu_button("Edit original block…", |ui| {
-                                        if let Some((_, doc)) = self.parsed.get(&view.note.id) {
-                                            for block in &doc.blocks {
+                                        if let Some(doc) = self.parsed.get(&view.note.id) {
+                                            for entity in doc.roots() {
+                                                let Some(block) = doc.node(*entity) else {
+                                                    continue;
+                                                };
                                                 if let Some(origin) =
                                                     block.origin.as_ref().filter(|origin| {
                                                         origin.note == view.note.id
@@ -1172,23 +1223,6 @@ impl eframe::App for TanglewoodUi {
                                     ui.close();
                                 }
                             });
-                            let can_mode = view.is_some_and(|view| {
-                                !view.note.trashed
-                                    && self
-                                        .drafts
-                                        .get(&view.note.id)
-                                        .is_some_and(Draft::can_change_mode)
-                            });
-                            if theme::button(
-                                ui,
-                                theme::Icon::Source,
-                                "Edit document source",
-                                can_mode,
-                            )
-                            .clicked()
-                            {
-                                edit_range = Some(None);
-                            }
                         });
                     });
                 });
@@ -1253,7 +1287,8 @@ impl eframe::App for TanglewoodUi {
                                 egui::Button::new(
                                     egui::RichText::new(label).size(11.0).color(color),
                                 )
-                                .frame(false)
+                                .frame(true)
+                                .frame_when_inactive(false)
                                 .min_size(egui::vec2(0.0, 20.0)),
                             )
                             .on_hover_text("Open status details")
@@ -1272,7 +1307,7 @@ impl eframe::App for TanglewoodUi {
                     });
                 });
             egui::CentralPanel::default().frame(egui::Frame::new().fill(main_fill)).show(ctx,|ui| {
-                egui::ScrollArea::vertical().id_salt("editor-scroll").auto_shrink([false,false]).show(ui,|ui| {
+                let document_scroll = egui::ScrollArea::vertical().id_salt("editor-scroll").auto_shrink([false,false]).show(ui,|ui| {
                     let width=ui.available_width().min(730.0);
                     let margin=((ui.available_width()-width)*0.5).max(0.0);
                     ui.horizontal_top(|ui| {
@@ -1289,9 +1324,9 @@ impl eframe::App for TanglewoodUi {
                                     editor_action=editor::source_editor(ui,draft,view.note.id,view.note.trashed,false,height);
                                 } else if !self.show_preview && draft.inline_block().is_some() {
                                     let context=draft.context.clone();
-                                    let source=draft.base_text.clone();
+                                    let source=context.source();
                                     let range=draft.range.clone().expect("inline block has a range");
-                                    self.processing.show_inline(ui,view,&context,&source,&range,&mut |ui| {
+                                    self.processing.show_inline(ui,view,&context,source,&range,&mut |ui| {
                                         let height=(ctx.content_rect().height()*0.65).max(80.0);
                                         editor_action=editor::source_editor(ui,draft,view.note.id,view.note.trashed,true,height);
                                     });
@@ -1302,6 +1337,7 @@ impl eframe::App for TanglewoodUi {
                         });
                     });
                 });
+                navigation::scroll_focus(ctx, &document_scroll);
             });
         } else {
             egui::CentralPanel::default()
@@ -1352,6 +1388,7 @@ impl eframe::App for TanglewoodUi {
         if let Some(action) = editor_action {
             if let Some(view) = view {
                 let draft = self.drafts.get(&view.note.id).expect("selected note draft");
+                return_to_block = draft.range.as_ref().map(|range| (view.note.id, range.start));
                 match action {
                     editor::EditorAction::Ready => {
                         if let Some(edit) = draft.edit() {
@@ -1679,6 +1716,12 @@ impl eframe::App for TanglewoodUi {
             }
             if ready && transition_ok && self.error.is_none() {
                 self.show_preview = true;
+            }
+        }
+        if self.show_preview {
+            if let Some((note, offset)) = return_to_block {
+                self.processing.focus_block(note, offset);
+                ctx.request_repaint();
             }
         }
         if let Some(id) = select {

@@ -6,10 +6,12 @@
 - `docs/mvp-goal.md` is the executable MVP goal prompt. Execute it only when the user asks to start/resume that goal; its presence does not authorize starting implementation during documentation work.
 - Preserve the plan's incremental delivery, optional capabilities, and testing stopping rules. Do not silently drop required deliverables or promote deferred features into release gates.
 - Prefer a single Rust package, standalone ECS, egui direct-style rendering, explicit shared commands, and small concrete modules. Command implementation and GUI exposure are independent.
+- Parsed Markdown uses the approved document sub-world model in `docs/plans/2026-10-26-document-subworlds.md`: one current cached sub-world per note, inline runs within block components, view-local layout/focus, and immutable older generations for active drafts.
 - Filters transform derived views; source changes use revision-checked commands. MCP, optional D-Bus, AI, and future plugin actions share domain validation and dispatch.
 
 ## Approved GUI direction
 
+- Terminology: **styling** means presentation (fonts, colors, spacing, layout); **formatting** means changing Markdown markup through source-edit commands. Styling does not modify authored source.
 - The user-approved UI reference is `docs/design/tanglewood-quiet-desktop.html`; implementation rules are in `docs/plans/2026-10-26-approved-egui-shell.md`. Read them before GUI work.
 - Preserve its Codex-inspired quiet rail/sidebar/header, centered document and contextual source editing. Prefer frameless icons with tooltips/accessibility labels; secondary actions live in menus/settings.
 - Do not reintroduce always-visible numbered block-edit lists, processing/debug configuration, rename/trash forms, metadata explanations or routine status rows into the document surface. Validate visible results against the approved reference, not compilation alone.

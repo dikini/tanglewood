@@ -11,11 +11,25 @@ pub(super) struct Draft {
     pub(super) composing: bool,
     pub(super) range: Option<Range<usize>>,
     pub(super) highlight: Option<(String, bool, eframe::egui::text::LayoutJob)>,
-    pub(super) context: std::sync::Arc<crate::markdown::Document>,
+    pub(super) context: std::sync::Arc<crate::document_world::DocumentWorld>,
 }
 
 impl Draft {
+    #[cfg(test)]
     pub(super) fn new(view: &NoteView, widget_generation: u64) -> Self {
+        let context = std::sync::Arc::new(crate::document_world::DocumentWorld::parse(
+            view.note.id,
+            view.note.revision,
+            &view.note.text,
+            None,
+        ));
+        Self::with_context(view, widget_generation, context)
+    }
+    pub(super) fn with_context(
+        view: &NoteView,
+        widget_generation: u64,
+        context: std::sync::Arc<crate::document_world::DocumentWorld>,
+    ) -> Self {
         Self {
             text: view.note.text.clone(),
             base_text: view.note.text.clone(),
@@ -25,11 +39,7 @@ impl Draft {
             composing: false,
             range: None,
             highlight: None,
-            context: std::sync::Arc::new(crate::markdown::read(
-                view.note.id,
-                view.note.revision,
-                &view.note.text,
-            )),
+            context,
         }
     }
     pub(super) fn dirty(&self) -> bool {
@@ -57,16 +67,17 @@ impl Draft {
     }
     /// Only an exact original top-level block has an in-place editing slot.
     /// Custom fences need more room than their rendered illustration/callout.
-    pub(super) fn inline_block(&self) -> Option<&crate::markdown::RenderBlock> {
+    pub(super) fn inline_block(&self) -> Option<crate::document_world::Node<'_>> {
         let range = self.range.as_ref()?;
-        self.context.blocks.iter().find(|block| {
-            block
-                .origin
-                .as_ref()
-                .is_some_and(|origin| origin.bytes == *range)
-                && !matches!(&block.kind, crate::markdown::BlockKind::Fence(fence)
+        self.context
+            .roots()
+            .iter()
+            .filter_map(|entity| self.context.node(*entity))
+            .find(|block| {
+                block.origin.is_some_and(|origin| origin.bytes == *range)
+                    && !matches!(block.kind, crate::markdown::BlockKind::Fence(fence)
                     if !fence.attributes.classes.is_empty() || !fence.attributes.values.is_empty())
-        })
+            })
     }
     pub(super) fn edit(&self) -> Option<TextEdit> {
         if !self.dirty() || self.conflict || self.composing {

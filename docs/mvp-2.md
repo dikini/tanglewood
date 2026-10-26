@@ -16,7 +16,9 @@ Drafts are retained in memory when switching notes. This increment does not add 
 
 ## Local artwork and filters
 
-Open Settings from the activity rail, then Document processing. Set Artwork directory to an explicitly selected local directory containing the note-relative `assets/` tree, sidecars and saved SVG/PNG. For a root note such as `source.md`, choose `docs/fixtures/mvp-2` to try the supplied example. For a note named `chapter/source.md`, the selected directory must contain `chapter/assets/...`. Use Process / refresh artwork after changing external resources. Missing artwork reports an error; it never triggers generation.
+Saved `image` and `media-type` references load automatically when a note is opened. Paths are relative to the note’s logical directory inside the vault: a root note’s `assets/figure.svg` lives at `<vault>/assets/figure.svg`; a `chapter/source.md` reference lives at `<vault>/chapter/assets/figure.svg`. No settings or Process action is needed for those saved references.
+
+For legacy sidecar-only notes, external resource directories or advanced filters, Settings → Processing still offers an optional artwork-directory override. The selected directory contains the note-relative resource tree (for a root fixture note, `docs/fixtures/mvp-2`; for `chapter/source.md`, a directory containing `chapter/assets/...`). Process / refresh artwork applies override changes or reloads externally changed files. Missing artwork reports an error; it never triggers generation.
 
 Resources are copied into an owned, bounded processing snapshot. Files must be regular local files; symlinks and oversized trees are rejected. Keep the selected directory stable while capture runs: capture does not implement an atomic live-directory transaction. Saved artwork remains local; existing note sync does **not** transfer these files.
 
@@ -39,3 +41,11 @@ The ordered Lua/Python example and pinned saved artwork are in [the fixture](fix
 One active document; no new tabs/splits, general docking or editor engine. One Notes flow style; Academic/Tufte profiles and publication export are deferred. Native Pandoc presentation currently covers paragraphs/headings, code, lists, quotes/divs and the verified illustration figures. Other nodes remain visibly available as unsupported read-only output with source mode available. No reverse conversion of processed output, plugin marketplace, attachment store/transfer protocol, or browser target is introduced.
 
 Integrated validation and remaining work are tracked in [MVP-2 status](mvp-2-status.md). The completed original MVP record is unchanged.
+
+### Saved image references
+
+The Markdown file can store `image` and `media-type` in each YAML `diagrams` entry. Tanglewood resolves that exact document-relative path, validates the image, and preserves the prompt fence. See [the complete file example](fixtures/mvp-2/with-image-references.md). Preview processing does not silently write front matter; changes to how external `illustration-md` saves these references are outside this project.
+
+### Processed image references
+
+Processors publish an `illustrations` metadata map keyed by block ID, with an exact document-relative `image` path and `media-type`. This is derived output; original source prompts are unchanged. Rendering loads these explicit references. An explicit Pandoc map is authoritative and bypasses sidecar conventions; native legacy saved-artwork preparation emits the same map after resolving its existing inputs. See the [updated fixture and metadata example](fixtures/mvp-2/README.md#explicit-rendered-image-metadata).

@@ -1,0 +1,12 @@
+{
+  "illustrations": {
+    "fig-add-inputs": {
+      "image": "assets/fig-add-inputs/figure.svg",
+      "media-type": "image/svg+xml"
+    },
+    "fig-choosing-a-result": {
+      "image": "assets/fig-choosing-a-result/strip.png",
+      "media-type": "image/png"
+    }
+  }
+}

@@ -54,10 +54,10 @@ Use one entity per note initially:
 
 - `NoteId(Uuid)` is the persistent identity; ECS `Entity` handles never cross persistence, command, or network boundaries.
 - `NoteMeta` holds the vault-relative path and trash state. `NoteText` holds source text and a revision token.
-- `SaveState` tracks accepted and persisted revisions. `ParsedMarkdown` and extracted links are optional, rebuildable components.
+- `SaveState` tracks accepted and persisted revisions. `ParsedDocument` and extracted links are optional, rebuildable derived data; the approved sub-world implementation is described in `docs/document-worlds.md`.
 - Resources hold the ID lookup, vault configuration, command queue, and worker state. Selection, tabs, drafts, cursor, IME state, and panel visibility belong in `UiState`, outside persistent note components.
 
-Do not make every paragraph, inline token, widget, or task checkbox an entity. Add block entities only if a later editing feature demonstrably needs stable block identity.
+The original MVP deferred per-block entities. The user approved document ECS sub-worlds on 2026-10-26 for the next document styling/interaction foundation; see `docs/plans/2026-10-26-document-subworlds.md`. Each note can own a lazy, rebuildable parsed sub-world with ordered block entities and inline-run components. Inline tokens and widgets are not separate entities in this pass. Layout, focus and editor buffers remain view-local; Markdown source remains authoritative.
 
 The event-loop sequence is explicit:
 

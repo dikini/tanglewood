@@ -44,6 +44,12 @@ pub enum ArtworkKind {
     Comic,
 }
 impl ArtworkKind {
+    pub(crate) fn media_type(self) -> &'static str {
+        match self {
+            Self::Illustration => "image/svg+xml",
+            Self::Comic => "image/png",
+        }
+    }
     fn extension(self) -> &'static str {
         match self {
             Self::Illustration => "svg",
@@ -72,6 +78,118 @@ pub struct PreparedFigure {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PreparedIllustrations {
     pub figures: Vec<PreparedFigure>,
+    pub metadata: IllustrationMetadata,
+}
+
+/// Derived processor output, never serialized back over authored front matter.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IllustrationMetadata {
+    pub illustrations: BTreeMap<String, RenderedImage>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenderedImage {
+    /// Exact document-relative path, not a directory-discovery hint or URL.
+    pub image: String,
+    #[serde(rename = "media-type")]
+    pub media_type: String,
+}
+
+impl IllustrationMetadata {
+    pub fn from_pandoc(document: &serde_json::Value) -> Result<Option<Self>, PreparationError> {
+        let Some(value) = document
+            .get("meta")
+            .and_then(|meta| meta.get("illustrations"))
+        else {
+            return Ok(None);
+        };
+        fn map(
+            value: &serde_json::Value,
+        ) -> Result<&serde_json::Map<String, serde_json::Value>, PreparationError> {
+            if value["t"] != "MetaMap" {
+                return Err(metadata("illustrations requires MetaMap"));
+            }
+            value["c"]
+                .as_object()
+                .ok_or_else(|| metadata("invalid MetaMap"))
+        }
+        fn string(value: &serde_json::Value) -> Result<String, PreparationError> {
+            if value["t"] == "MetaString" {
+                return value["c"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| metadata("invalid MetaString"));
+            }
+            if value["t"] == "MetaInlines" {
+                let mut text = String::new();
+                for inline in value["c"]
+                    .as_array()
+                    .ok_or_else(|| metadata("invalid MetaInlines"))?
+                {
+                    match inline["t"].as_str() {
+                        Some("Str") => text.push_str(
+                            inline["c"]
+                                .as_str()
+                                .ok_or_else(|| metadata("invalid Str"))?,
+                        ),
+                        Some("Space") => text.push(' '),
+                        _ => return Err(metadata("image references require literal metadata")),
+                    }
+                }
+                return Ok(text);
+            }
+            Err(metadata("image references require string metadata"))
+        }
+        let values = map(value)?;
+        if values.len() > 64 {
+            return Err(quota("image references"));
+        }
+        let mut result = Self::default();
+        for (id, value) in values {
+            if !stable_id(id) {
+                return Err(metadata("stable fig- identifier required"));
+            }
+            let fields = map(value)?;
+            let image = string(
+                fields
+                    .get("image")
+                    .ok_or_else(|| metadata("image reference required"))?,
+            )?;
+            safe_path(&image)?;
+            let media_type = string(
+                fields
+                    .get("media-type")
+                    .ok_or_else(|| metadata("media-type required"))?,
+            )?;
+            if !matches!(media_type.as_str(), "image/svg+xml" | "image/png") {
+                return Err(metadata("unsupported image media-type"));
+            }
+            result
+                .illustrations
+                .insert(id.clone(), RenderedImage { image, media_type });
+        }
+        Ok(Some(result))
+    }
+
+    /// Retain unrelated metadata and additional fields on existing image entries.
+    pub fn write_pandoc(&self, document: &mut serde_json::Value) {
+        use serde_json::json;
+        if self.illustrations.is_empty() {
+            return;
+        }
+        let meta = &mut document["meta"];
+        if meta.get("illustrations").is_none() {
+            meta["illustrations"] = json!({"t":"MetaMap","c":{}});
+        }
+        for (id, image) in &self.illustrations {
+            let entry = &mut meta["illustrations"]["c"][id];
+            if entry.is_null() {
+                *entry = json!({"t":"MetaMap","c":{}});
+            }
+            entry["c"]["image"] = json!({"t":"MetaString","c":image.image});
+            entry["c"]["media-type"] = json!({"t":"MetaString","c":image.media_type});
+        }
+    }
 }
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum PreparationError {
@@ -102,6 +220,15 @@ fn quota(what: &str) -> PreparationError {
 /// Filesystem containment/symlink validation belongs to the snapshot materializer;
 /// this pure adapter validates logical map keys and reference aliases only.
 pub fn prepare(input: PreparationInput) -> Result<PreparedIllustrations, PreparationError> {
+    prepare_with_metadata(input, None)
+}
+
+/// An explicit reference map is authoritative. Never fall back to sidecars when
+/// a processor supplied an incomplete, missing or invalid image reference.
+pub fn prepare_with_metadata(
+    input: PreparationInput,
+    references: Option<&IllustrationMetadata>,
+) -> Result<PreparedIllustrations, PreparationError> {
     if input.source.len() > SOURCE_LIMIT || input.assets.len() > 128 {
         return Err(quota("source or file count"));
     }
@@ -133,6 +260,7 @@ pub fn prepare(input: PreparationInput) -> Result<PreparedIllustrations, Prepara
     }
     let descriptions = descriptions(&input.source)?;
     let mut figures = Vec::new();
+    let mut output_metadata = IllustrationMetadata::default();
     let mut used = BTreeSet::new();
     let mut current = None;
     // Offset events traverse nested lists/quotes too; top-level render wrappers
@@ -173,30 +301,45 @@ pub fn prepare(input: PreparationInput) -> Result<PreparedIllustrations, Prepara
                     if description.kind != kind {
                         return Err(metadata(format!("fence and metadata kind disagree: {id}")));
                     }
-                    let directory = format!("{parent}assets/{id}/");
-                    let sidecar = format!("{directory}{}.json", kind.name());
-                    let bytes = assets
-                        .get(&sidecar)
-                        .ok_or_else(|| PreparationError::Missing(sidecar.clone()))?;
-                    let state: serde_json::Value =
-                        serde_json::from_slice(bytes).map_err(invalid)?;
-                    if state.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
-                        return Err(invalid("sidecar needs integer version 1"));
-                    }
-                    let reference = state
-                        .get(kind.extension())
-                        .and_then(serde_json::Value::as_str)
-                        .ok_or_else(|| invalid("missing kind-specific artwork reference"))?;
-                    let target = reference_path(reference)?;
-                    let asset_path = format!("assets/{id}/{target}");
+                    let image = if let Some(references) = references {
+                        Some(references.illustrations.get(&id).ok_or_else(|| {
+                            metadata(format!("image reference required for {id}"))
+                        })?)
+                    } else {
+                        description.image.as_ref()
+                    };
+                    let asset_path = if let Some(image) = image {
+                        safe_path(&image.image)?;
+                        if image.media_type != kind.media_type() {
+                            return Err(metadata(format!("image media-type disagrees with {id}")));
+                        }
+                        image.image.clone()
+                    } else {
+                        let directory = format!("{parent}assets/{id}/");
+                        let sidecar = format!("{directory}{}.json", kind.name());
+                        let bytes = assets
+                            .get(&sidecar)
+                            .ok_or_else(|| PreparationError::Missing(sidecar.clone()))?;
+                        let state: serde_json::Value =
+                            serde_json::from_slice(bytes).map_err(invalid)?;
+                        if state.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
+                            return Err(invalid("sidecar needs integer version 1"));
+                        }
+                        let reference = state
+                            .get(kind.extension())
+                            .and_then(serde_json::Value::as_str)
+                            .ok_or_else(|| invalid("missing kind-specific artwork reference"))?;
+                        let target = reference_path(reference)?;
+                        if !target
+                            .rsplit('.')
+                            .next()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case(kind.extension()))
+                        {
+                            return Err(PreparationError::Path(reference.into()));
+                        }
+                        format!("assets/{id}/{target}")
+                    };
                     let snapshot_path = format!("{parent}{asset_path}");
-                    if !target
-                        .rsplit('.')
-                        .next()
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case(kind.extension()))
-                    {
-                        return Err(PreparationError::Path(reference.into()));
-                    }
                     let data = assets
                         .get(&snapshot_path)
                         .ok_or_else(|| PreparationError::Missing(snapshot_path.clone()))?;
@@ -204,6 +347,13 @@ pub fn prepare(input: PreparationInput) -> Result<PreparedIllustrations, Prepara
                         ArtworkKind::Illustration => validate_svg(data)?,
                         ArtworkKind::Comic => validate_png(data)?.map(f64::from),
                     };
+                    output_metadata.illustrations.insert(
+                        id.clone(),
+                        RenderedImage {
+                            image: asset_path.clone(),
+                            media_type: kind.media_type().into(),
+                        },
+                    );
                     figures.push(PreparedFigure {
                         id,
                         kind,
@@ -229,7 +379,13 @@ pub fn prepare(input: PreparationInput) -> Result<PreparedIllustrations, Prepara
     if used.len() != descriptions.len() {
         return Err(metadata("unused illustration metadata"));
     }
-    Ok(PreparedIllustrations { figures })
+    if references.is_some_and(|references| references.illustrations.len() != used.len()) {
+        return Err(metadata("unused illustration image references"));
+    }
+    Ok(PreparedIllustrations {
+        figures,
+        metadata: output_metadata,
+    })
 }
 fn stable_id(id: &str) -> bool {
     id.strip_prefix("fig-").is_some_and(|suffix| {
@@ -269,6 +425,17 @@ struct Description {
     caption: String,
     description: String,
     width: Option<String>,
+    image: Option<RenderedImage>,
+}
+
+/// Saved references only; callers decide how to obtain the explicitly named bytes.
+pub fn saved_image_references(source: &str) -> Result<IllustrationMetadata, PreparationError> {
+    Ok(IllustrationMetadata {
+        illustrations: descriptions(source)?
+            .into_iter()
+            .filter_map(|(id, description)| description.image.map(|image| (id, image)))
+            .collect(),
+    })
 }
 fn literal(value: &Yaml) -> Result<String, PreparationError> {
     let value = value
@@ -332,12 +499,43 @@ fn descriptions(source: &str) -> Result<BTreeMap<String, Description>, Preparati
             _ => continue,
         };
         // Upstream requires every selected description field to be literal.
-        for value in fields.values() {
-            literal(value)?;
+        for (key, value) in fields {
+            if matches!(key.as_str(), Some("image" | "media-type")) {
+                value
+                    .as_str()
+                    .ok_or_else(|| metadata("image references require strings"))?;
+            } else {
+                literal(value)?;
+            }
         }
         let id = literal(&item["id"])?;
         let caption = literal(&item["caption"])?;
         let description = literal(&item["description"])?;
+        let image = match (
+            item["image"].is_badvalue(),
+            item["media-type"].is_badvalue(),
+        ) {
+            (true, true) => None,
+            (false, false) => {
+                let image = item["image"]
+                    .as_str()
+                    .ok_or_else(|| metadata("image requires a string"))?;
+                safe_path(image)?;
+                let media_type = item["media-type"]
+                    .as_str()
+                    .ok_or_else(|| metadata("media-type requires a string"))?;
+                if media_type != kind.media_type() {
+                    return Err(metadata(
+                        "saved image media-type disagrees with diagram kind",
+                    ));
+                }
+                Some(RenderedImage {
+                    image: image.into(),
+                    media_type: media_type.into(),
+                })
+            }
+            _ => return Err(metadata("saved image requires both image and media-type")),
+        };
         if id.trim().is_empty() || caption.trim().is_empty() || description.trim().is_empty() {
             return Err(metadata("id, caption and description required"));
         }
@@ -364,6 +562,7 @@ fn descriptions(source: &str) -> Result<BTreeMap<String, Description>, Preparati
                     caption,
                     description,
                     width,
+                    image,
                 },
             )
             .is_some()
@@ -691,6 +890,115 @@ mod tests {
             ],
         }
     }
+    #[test]
+    fn explicit_metadata_bypasses_conventions_and_never_falls_back() {
+        let input = fixture();
+        let original = input.source.clone();
+        let prepared = prepare(input.clone()).unwrap();
+        let expected: IllustrationMetadata = serde_json::from_str(include_str!(
+            "../docs/fixtures/mvp-2/expected-derived-metadata.json"
+        ))
+        .unwrap();
+        assert_eq!(prepared.metadata, expected);
+        let saved_source = include_str!("../docs/fixtures/mvp-2/with-image-references.md");
+        let mut saved = input.clone();
+        saved.source = saved_source.into();
+        saved
+            .assets
+            .retain(|asset| !asset.relative_path.ends_with(".json"));
+        let from_file = prepare(saved.clone()).unwrap();
+        assert_eq!(from_file.metadata, expected);
+        assert_eq!(saved.source, saved_source);
+        assert!(from_file.figures.iter().all(|figure| {
+            saved_source[figure.source_bytes.clone()].contains(&format!("#{}", figure.id))
+        }));
+        // Even with conventional sidecars present, a bad saved reference is
+        // authoritative and must not silently fall back.
+        for bad_source in [
+            saved_source.replace(
+                "image: assets/fig-add-inputs/figure.svg",
+                "image: missing.svg",
+            ),
+            saved_source.replace(
+                "image: assets/fig-add-inputs/figure.svg",
+                "image: ../escape.svg",
+            ),
+            saved_source.replace("    media-type: image/svg+xml\n", ""),
+            saved_source.replace("media-type: image/svg+xml", "media-type: image/png"),
+        ] {
+            let mut bad = input.clone();
+            bad.source = bad_source;
+            assert!(prepare(bad).is_err());
+        }
+
+        let mut tree =
+            serde_json::json!({"meta": {"title":{"t":"MetaString","c":"Keep title"}}, "blocks":[]});
+        expected.write_pandoc(&mut tree);
+        tree["meta"]["illustrations"]["c"]["fig-add-inputs"]["c"]["custom"] =
+            serde_json::json!({"t":"MetaString","c":"keep extra"});
+        let roundtrip = IllustrationMetadata::from_pandoc(&tree).unwrap().unwrap();
+        roundtrip.write_pandoc(&mut tree);
+        assert_eq!(roundtrip, expected);
+        assert_eq!(tree["meta"]["title"]["c"], "Keep title");
+        assert_eq!(
+            tree["meta"]["illustrations"]["c"]["fig-add-inputs"]["c"]["custom"]["c"],
+            "keep extra"
+        );
+        let mut relocated = input.clone();
+        relocated.logical_path = "chapter/source.md".into();
+        // No sidecars and no assets/<block-id>/ directory layout.
+        relocated
+            .assets
+            .retain(|asset| !asset.relative_path.ends_with(".json"));
+        let mut references = roundtrip;
+        for (index, figure) in prepared.figures.iter().enumerate() {
+            let image = references.illustrations.get_mut(&figure.id).unwrap();
+            let file = relocated
+                .assets
+                .iter_mut()
+                .find(|asset| asset.relative_path == figure.asset_path)
+                .unwrap();
+            image.image = format!("rendered/chosen-{index}.{}", figure.kind.extension());
+            file.relative_path = format!("chapter/{}", image.image);
+        }
+        let result = prepare_with_metadata(relocated.clone(), Some(&references)).unwrap();
+        assert_eq!(result.metadata, references);
+        assert_eq!(relocated.source, original);
+        for (figure, before) in result.figures.iter().zip(&prepared.figures) {
+            assert_eq!(figure.source_bytes, before.source_bytes);
+            assert_eq!(figure.asset_sha256, before.asset_sha256);
+            assert_eq!(
+                figure.asset_path,
+                references.illustrations[&figure.id].image
+            );
+        }
+        // Valid conventional files/sidecars must not mask an explicit failure.
+        for bad_path in [
+            "missing.svg",
+            "../escape.svg",
+            "/absolute.svg",
+            "https://host/image.svg",
+            "assets/%2e%2e/image.svg",
+        ] {
+            let mut bad = expected.clone();
+            bad.illustrations.get_mut("fig-add-inputs").unwrap().image = bad_path.into();
+            assert!(
+                prepare_with_metadata(input.clone(), Some(&bad)).is_err(),
+                "{bad_path}"
+            );
+        }
+        let mut bad = expected.clone();
+        bad.illustrations
+            .get_mut("fig-add-inputs")
+            .unwrap()
+            .media_type = "image/png".into();
+        assert!(prepare_with_metadata(input.clone(), Some(&bad)).is_err());
+        assert!(prepare_with_metadata(input, Some(&IllustrationMetadata::default())).is_err());
+        tree["meta"]["illustrations"]["c"]["fig-add-inputs"]["c"]["image"]["c"] =
+            serde_json::json!("../escape.svg");
+        assert!(IllustrationMetadata::from_pandoc(&tree).is_err());
+    }
+
     #[test]
     fn pinned_upstream_semantics_assets_and_missing_artwork_rejection() {
         let input = fixture();
