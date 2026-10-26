@@ -28,3 +28,9 @@ pub mod codex;
 
 #[cfg(feature = "lan")]
 pub mod lan;
+
+#[cfg(feature = "lan")]
+mod lan_owner;
+
+#[cfg(all(target_os = "android", feature = "gui"))]
+pub mod android_picker;

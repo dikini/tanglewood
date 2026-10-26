@@ -1,6 +1,6 @@
-# Authenticated LAN transport preparation
+# Authenticated foreground LAN sync
 
-`src/lan.rs` implements an owned-message QUIC controller, separate from App and all mutable Automerge state. It is Y3c transport preparation; integrated vault joining, durable per-document sync and live two-device acceptance remain open. No command replay, public discovery, relay, accounts, or background Android service is included.
+`src/lan.rs` implements an owned-message QUIC controller, separate from App and all mutable Automerge state. `lan_owner` and App integrate empty-vault joining and durable per-document synchronization. Two hardware devices and Android networking remain unverified. No command replay, public discovery, relay, accounts, or background Android service is included.
 
 ## Dependencies and authentication
 
@@ -20,18 +20,60 @@ There are at most eight peers/connection tasks, sixteen controller requests/even
 
 Each Packet contains version, vault UUID, Catalog/Note(UUID) document identity, message UUID and a body: catalog Manifest(note UUIDs), Sync(encoded Automerge message), or DurableReceipt(received message UUID). The controller validates version/vault/size and handles bytes only. The owner decodes and applies actual `automerge::sync::Message` values with per-peer, per-document `State`; a receipt is emitted only after the application persistence gate below.
 
-## Required owner integration after migration review
+## Owner integration
 
-Add local-only pair/unpair/connect/listen commands with existing Accepted request/status semantics. Correlate pairing completion events to request IDs and keep unavailable capability distinct from policy rejection. Confirm pins before starting connections; do not auto-trust an incoming public certificate. Persisted pin removal must close sessions and invalidate queued owner work from that peer. App startup/session lifetime owns one optional Controller driven on its I/O runtime; Android uses only the foreground lifetime.
+Local-only pair/unpair/connect/listen commands use existing Accepted request/status semantics. Correlate pairing completion events to request IDs and keep unavailable capability distinct from policy rejection. Confirm pins before starting connections; do not auto-trust an incoming public certificate. Persisted pin removal must close sessions and invalidate queued owner work from that peer. App startup/session lifetime owns one optional Controller driven on its I/O runtime; Android uses only the foreground lifetime.
 
-Add an owner-only map `(peer fingerprint, document identity) -> automerge::sync::State`, plus private receive inputs. No network task generates or applies CRDT changes. On connect/reconnect, choose a single initiator (for example by fingerprint ordering), track the active session ID, construct fresh protocol states from durable histories, enumerate durable catalog membership, and generate sync messages from the last committed document snapshots. Accepted unsaved local changes are never advertised.
+The owner holds `(peer fingerprint, document identity) -> automerge::sync::State` and private receive inputs. No network task generates or applies CRDT changes. On connect/reconnect, choose a single initiator (for example by fingerprint ordering), track the active session ID, construct fresh protocol states from durable histories, enumerate durable catalog membership, and generate sync messages from the last committed document snapshots. Accepted unsaved local changes are never advertised.
 
 For a ready vault, apply an incoming sync message to an owner candidate, validate catalog/document identity and projection rules, and use the existing history-generation save path. Hold any next protocol acknowledgement/response whose contents imply receipt of those changes until that generation commits. A DurableReceipt merely correlates a committed receive; it is not proof of exactly-once command execution. Persistence failure keeps accepted dirty data and suppresses success receipts. Reconnect regenerates sync states from durable histories and uses Automerge's duplicate handling rather than a custom replay log.
 
-For pairing into an empty vault, select the existing peer's vault UUID from its explicitly confirmed ticket. Accumulate the original catalog and note document histories through actual Automerge sync messages on the owner. Use empty documents with a fresh local actor as receivers; never seed a second matching Markdown catalog. Wait for a complete, validated catalog/document set before installing projections and identities in one initial-join transaction. Refuse replacing a nonempty unrelated local vault. Persist the new local actor before its first edit. The existing pre-migration backup and no-sync feature guard must cover the join transition too.
+For pairing into an empty vault, select the existing peer's vault UUID from its explicitly confirmed ticket. The initial join transfers the complete original histories using SHA-256-checked ordered 64 KiB chunks, capped at 32 MiB encoded history. It uses a distinct persisted destination actor and never independently seeds a matching Markdown catalog. Subsequent exchanges use actual Automerge sync messages. Wait for a complete, validated catalog/document set before installing projections and identities in one initial-join transaction. Refuse replacing a nonempty unrelated local vault. Persist the new local actor before its first edit. The existing pre-migration backup and no-sync feature guard must cover the join transition too.
 
 Integration validation must use two real temporary vault Apps, close/reopen them, and demonstrate offline local edits, reconnect convergence, durable acknowledgements, retained rename/delete conflicts and unknown-peer rejection. Loopback checks establish transport behavior on one machine, not two hardware devices or Android readiness.
 
 ## Recorded transport evidence
 
 `RUSTC_WRAPPER= cargo test --lib --no-default-features --features lan --offline lan::tests` passed one focused loopback scenario. It exchanges real Automerge sync messages on owner-side test documents through mutually authenticated QUIC, validates a tampered fingerprint, rejects an unpinned TLS client, rejects an oversized inbound frame length before body allocation, rejects an oversized outbound payload, proves unpair closes an existing connection, and reopens persisted identity/pins. The sandbox denied UDP creation on the initial run; the recorded passing run used approved local-network escalation. This is one-machine loopback evidence, not two hardware devices or integrated durable vault synchronization.
+
+Owner integration is implemented in `lan_owner` and `App`: persisted empty-peer preparation, atomic existing-history join and per-document Automerge message exchange are available through shared local-only LAN commands. See `lan-owner-integration.md` for exact scoped evidence and remaining device/fault-injection limits. This supersedes the earlier standalone transport-only implementation boundary.
+
+## Linux launch workflow
+
+Build `cargo build --locked --bins --features gui,codex,lan`. The GUI's collapsed
+Sync controls expose explicit migration, listen/ticket, empty join preparation,
+confirmation, connect/unpair, pause/resume and operation status. Compare the
+public fingerprint, address and vault ID with the other device before confirming.
+No incoming ticket automatically grants trust.
+
+For a CLI-only exchange, use two vault directories and fixed UDP ports. Actions
+run in argument order. First the source prints its ticket and exits:
+
+```sh
+target/debug/tanglewood --headless --vault /path/to/source --enable-sync --lan-listen 192.168.1.10:43101 --lan-ticket
+```
+
+On an empty destination, paste that ticket as SOURCE_TICKET and print its own:
+
+```sh
+target/debug/tanglewood --headless --vault /path/to/destination --prepare-join "$SOURCE_TICKET" --lan-listen 192.168.1.11:43102 --lan-ticket
+```
+
+Exchange/compare tickets through a trusted channel. Restart both at the same
+addresses, passing `--confirm-peer "$OTHER_TICKET"` after `--lan-listen`. Start
+the peer with the lexicographically larger fingerprint first, adding `--lan-serve`
+to retain its owner loop. Start the smaller fingerprint peer with
+`--connect-peer OTHER_FINGERPRINT --lan-serve`. Use a single connection initiator.
+Both peers must confirm one another; confirmation persists before connect.
+The GUI can perform the same actions while its owner is running.
+
+`--lan-status` prints structured JSON. `--lan-advertise IP` immediately after a
+wildcard `--lan-listen 0.0.0.0:PORT` selects the advertised interface. Port zero
+is useful only while that exact listener remains alive; its ticket cannot be
+reused after restart. No discovery, relay or external service is used.
+
+Actual binary smoke passed finite tickets, explicit confirmation, foreground
+serve, empty join, original note UUID/Unicode bytes, distinct actor and restart
+on UDP loopback (`/tmp/tanglewood-lan-cli-u29b7zbh`). The two-App scenario also
+covers offline rename/trash and reconnect. These are one-machine checks; they
+do not prove two hardware devices, wireless behavior or Android lifecycle.

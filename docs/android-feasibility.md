@@ -114,3 +114,15 @@ Linux display access, then assign Android packaging ownership and execute 0b.
 were sandbox access failures. Linux window smoke can use an approved escalated
 launch after GUI integration; an actual Tanglewood workflow remains outstanding.
 Android prerequisite findings are unchanged.
+
+## Provisioning update after user approval
+
+The user accepted Google's SDK license and chose a local emulator. A host probe
+with sandbox escalation found `/dev/kvm` and confirmed read/write access; the
+earlier missing device was sandbox visibility. The representative target is now
+x86_64 Android API 35. Official command-line tools15859902 were downloaded and
+SHA-256 checked; API35/build-tools35.0.0/NDK29/platform-tools are being installed
+in `/tmp/tanglewood-android-sdk`, with Rust Android targets added. This supersedes
+the prerequisite blocker; cross-build and device/emulator behavior still require
+actual evidence. No physical-device or wireless test is claimed or added as a
+release gate beyond the plan's representative emulator/two-device workflow.

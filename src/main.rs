@@ -17,6 +17,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut codex_enabled = false;
     let mut codex_cwd = None;
     let mut codex_resume = None;
+    let mut lan_requested = false;
+    let mut lan_serve = false;
+    let mut lan_listen_requested = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--vault" => {
@@ -39,6 +42,73 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--codex-resume" => {
                 codex_resume = Some(args.next().ok_or("--codex-resume needs a thread ID")?)
+            }
+            "--lan-listen" => {
+                lan_requested = true;
+                lan_listen_requested = true;
+                startup.push(tanglewood::commands::Command::ListenLan {
+                    bind: args.next().ok_or("--lan-listen needs ADDRESS:PORT")?,
+                    advertised_ip: None,
+                });
+            }
+            "--lan-advertise" => {
+                let ip = args.next().ok_or("--lan-advertise needs an IP address")?;
+                let Some(tanglewood::commands::Command::ListenLan { advertised_ip, .. }) =
+                    startup.last_mut()
+                else {
+                    return Err(
+                        "--lan-advertise must immediately follow --lan-listen ADDRESS:PORT".into(),
+                    );
+                };
+                *advertised_ip = Some(ip);
+            }
+            "--lan-ticket" => {
+                lan_requested = true;
+                startup.push(tanglewood::commands::Command::GetLanTicket);
+            }
+            "--prepare-join" => {
+                lan_requested = true;
+                startup.push(tanglewood::commands::Command::PrepareJoin {
+                    ticket: args.next().ok_or("--prepare-join needs a source ticket")?,
+                });
+            }
+            "--cancel-join" => {
+                lan_requested = true;
+                startup.push(tanglewood::commands::Command::CancelJoin);
+            }
+            "--confirm-peer" => {
+                lan_requested = true;
+                startup.push(tanglewood::commands::Command::ConfirmPeer {
+                    ticket: args.next().ok_or("--confirm-peer needs a peer ticket")?,
+                });
+            }
+            "--unpair-peer" => {
+                lan_requested = true;
+                startup.push(tanglewood::commands::Command::UnpairPeer {
+                    fingerprint: args.next().ok_or("--unpair-peer needs a fingerprint")?,
+                });
+            }
+            "--connect-peer" => {
+                lan_requested = true;
+                startup.push(tanglewood::commands::Command::ConnectPeer {
+                    fingerprint: args.next().ok_or("--connect-peer needs a fingerprint")?,
+                });
+            }
+            "--lan-status" => {
+                lan_requested = true;
+                startup.push(tanglewood::commands::Command::GetLanStatus);
+            }
+            "--pause-lan" => {
+                lan_requested = true;
+                startup.push(tanglewood::commands::Command::PauseLan);
+            }
+            "--resume-lan" => {
+                lan_requested = true;
+                startup.push(tanglewood::commands::Command::ResumeLan);
+            }
+            "--lan-serve" => {
+                lan_requested = true;
+                lan_serve = true;
             }
             "--mirror" => {
                 startup.push(tanglewood::commands::Command::SetMirrorEnabled { enabled: true })
@@ -69,12 +139,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--help" | "-h" => {
                 println!(
-                    "tanglewood [--vault DIRECTORY] [--headless] [--mirror|--no-mirror] [--rescan] [--enable-sync] [--import SOURCE NOTE_PATH] [--export NOTE_UUID DESTINATION] [--mcp-socket SOCKET] [--mcp-write] [--codex [--codex-cwd DIRECTORY] [--codex-resume THREAD]]\nHeadless mode opens the vault and lists note paths. Build with --features gui for the editor."
+                    "tanglewood [--vault DIRECTORY] [--headless] [--mirror|--no-mirror] [--rescan] [--enable-sync] [--import SOURCE NOTE_PATH] [--export NOTE_UUID DESTINATION] [--mcp-socket SOCKET] [--mcp-write] [--codex [--codex-cwd DIRECTORY] [--codex-resume THREAD]]\nHeadless mode opens the vault and lists note paths. Build with --features gui for the editor.\nLAN (--features lan): --prepare-join TICKET | --cancel-join | --lan-listen ADDRESS:PORT [--lan-advertise IP] | --lan-ticket | --confirm-peer TICKET | --connect-peer FINGERPRINT | --unpair-peer FINGERPRINT | --lan-status | --pause-lan | --resume-lan | --lan-serve. Startup actions run in argument order; use fixed ports for ticket exchange across restarts."
                 );
                 return Ok(());
             }
             _ => return Err(format!("unknown argument: {arg}").into()),
         }
+    }
+    if lan_requested && !cfg!(feature = "lan") {
+        return Err("LAN commands require --features lan".into());
+    }
+    if lan_serve && !lan_listen_requested {
+        return Err("--lan-serve requires --lan-listen ADDRESS:PORT".into());
     }
     let vault = vault.unwrap_or_else(|| {
         std::env::var_os("XDG_DATA_HOME")
@@ -124,11 +200,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let mut app = tanglewood::App::open(&vault)?;
+    #[cfg(feature = "lan")]
+    let _lan_runtime = {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()?;
+        app.set_lan_runtime(runtime.handle().clone());
+        runtime
+    };
     for command in startup {
-        if let tanglewood::commands::CommandResult::Accepted { request_id } =
-            app.execute(command, tanglewood::commands::Caller::Local)?
-        {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let result = app.execute(command, tanglewood::commands::Caller::Local)?;
+        if let tanglewood::commands::CommandResult::LanTicket { ticket } = &result {
+            println!("{ticket}");
+        }
+        if let tanglewood::commands::CommandResult::LanStatus(status) = &result {
+            #[cfg(feature = "lan")]
+            println!("{}", serde_json::to_string(status)?);
+            #[cfg(not(feature = "lan"))]
+            let _ = status;
+        }
+        if let tanglewood::commands::CommandResult::Accepted { request_id } = result {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             loop {
                 app.tick();
                 match app.io_status(request_id) {
@@ -163,6 +256,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             )
         })
         .transpose()?;
+    if lan_serve && (headless || !cfg!(feature = "gui")) {
+        loop {
+            app.tick();
+            #[cfg(all(target_os = "linux", feature = "mcp"))]
+            if let Some(socket) = &mut owner {
+                socket.poll(&mut app);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
     if headless || !cfg!(feature = "gui") {
         #[cfg(all(target_os = "linux", feature = "mcp"))]
         if let Some(socket) = &mut owner {

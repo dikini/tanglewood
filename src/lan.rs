@@ -18,6 +18,7 @@ use std::{
 };
 use tokio::sync::{Semaphore, mpsc};
 use uuid::Uuid;
+static ASSET_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const VERSION: u16 = 1;
 const MAX_PAYLOAD: usize = 1024 * 1024;
 // A JSON byte can occupy four characters ("255,"). Reserve fixed envelope
@@ -95,16 +96,33 @@ fn fingerprint(certificate: &[u8]) -> Result<Fingerprint, LanError> {
         hash.iter().map(|byte| format!("{byte:02x}")).collect(),
     ))
 }
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum DocumentId {
     Catalog,
     Note(NoteId),
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Body {
-    Manifest { notes: Vec<NoteId> },
-    Sync { bytes: Vec<u8> },
-    DurableReceipt { received: Uuid },
+    Manifest {
+        notes: Vec<NoteId>,
+    },
+    JoinRequest {
+        transfer: Uuid,
+    },
+    JoinChunk {
+        transfer: Uuid,
+        index: u32,
+        count: u32,
+        total: u32,
+        digest: Vec<u8>,
+        bytes: Vec<u8>,
+    },
+    Sync {
+        bytes: Vec<u8>,
+    },
+    DurableReceipt {
+        received: Uuid,
+    },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -135,19 +153,54 @@ impl Packet {
                 Err(LanError::Invalid)
             }
             Body::Sync { bytes } if bytes.len() > MAX_PAYLOAD => Err(LanError::Invalid),
+            Body::JoinChunk {
+                count,
+                total,
+                index,
+                digest,
+                bytes,
+                ..
+            } if *count == 0
+                || *count > 1024
+                || *index >= *count
+                || *total > 32 * 1024 * 1024
+                || digest.len() != 32
+                || bytes.len() > 64 * 1024 =>
+            {
+                Err(LanError::Invalid)
+            }
             _ => Ok(()),
         }
     }
 }
 #[derive(Debug)]
-pub enum Request {
+pub enum Control {
     Confirm(Ticket),
     Unpair(Fingerprint),
     Connect(Ticket),
-    Send { peer: Fingerprint, packet: Packet },
+}
+#[derive(Debug)]
+pub enum Request {
+    Control {
+        request_id: Uuid,
+        operation: Control,
+    },
+    Disconnect(Fingerprint),
+    Confirm(Ticket),
+    Unpair(Fingerprint),
+    Connect(Ticket),
+    Send {
+        session: usize,
+        peer: Fingerprint,
+        packet: Packet,
+    },
 }
 #[derive(Debug)]
 pub enum Event {
+    ControlResult {
+        request_id: Uuid,
+        result: Result<(), String>,
+    },
     Confirmed(Fingerprint),
     Unpaired(Fingerprint),
     Connected {
@@ -169,7 +222,14 @@ pub enum Event {
         error: String,
     },
     Failed(String),
+    SendAccepted {
+        session: usize,
+        message_id: Uuid,
+        peer: Fingerprint,
+    },
     SendRejected {
+        session: usize,
+        message_id: Uuid,
         peer: Fingerprint,
         packet: Packet,
         error: String,
@@ -241,6 +301,7 @@ fn peer_sender(
     pins: &Pins,
     sessions: &Sessions,
     peer: &Fingerprint,
+    expected_session: usize,
 ) -> Result<mpsc::Sender<Vec<u8>>, LanError> {
     let confirmed = pins.read().map_err(error)?;
     if !confirmed.contains_key(peer) {
@@ -250,6 +311,7 @@ fn peer_sender(
         .lock()
         .map_err(error)?
         .get(peer)
+        .filter(|session| session.connection.stable_id() == expected_session)
         .map(|session| session.outbound.clone())
         .ok_or_else(|| LanError::Io("peer disconnected".into()))
 }
@@ -284,6 +346,7 @@ pub struct Controller {
     events: mpsc::Receiver<Event>,
     task: tokio::task::JoinHandle<()>,
     ticket: Ticket,
+    pins: Pins,
 }
 impl Controller {
     pub async fn bind(
@@ -291,8 +354,10 @@ impl Controller {
         vault_id: Uuid,
         address: SocketAddr,
     ) -> Result<Self, LanError> {
+        let gate = ASSET_GATE.lock().await;
         let directory = vault_directory.join("lan");
         let (directory, identity, loaded) = tokio::task::spawn_blocking(move || {
+            let _gate = gate;
             load_assets(&directory).map(|(identity, pins)| (directory, identity, pins))
         })
         .await
@@ -335,7 +400,7 @@ impl Controller {
             endpoint.clone(),
             directory,
             Arc::new(identity),
-            pins,
+            pins.clone(),
             vault_id,
             receiver,
             events,
@@ -346,9 +411,15 @@ impl Controller {
             events: completions,
             task,
             ticket,
+            pins,
         })
     }
     /// For a wildcard bind, caller must explicitly choose an advertised LAN IP.
+    pub fn local_address(&self) -> SocketAddr {
+        self.endpoint
+            .local_addr()
+            .expect("bound endpoint has local address")
+    }
     pub fn ticket(&self, advertised: Option<SocketAddr>) -> Result<Ticket, LanError> {
         let mut ticket = self.ticket.clone();
         if let Some(address) = advertised {
@@ -359,6 +430,15 @@ impl Controller {
         }
         ticket.validate()?;
         Ok(ticket)
+    }
+    pub fn confirmed_peers(&self) -> Vec<Ticket> {
+        self.pins
+            .read()
+            .map(|pins| pins.values().cloned().collect())
+            .unwrap_or_default()
+    }
+    pub fn is_confirmed(&self, peer: &Fingerprint) -> bool {
+        self.pins.read().is_ok_and(|pins| pins.contains_key(peer))
     }
     pub fn try_send(&self, request: Request) -> Result<(), mpsc::error::TrySendError<Request>> {
         self.requests.try_send(request)
@@ -455,37 +535,43 @@ async fn run(
             Some(incoming)=endpoint.accept()=>{
                 let address=incoming.remote_address();let Ok(permit)=budget.clone().try_acquire_owned()else{incoming.refuse();continue;};
                 let(events,pins,sessions)=(events.clone(),pins.clone(),sessions.clone());
-                tasks.spawn(async move{let _permit=permit;match incoming.await{Ok(connection)=>session(connection,false,None,vault,pins,sessions,events).await,Err(error)=>{let _=emit(&events,Event::Rejected{address,error:error.to_string()}).await;}}});
+                tasks.spawn(async move{let _permit=permit;match incoming.await{Ok(connection)=>session(connection,false,None,vault,pins,sessions,events,None).await,Err(error)=>{let _=emit(&events,Event::Rejected{address,error:error.to_string()}).await;}}});
             }
-            request=requests.recv()=>{let Some(request)=request else{break;};match request{
+            request=requests.recv()=>{let Some(request)=request else{break;};
+                let(request,request_id)=match request{Request::Control{request_id,operation}=>(match operation{Control::Confirm(ticket)=>Request::Confirm(ticket),Control::Unpair(peer)=>Request::Unpair(peer),Control::Connect(ticket)=>Request::Connect(ticket)},Some(request_id)),request=>(request,None)};
+                match request{
+                Request::Control{..}=>unreachable!(),
+                Request::Disconnect(peer)=>{if let Ok(mut sessions)=sessions.lock(){if let Some(session)=sessions.remove(&peer){session.connection.close(1u32.into(),b"owner disconnected");}}},
                 Request::Confirm(ticket)=>{
-                    if ticket.validate().is_err()||ticket.vault_id!=vault{let _=emit(&events,Event::Failed("invalid or different-vault ticket".into())).await;continue;}
+                    if ticket.validate().is_err()||ticket.vault_id!=vault{let _=emit(&events,Event::Failed("invalid or different-vault ticket".into())).await;control_result(&events,request_id,Err("LAN control failed".into())).await;continue;}
                     let mut updated=match pins.read(){Ok(pins)=>pins.clone(),Err(_)=>break,};
-                    if updated.len()>=MAX_PEERS&&!updated.contains_key(&ticket.fingerprint){let _=emit(&events,Event::Failed("peer limit reached".into())).await;continue;}
-                    updated.insert(ticket.fingerprint.clone(),ticket.clone());let path=directory.join("peers.json");let snapshot:Vec<_>=updated.values().cloned().collect();
-                    let persisted=tokio::task::spawn_blocking(move||write_private(&path,&serde_json::to_vec(&snapshot).map_err(error)?)).await;
-                    match persisted{Ok(Ok(()))=>{if let Ok(mut pins)=pins.write(){*pins=updated;}if let Err(error)=refresh_server(&endpoint,&identity,&pins){let _=emit(&events,Event::Failed(error.to_string())).await;}else{let _=emit(&events,Event::Confirmed(ticket.fingerprint)).await;}},other=>{let _=emit(&events,Event::Failed(format!("pin persistence failed: {}",match other{Ok(Err(error))=>error.to_string(),Err(error)=>error.to_string(),_=>unreachable!()}))).await;}}
+                    if updated.len()>=MAX_PEERS&&!updated.contains_key(&ticket.fingerprint){let _=emit(&events,Event::Failed("peer limit reached".into())).await;control_result(&events,request_id,Err("LAN control failed".into())).await;continue;}
+                    let gate=ASSET_GATE.lock().await;
+                    let pin=ticket.clone();let assets=directory.clone();
+                    let persisted=tokio::task::spawn_blocking(move||{let _gate=gate; update_pin(&assets,Some(pin),None)}).await;
+                    if let Ok(Ok(latest))=&persisted {updated=latest.clone();}
+                    match persisted{Ok(Ok(_))=>{if let Ok(mut pins)=pins.write(){*pins=updated;}if let Err(error)=refresh_server(&endpoint,&identity,&pins){let _=emit(&events,Event::Failed(error.to_string())).await;control_result(&events,request_id,Err("LAN control failed".into())).await;}else{let _=emit(&events,Event::Confirmed(ticket.fingerprint)).await;control_result(&events,request_id,Ok(())).await;}},other=>{let _=emit(&events,Event::Failed(format!("pin persistence failed: {}",match other{Ok(Err(error))=>error.to_string(),Err(error)=>error.to_string(),_=>unreachable!()}))).await;control_result(&events,request_id,Err("pin persistence failed".into())).await;}}
                 }
                 Request::Unpair(peer)=>{
-                    let mut updated=match pins.read(){Ok(pins)=>pins.clone(),Err(_)=>break,};updated.remove(&peer);let path=directory.join("peers.json");let snapshot:Vec<_>=updated.values().cloned().collect();
-                    match tokio::task::spawn_blocking(move||write_private(&path,&serde_json::to_vec(&snapshot).map_err(error)?)).await{
-                        Ok(Ok(()))=>{match revoke_session(&pins,&sessions,updated,&peer){Ok(())=>{let _=refresh_server(&endpoint,&identity,&pins);let _=emit(&events,Event::Unpaired(peer)).await;},Err(error)=>{let _=emit(&events,Event::Failed(error.to_string())).await;}}}
-                        _=>{let _=emit(&events,Event::Failed("unpair persistence failed".into())).await;}
+                    let gate=ASSET_GATE.lock().await;let assets=directory.clone();let removed=peer.clone();
+                    match tokio::task::spawn_blocking(move||{let _gate=gate;update_pin(&assets,None,Some(removed))}).await{
+                        Ok(Ok(updated))=>{match revoke_session(&pins,&sessions,updated,&peer){Ok(())=>{let _=refresh_server(&endpoint,&identity,&pins);let _=emit(&events,Event::Unpaired(peer)).await;control_result(&events,request_id,Ok(())).await;},Err(error)=>{let _=emit(&events,Event::Failed(error.to_string())).await;control_result(&events,request_id,Err("LAN control failed".into())).await;}}}
+                        _=>{let _=emit(&events,Event::Failed("unpair persistence failed".into())).await;control_result(&events,request_id,Err("LAN control failed".into())).await;}
                     }
                 }
                 Request::Connect(ticket)=>{
                     let allowed=ticket.validate().is_ok()&&ticket.vault_id==vault&&pins.read().is_ok_and(|pins|pins.contains_key(&ticket.fingerprint));
-                    if !allowed{let _=emit(&events,Event::Failed("peer is not locally confirmed".into())).await;continue;}
-                    let Ok(permit)=budget.clone().try_acquire_owned()else{let _=emit(&events,Event::Failed("connection limit reached".into())).await;continue;};
+                    if !allowed{let _=emit(&events,Event::Failed("peer is not locally confirmed".into())).await;control_result(&events,request_id,Err("LAN control failed".into())).await;continue;}
+                    let Ok(permit)=budget.clone().try_acquire_owned()else{let _=emit(&events,Event::Failed("connection limit reached".into())).await;control_result(&events,request_id,Err("LAN control failed".into())).await;continue;};
                     let connecting=client_config(&identity,&ticket).and_then(|config|endpoint.connect_with(config,ticket.address,NAME).map_err(error));
                     let(events,pins,sessions)=(events.clone(),pins.clone(),sessions.clone());
-                    tasks.spawn(async move{let _permit=permit;match connecting{Ok(connecting)=>match tokio::time::timeout(Duration::from_secs(10),connecting).await{Ok(Ok(connection))=>session(connection,true,Some(ticket.fingerprint.clone()),vault,pins,sessions,events).await,other=>{let _=emit(&events,Event::Rejected{address:ticket.address,error:format!("TLS connect failed: {other:?}")}).await;}},Err(error)=>{let _=emit(&events,Event::Failed(error.to_string())).await;}}});
+                    tasks.spawn(async move{let _permit=permit;match connecting{Ok(connecting)=>match tokio::time::timeout(Duration::from_secs(10),connecting).await{Ok(Ok(connection))=>session(connection,true,Some(ticket.fingerprint.clone()),vault,pins,sessions,events,request_id).await,other=>{let _=emit(&events,Event::Rejected{address:ticket.address,error:format!("TLS connect failed: {other:?}")}).await;control_result(&events,request_id,Err("TLS connection failed".into())).await;}},Err(error)=>{let _=emit(&events,Event::Failed(error.to_string())).await;control_result(&events,request_id,Err("LAN control failed".into())).await;}}});
                 }
-                Request::Send{peer,packet}=>{
-                    let bytes=match encode_packet(&packet,vault){Ok(bytes)=>bytes,Err(error)=>{let _=emit(&events,Event::SendRejected{peer,packet,error:error.to_string()}).await;continue;}};
-                    match peer_sender(&pins,&sessions,&peer){
-                        Ok(sender)=>if sender.try_send(bytes).is_err(){let _=emit(&events,Event::SendRejected{peer,packet,error:"peer queue full or disconnected".into()}).await;},
-                        Err(error)=>{let _=emit(&events,Event::SendRejected{peer,packet,error:error.to_string()}).await;}
+                Request::Send{peer,session,packet}=>{let message_id=packet.message_id;
+                    let bytes=match encode_packet(&packet,vault){Ok(bytes)=>bytes,Err(error)=>{let _=emit(&events,Event::SendRejected{peer,session,message_id,packet,error:error.to_string()}).await;continue;}};
+                    match peer_sender(&pins,&sessions,&peer,session){
+                        Ok(sender)=>if sender.try_send(bytes).is_err(){let _=emit(&events,Event::SendRejected{peer,session,message_id,packet,error:"peer queue full or disconnected".into()}).await;}else{let _=emit(&events,Event::SendAccepted{peer,session,message_id}).await;},
+                        Err(error)=>{let _=emit(&events,Event::SendRejected{peer,session,message_id,packet,error:error.to_string()}).await;}
                     }
                 }
             }}
@@ -494,6 +580,15 @@ async fn run(
     }
     endpoint.close(0u32.into(), b"transport closed");
     tasks.abort_all();
+}
+async fn control_result(
+    events: &mpsc::Sender<Event>,
+    request_id: Option<Uuid>,
+    result: Result<(), String>,
+) {
+    if let Some(request_id) = request_id {
+        let _ = emit(events, Event::ControlResult { request_id, result }).await;
+    }
 }
 async fn emit(events: &mpsc::Sender<Event>, event: Event) -> Result<(), LanError> {
     tokio::time::timeout(Duration::from_secs(3), events.send(event))
@@ -509,6 +604,7 @@ async fn session(
     pins: Pins,
     sessions: Sessions,
     events: mpsc::Sender<Event>,
+    request_id: Option<Uuid>,
 ) {
     let authenticated = (|| {
         let certs = connection
@@ -535,6 +631,7 @@ async fn session(
                 },
             )
             .await;
+            control_result(&events, request_id, Err(error.to_string())).await;
             return;
         }
     };
@@ -559,6 +656,7 @@ async fn session(
             },
         )
         .await;
+        control_result(&events, request_id, Err(error.to_string())).await;
         return;
     }
     if emit(
@@ -577,6 +675,7 @@ async fn session(
         }
         return;
     }
+    control_result(&events, request_id, Ok(())).await;
     let result = async {
         let (mut send, mut recv) = if outgoing {
             connection.open_bi().await.map_err(error)?
@@ -693,6 +792,32 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), LanError> {
     }
     result
 }
+fn update_pin(
+    directory: &Path,
+    added: Option<Ticket>,
+    removed: Option<Fingerprint>,
+) -> Result<HashMap<Fingerprint, Ticket>, LanError> {
+    let (_, loaded) = load_assets(directory)?;
+    let mut pins: HashMap<_, _> = loaded
+        .into_iter()
+        .map(|ticket| (ticket.fingerprint.clone(), ticket))
+        .collect();
+    if let Some(peer) = removed {
+        pins.remove(&peer);
+    }
+    if let Some(ticket) = added {
+        pins.insert(ticket.fingerprint.clone(), ticket);
+    }
+    if pins.len() > MAX_PEERS {
+        return Err(LanError::Busy);
+    }
+    let snapshot: Vec<_> = pins.values().cloned().collect();
+    write_private(
+        &directory.join("peers.json"),
+        &serde_json::to_vec(&snapshot).map_err(error)?,
+    )?;
+    Ok(pins)
+}
 fn load_assets(directory: &Path) -> Result<(Identity, Vec<Ticket>), LanError> {
     if fs::symlink_metadata(directory).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         return Err(LanError::Invalid);
@@ -746,11 +871,64 @@ mod tests {
         sync::{Message, State, SyncDoc},
         transaction::Transactable,
     };
-    async fn next(controller: &mut Controller) -> Event {
-        tokio::time::timeout(Duration::from_secs(5), controller.events.recv())
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retired_pin_writer_finishes_before_next_asset_load() {
+        let root = std::env::temp_dir().join(format!("tanglewood-pin-retire-{}", Uuid::new_v4()));
+        let assets = root.join("lan");
+        let (identity, _) = load_assets(&assets).unwrap();
+        let ticket = Ticket {
+            version: VERSION,
+            address: "127.0.0.1:34567".parse().unwrap(),
+            vault_id: Uuid::new_v4(),
+            fingerprint: fingerprint(&identity.certificate).unwrap(),
+            certificate: identity.certificate,
+        };
+        let peer = ticket.fingerprint.clone();
+        let write_assets = assets.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let retired = tokio::spawn(async move {
+            let gate = ASSET_GATE.lock().await;
+            tokio::task::spawn_blocking(move || {
+                let _gate = gate;
+                let _ = started_tx.send(());
+                release_rx.recv().unwrap();
+                update_pin(&write_assets, Some(ticket), None).unwrap();
+            })
             .await
-            .expect("event timeout")
-            .expect("controller disconnected")
+            .unwrap();
+        });
+        started_rx.await.unwrap();
+        retired.abort();
+        let mut next = tokio::spawn(async move {
+            let gate = ASSET_GATE.lock().await;
+            tokio::task::spawn_blocking(move || {
+                let _gate = gate;
+                load_assets(&assets).unwrap().1
+            })
+            .await
+            .unwrap()
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut next)
+                .await
+                .is_err()
+        );
+        release_tx.send(()).unwrap();
+        let loaded = next.await.unwrap();
+        assert_eq!(loaded[0].fingerprint, peer);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    async fn next(controller: &mut Controller) -> Event {
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), controller.events.recv())
+                .await
+                .expect("event timeout")
+                .expect("controller disconnected");
+            if !matches!(event, Event::SendAccepted { .. }) {
+                return event;
+            }
+        }
     }
     async fn packet(controller: &mut Controller) -> (Fingerprint, Packet) {
         loop {
@@ -789,8 +967,14 @@ mod tests {
         assert!(matches!(next(&mut a).await, Event::Confirmed(_)));
         assert!(matches!(next(&mut b).await, Event::Confirmed(_)));
         a.try_send(Request::Connect(bt.clone())).unwrap();
-        assert!(matches!(next(&mut a).await, Event::Connected { .. }));
-        assert!(matches!(next(&mut b).await, Event::Connected { .. }));
+        let session_a = match next(&mut a).await {
+            Event::Connected { session, .. } => session,
+            _ => panic!("connected"),
+        };
+        let session_b = match next(&mut b).await {
+            Event::Connected { session, .. } => session,
+            _ => panic!("connected"),
+        };
         let mut left = AutoCommit::new();
         let text = left.put_object(ROOT, "text", ObjType::Text).unwrap();
         left.splice_text(&text, 0, 0, "authenticated 🦀").unwrap();
@@ -799,6 +983,7 @@ mod tests {
         for _ in 0..6 {
             if let Some(message) = left.sync().generate_sync_message(&mut ls) {
                 a.try_send(Request::Send {
+                    session: session_a,
                     peer: bt.fingerprint.clone(),
                     packet: Packet {
                         version: VERSION,
@@ -823,6 +1008,7 @@ mod tests {
             }
             if let Some(message) = right.sync().generate_sync_message(&mut rs) {
                 b.try_send(Request::Send {
+                    session: session_b,
                     peer: at.fingerprint.clone(),
                     packet: Packet {
                         version: VERSION,
@@ -861,6 +1047,7 @@ mod tests {
         assert!(encode_packet(&maximum, vault).unwrap().len() <= MAX_FRAME);
         let maximum_id = maximum.message_id;
         a.try_send(Request::Send {
+            session: session_a,
             peer: bt.fingerprint.clone(),
             packet: maximum,
         })
@@ -881,6 +1068,7 @@ mod tests {
         };
         assert!(oversize.validate(vault).is_err());
         a.try_send(Request::Send {
+            session: session_a,
             peer: bt.fingerprint.clone(),
             packet: oversize,
         })
@@ -949,6 +1137,7 @@ mod tests {
         };
         let denied_id = denied.message_id;
         a.try_send(Request::Send {
+            session: session_a,
             peer: bt.fingerprint.clone(),
             packet: denied,
         })
@@ -986,6 +1175,34 @@ mod tests {
             .unwrap();
         loop {
             if matches!(next(&mut a).await, Event::Connected { .. }) {
+                break;
+            }
+        }
+        let stale = Packet {
+            version: VERSION,
+            vault_id: vault,
+            document: DocumentId::Catalog,
+            message_id: Uuid::new_v4(),
+            body: Body::Sync { bytes: vec![1] },
+        };
+        let stale_id = stale.message_id;
+        a.try_send(Request::Send {
+            peer: bt.fingerprint.clone(),
+            session: session_a,
+            packet: stale,
+        })
+        .unwrap();
+        loop {
+            if let Event::SendRejected {
+                session,
+                message_id,
+                packet,
+                ..
+            } = next(&mut a).await
+            {
+                assert_eq!(session, session_a);
+                assert_eq!(message_id, stale_id);
+                assert_eq!(packet.message_id, stale_id);
                 break;
             }
         }

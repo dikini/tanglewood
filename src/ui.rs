@@ -32,6 +32,12 @@ pub struct TanglewoodUi {
     error: Option<String>,
     show_notes: bool,
     closing: bool,
+    #[cfg(feature = "lan")]
+    lan_panel: LanPanel,
+    #[cfg(target_os = "android")]
+    picker: Option<crate::android_picker::AndroidPicker>,
+    #[cfg(target_os = "android")]
+    picker_status: String,
     #[cfg(all(target_os = "linux", feature = "mcp"))]
     mcp: Option<crate::mcp::OwnerSocket>,
     #[cfg(all(target_os = "linux", feature = "codex"))]
@@ -51,8 +57,14 @@ impl TanglewoodUi {
             show_trash: false,
             show_preview: false,
             error: None,
-            show_notes: true,
+            show_notes: !cfg!(target_os = "android"),
             closing: false,
+            #[cfg(feature = "lan")]
+            lan_panel: LanPanel::default(),
+            #[cfg(target_os = "android")]
+            picker: None,
+            #[cfg(target_os = "android")]
+            picker_status: String::new(),
             #[cfg(all(target_os = "linux", feature = "mcp"))]
             mcp: None,
             #[cfg(all(target_os = "linux", feature = "codex"))]
@@ -72,7 +84,121 @@ impl TanglewoodUi {
         self
     }
 
+    #[cfg(target_os = "android")]
+    pub fn with_android_picker(mut self, picker: crate::android_picker::AndroidPicker) -> Self {
+        self.picker = Some(picker);
+        self
+    }
+
+    #[cfg(target_os = "android")]
+    fn poll_picker(&mut self, ctx: &egui::Context) {
+        use crate::android_picker::PickerCompletion;
+        let completion = self.picker.as_mut().and_then(|picker| picker.poll());
+        if let Some(completion) = completion {
+            self.picker_status = match completion {
+                PickerCompletion::ImportReady {
+                    request_id,
+                    command,
+                } => {
+                    // Preserve selection and all drafts. refresh() will flag a changed
+                    // canonical revision as a conflict when a local draft is dirty.
+                    match self.app.execute(command, Caller::Local) {
+                        Ok(CommandResult::Note(view)) => format!(
+                            "Import {request_id} accepted: {} (revision {:?}); storage pending",
+                            view.note.path, view.note.revision
+                        ),
+                        Ok(_) => format!("Import {request_id}: unexpected response"),
+                        Err(error) => {
+                            format!("Import {request_id} rejected; draft retained: {error}")
+                        }
+                    }
+                }
+                PickerCompletion::Exported {
+                    request_id,
+                    note,
+                    revision,
+                } => format!(
+                    "Document export {request_id} complete: {note:?}, canonical revision {revision:?}. SQLite save status is separate."
+                ),
+                PickerCompletion::Cancelled { request_id } => {
+                    format!("Document request {request_id} cancelled; source unchanged")
+                }
+                PickerCompletion::Failed { request_id, error } => {
+                    format!("Document request {request_id} failed: {error}")
+                }
+            };
+        }
+        if self
+            .picker
+            .as_ref()
+            .is_some_and(|picker| picker.is_pending())
+        {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    fn picker_controls(&mut self, ui: &mut egui::Ui) {
+        let selected = self.selected.and_then(|id| self.app.note(id).ok());
+        let Some(picker) = &mut self.picker else {
+            return;
+        };
+        let pending = picker.is_pending();
+        let mut result = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Import into new vault path:");
+            ui.text_edit_singleline(&mut self.new_path);
+            if ui
+                .add_enabled(!pending, egui::Button::new("Choose document to import"))
+                .clicked()
+            {
+                result = Some(picker.import_create(self.new_path.clone()));
+            }
+            if let Some(view) = selected.as_ref().filter(|view| !view.note.trashed) {
+                if ui
+                    .add_enabled(
+                        !pending,
+                        egui::Button::new("Replace selected from document"),
+                    )
+                    .clicked()
+                {
+                    result = Some(picker.import_replace(view));
+                }
+                if ui
+                    .add_enabled(
+                        !pending,
+                        egui::Button::new("Export canonical selected revision"),
+                    )
+                    .clicked()
+                {
+                    result = Some(picker.export(view));
+                }
+                ui.label(format!(
+                    "Canonical revision {:?}; local drafts are excluded from export",
+                    view.note.revision
+                ));
+            }
+            if pending && ui.button("Cancel document request").clicked() {
+                self.picker_status = match picker.cancel() {
+                    Ok(()) => "Cancellation requested".into(),
+                    Err(error) => error,
+                };
+            }
+        });
+        if let Some(result) = result {
+            self.picker_status = match result {
+                Ok(id) => format!("Document request {id} pending"),
+                Err(error) => format!("Cannot open document picker: {error}"),
+            };
+        }
+        ui.label(&self.picker_status);
+    }
+
     fn select(&mut self, id: NoteId) {
+        #[cfg(target_os = "android")]
+        {
+            self.show_notes = false;
+        }
         if self.selected != Some(id) {
             if let Some(previous) = self.selected.and_then(|old| self.drafts.get_mut(&old)) {
                 if previous.composing {
@@ -121,6 +247,7 @@ impl TanglewoodUi {
                 self.select(view.note.id);
             }
             Ok(CommandResult::Notes(_)) => {}
+            Ok(CommandResult::LanTicket { .. } | CommandResult::LanStatus(_)) => {}
             Ok(CommandResult::Accepted { .. }) => {
                 self.error = Some("Operation queued; waiting for completion.".into());
             }
@@ -158,9 +285,221 @@ impl TanglewoodUi {
     }
 }
 
+#[cfg(feature = "lan")]
+struct LanPanel {
+    bind: String,
+    advertised: String,
+    source_ticket: String,
+    peer_ticket: String,
+    fingerprint: String,
+    ticket: String,
+    status: Option<crate::commands::LanStatus>,
+    message: String,
+    request: Option<uuid::Uuid>,
+    last_poll: Option<std::time::Instant>,
+}
+#[cfg(feature = "lan")]
+impl Default for LanPanel {
+    fn default() -> Self {
+        Self {
+            bind: "0.0.0.0:0".into(),
+            advertised: String::new(),
+            source_ticket: String::new(),
+            peer_ticket: String::new(),
+            fingerprint: String::new(),
+            ticket: String::new(),
+            status: None,
+            message: String::new(),
+            request: None,
+            last_poll: None,
+        }
+    }
+}
+#[cfg(feature = "lan")]
+impl LanPanel {
+    fn execute(&mut self, app: &mut App, command: Command) {
+        match app.execute(command, Caller::Local) {
+            Ok(CommandResult::LanTicket { ticket }) => {
+                self.ticket = ticket;
+                self.message =
+                    "Ticket ready; verify fingerprints with the other device before confirming."
+                        .into();
+            }
+            Ok(CommandResult::LanStatus(status)) => {
+                if let Some(ticket) = &status.ticket {
+                    self.ticket = ticket.clone();
+                }
+                self.status = Some(status);
+            }
+            Ok(CommandResult::Accepted { request_id }) => {
+                self.request = Some(request_id);
+                self.message =
+                    format!("Sync operation {request_id} pending; note save status is separate");
+            }
+            Ok(_) => self.message = "Sync command accepted; inspect status below".into(),
+            Err(error) => self.message = format!("Sync command failed: {error}"),
+        }
+        self.last_poll = None;
+    }
+    fn ticket_identity(ui: &mut egui::Ui, text: &str) {
+        if text.trim().is_empty() {
+            return;
+        }
+        match crate::lan::Ticket::parse(text.trim()) {
+            Ok(ticket) => {
+                ui.label(format!(
+                    "Fingerprint: {}\nAddress: {}\nVault: {}",
+                    ticket.fingerprint.0, ticket.address, ticket.vault_id
+                ));
+            }
+            Err(error) => {
+                ui.colored_label(egui::Color32::YELLOW, format!("Invalid ticket: {error}"));
+            }
+        }
+    }
+    fn show(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, app: &mut App) {
+        if let Some(request) = self.request {
+            if let Some(status) = app.io_status(request) {
+                if !matches!(status, crate::app::IoStatus::Pending) {
+                    self.message = format!(
+                        "Sync operation {request}: {status:?}; note save status is separate"
+                    );
+                    self.request = None;
+                }
+            }
+        }
+        let mut expanded = false;
+        ui.collapsing("Sync", |ui| {
+            expanded = true;
+            egui::ScrollArea::vertical()
+                .id_salt("lan-controls")
+                .max_height((ctx.content_rect().height() * 0.45).max(1.0))
+                .show(ui, |ui| {
+            ui.label("Foreground LAN only. Pairing and vault migration require explicit actions.");
+            let mut command = None;
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Enable sync for this vault").clicked() {
+                    command = Some(Command::EnableSync);
+                }
+                if ui.button("Status").clicked() {
+                    command = Some(Command::GetLanStatus);
+                }
+                if ui.button("Pause").clicked() {
+                    command = Some(Command::PauseLan);
+                }
+                if ui.button("Resume").clicked() {
+                    command = Some(Command::ResumeLan);
+                }
+            });
+            ui.label("Listen bind address (IP:port)");
+            ui.text_edit_singleline(&mut self.bind);
+            ui.label("Advertised IP (required for wildcard bind)");
+            ui.text_edit_singleline(&mut self.advertised);
+            if ui.button("Listen on this address").clicked() {
+                command = Some(Command::ListenLan {
+                    bind: self.bind.clone(),
+                    advertised_ip: (!self.advertised.trim().is_empty())
+                        .then(|| self.advertised.trim().to_owned()),
+                });
+            }
+            if ui.button("Read local ticket").clicked() {
+                command = Some(Command::GetLanTicket);
+            }
+            if !self.ticket.is_empty() {
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.ticket)
+                        .desired_rows(2)
+                        .interactive(false),
+                );
+                Self::ticket_identity(ui, &self.ticket);
+                if ui.button("Copy local ticket").clicked() {
+                    ctx.copy_text(self.ticket.clone());
+                }
+            }
+            ui.label("Source ticket for an empty joining vault");
+            ui.text_edit_multiline(&mut self.source_ticket);
+            Self::ticket_identity(ui, &self.source_ticket);
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Prepare empty join").clicked() {
+                    command = Some(Command::PrepareJoin {
+                        ticket: self.source_ticket.trim().into(),
+                    });
+                }
+                if ui.button("Cancel prepared join").clicked() {
+                    command = Some(Command::CancelJoin);
+                }
+            });
+            ui.label("Peer ticket: compare fingerprint out of band before confirming trust");
+            ui.text_edit_multiline(&mut self.peer_ticket);
+            Self::ticket_identity(ui, &self.peer_ticket);
+            if ui.button("Confirm this peer ticket").clicked() {
+                command = Some(Command::ConfirmPeer {
+                    ticket: self.peer_ticket.trim().into(),
+                });
+            }
+            ui.label("Peer fingerprint");
+            ui.text_edit_singleline(&mut self.fingerprint);
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Connect fingerprint").clicked() {
+                    command = Some(Command::ConnectPeer {
+                        fingerprint: self.fingerprint.trim().into(),
+                    });
+                }
+                if ui.button("Unpair fingerprint").clicked() {
+                    command = Some(Command::UnpairPeer {
+                        fingerprint: self.fingerprint.trim().into(),
+                    });
+                }
+            });
+            if let Some(command) = command {
+                self.execute(app, command);
+            }
+            if let Some(status) = &self.status {
+                ui.label(format!(
+                    "Listening: {} · paused: {} · prepared: {} · joining: {}",
+                    status.listening, status.paused, status.prepared, status.joining
+                ));
+                ui.label(format!(
+                    "Pairing state storage: {}/{} generations; queued messages: {}",
+                    status.persisted_generation,
+                    status.accepted_generation,
+                    status.pending_messages
+                ));
+                for peer in &status.peers {
+                    ui.label(format!(
+                        "{} · connected: {} · receipt: {:?}",
+                        peer.fingerprint, peer.connected, peer.last_receipt
+                    ));
+                }
+                if let Some(error) = &status.error {
+                    ui.colored_label(egui::Color32::LIGHT_RED, error);
+                }
+            }
+            ui.label(&self.message);
+                });
+        });
+        let active = self.request.is_some()
+            || self.status.as_ref().is_some_and(|status| {
+                status.listening || status.joining || status.pending_messages > 0
+            });
+        if expanded || active {
+            if self
+                .last_poll
+                .is_none_or(|last| last.elapsed() >= std::time::Duration::from_millis(500))
+            {
+                self.execute(app, Command::GetLanStatus);
+                self.last_poll = Some(std::time::Instant::now());
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        }
+    }
+}
+
 impl eframe::App for TanglewoodUi {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.app.tick();
+        #[cfg(target_os = "android")]
+        self.poll_picker(ctx);
         #[cfg(all(target_os = "linux", feature = "mcp"))]
         if let Some(socket) = &mut self.mcp {
             let context = ctx.clone();
@@ -195,7 +534,19 @@ impl eframe::App for TanglewoodUi {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.heading("Tanglewood");
-                ui.toggle_value(&mut self.show_notes, "Notes");
+                let opened_notes =
+                    ui.toggle_value(&mut self.show_notes, "Notes").changed() && self.show_notes;
+                #[cfg(target_os = "android")]
+                if opened_notes {
+                    if let Some(draft) = self.selected.and_then(|id| self.drafts.get_mut(&id)) {
+                        if draft.composing {
+                            draft.composing = false;
+                            draft.conflict = true;
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "android"))]
+                let _ = opened_notes;
                 ui.checkbox(&mut self.show_preview, "Preview");
                 #[cfg(all(target_os = "linux", feature = "codex"))]
                 if let Some(panel) = &mut self.conversation {
@@ -208,6 +559,10 @@ impl eframe::App for TanglewoodUi {
                     retry = true;
                 }
             });
+            #[cfg(feature = "lan")]
+            self.lan_panel.show(ui, ctx, &mut self.app);
+            #[cfg(target_os = "android")]
+            ui.collapsing("Documents", |ui| self.picker_controls(ui));
             if let Some(error) = &self.error {
                 ui.colored_label(egui::Color32::LIGHT_RED, error);
             }
@@ -224,7 +579,11 @@ impl eframe::App for TanglewoodUi {
         if self.show_notes {
             egui::SidePanel::left("notes")
                 .resizable(true)
-                .default_width(230.0)
+                .default_width(if cfg!(target_os = "android") {
+                    ctx.content_rect().width()
+                } else {
+                    230.0
+                })
                 .show(ctx, |ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.query)
@@ -266,7 +625,8 @@ impl eframe::App for TanglewoodUi {
                     }
                 });
         }
-        egui::CentralPanel::default().show(ctx, |ui| {
+        if !cfg!(target_os = "android") || !self.show_notes {
+            egui::CentralPanel::default().show(ctx, |ui| {
           egui::ScrollArea::vertical().id_salt("editor-scroll").show(ui, |ui| {
             let Some(view) = notes.iter().find(|view| Some(view.note.id) == self.selected) else {
                 ui.label("Create or select a Markdown note."); return;
@@ -341,6 +701,7 @@ impl eframe::App for TanglewoodUi {
             }
           });
         });
+        }
         let navigation_source = notes
             .iter()
             .find(|view| Some(view.note.id) == self.selected)

@@ -32,6 +32,8 @@ pub struct SyncStatus {
     pub error: Option<String>,
 }
 enum PendingIo {
+    #[cfg(feature = "lan")]
+    Lan,
     Configure,
     Import(ImportDestination),
     Export,
@@ -55,9 +57,27 @@ struct Migration {
     committing: bool,
     history: Option<crate::sync::HistoryBundle>,
 }
+#[cfg(feature = "lan")]
+struct JoinCommit {
+    request_id: Uuid,
+    peer: crate::lan::Fingerprint,
+    session: usize,
+    transfer: Uuid,
+    bundle: crate::sync::HistoryBundle,
+    replica: crate::sync::Replica,
+    notes: Vec<NoteRecord>,
+}
 /// The application thread exclusively owns the ECS World.
 #[derive(Default)]
 pub struct App {
+    #[cfg(feature = "lan")]
+    lan_state: crate::lan_owner::LanState,
+    #[cfg(feature = "lan")]
+    lan_join: Option<JoinCommit>,
+    #[cfg(feature = "lan")]
+    lan_prepare_pending: bool,
+    #[cfg(feature = "lan")]
+    vault_directory: Option<std::path::PathBuf>,
     #[cfg(feature = "sync")]
     replica: Option<crate::sync::Replica>,
     #[cfg(feature = "sync")]
@@ -103,6 +123,10 @@ impl App {
         let history = state.history.clone();
         let mut app = Self {
             store: Some(store),
+            #[cfg(feature = "lan")]
+            vault_directory: Some(directory.to_path_buf()),
+            #[cfg(feature = "lan")]
+            lan_state: crate::lan_owner::LanState::with_preparation(state.preparation),
             files: Some(
                 FileWorker::open(&directory.join("markdown"))
                     .map_err(|error| StoreError::Storage(error.to_string()))?,
@@ -166,6 +190,244 @@ impl App {
             app.durable_history = Some(history);
         }
         Ok(app)
+    }
+    #[cfg(feature = "lan")]
+    pub fn set_lan_runtime(&mut self, handle: tokio::runtime::Handle) {
+        self.lan_state.runtime = Some(handle);
+    }
+    #[cfg(feature = "lan")]
+    fn lan_context(&self) -> crate::lan_owner::Context<'_> {
+        crate::lan_owner::Context {
+            history: self.durable_history.as_ref(),
+            accepted: self.generation,
+            persisted: self.persisted_generation,
+        }
+    }
+    #[cfg(feature = "lan")]
+    fn execute_lan(&mut self, command: Command) -> Result<CommandResult, CommandError> {
+        use crate::lan::{Control, Fingerprint, Ticket};
+        if matches!(command, Command::GetLanTicket) {
+            return self
+                .lan_state
+                .ticket()
+                .map(|ticket| CommandResult::LanTicket { ticket })
+                .map_err(CommandError::Unavailable);
+        }
+        if matches!(command, Command::GetLanStatus) {
+            return Ok(CommandResult::LanStatus(
+                self.lan_state.status(&self.lan_context()),
+            ));
+        }
+        if self.lan_join.is_some()
+            && matches!(command, Command::PrepareJoin { .. } | Command::CancelJoin)
+        {
+            return Err(CommandError::Busy);
+        }
+        let directory = self
+            .vault_directory
+            .clone()
+            .ok_or_else(|| CommandError::Unavailable("open a vault first".into()))?;
+        let request_id = self.accept_io()?;
+        self.io_pending.insert(request_id, PendingIo::Lan);
+        let outcome = (|| -> Result<(), String> {
+            match command {
+                Command::PrepareJoin { ticket } => {
+                    if self.migration.is_some() || self.lan_prepare_pending {
+                        return Err("join preparation is busy".into());
+                    }
+                    if !self.ids.is_empty() || self.replica.is_some() {
+                        return Err("join requires an empty unmigrated vault".into());
+                    }
+                    let parsed = Ticket::parse(&ticket).map_err(|e| e.to_string())?;
+                    if self
+                        .lan_state
+                        .preparation
+                        .as_ref()
+                        .is_some_and(|p| p.vault_id != parsed.vault_id)
+                    {
+                        return Err("cancel the existing join preparation first".into());
+                    }
+                    let device_id = self
+                        .lan_state
+                        .preparation
+                        .as_ref()
+                        .map(|p| p.device_id)
+                        .unwrap_or_else(Uuid::new_v4);
+                    self.storage_jobs.push_back(StoreRequest::PrepareJoin {
+                        request_id,
+                        preparation: Some(crate::lan_owner::Preparation {
+                            vault_id: parsed.vault_id,
+                            device_id,
+                            ticket,
+                        }),
+                    });
+                    self.lan_prepare_pending = true;
+                }
+                Command::CancelJoin => {
+                    if self.lan_prepare_pending {
+                        return Err("join preparation is busy".into());
+                    }
+                    if let Some(cancelled) = self.lan_state.pause() {
+                        self.io_pending.remove(&cancelled);
+                        self.io_status.insert(
+                            cancelled,
+                            IoStatus::Failed("LAN startup cancelled by CancelJoin".into()),
+                        );
+                    }
+                    self.storage_jobs.push_back(StoreRequest::PrepareJoin {
+                        request_id,
+                        preparation: None,
+                    });
+                    self.lan_prepare_pending = true;
+                }
+                Command::ListenLan {
+                    bind,
+                    advertised_ip,
+                } => {
+                    let vault = self
+                        .durable_history
+                        .as_ref()
+                        .map(|h| h.vault_id)
+                        .or_else(|| self.lan_state.preparation.as_ref().map(|p| p.vault_id))
+                        .ok_or("enable sync or prepare joining first")?;
+                    self.lan_state.start(
+                        request_id,
+                        directory,
+                        vault,
+                        bind.parse().map_err(|_| "invalid numeric bind address")?,
+                        advertised_ip
+                            .map(|ip| ip.parse().map_err(|_| "invalid advertised IP"))
+                            .transpose()?,
+                    )?;
+                }
+                Command::ConfirmPeer { ticket } => {
+                    let ticket = Ticket::parse(&ticket).map_err(|e| e.to_string())?;
+                    self.lan_state
+                        .control(request_id, Control::Confirm(ticket))?;
+                }
+                Command::UnpairPeer { fingerprint } => {
+                    let peer = Fingerprint(fingerprint);
+                    self.lan_state.deny(&peer);
+                    self.lan_state.control(request_id, Control::Unpair(peer))?;
+                }
+                Command::ConnectPeer { fingerprint } => {
+                    let ticket = self.lan_state.known(&fingerprint)?;
+                    self.lan_state
+                        .control(request_id, Control::Connect(ticket))?;
+                }
+                Command::PauseLan => {
+                    if let Some(cancelled) = self.lan_state.pause() {
+                        self.io_pending.remove(&cancelled);
+                        self.io_status.insert(
+                            cancelled,
+                            IoStatus::Failed("LAN startup cancelled by pause".into()),
+                        );
+                    }
+                    self.io_status.insert(request_id, IoStatus::Completed);
+                    self.io_pending.remove(&request_id);
+                }
+                Command::ResumeLan => {
+                    let vault = self
+                        .durable_history
+                        .as_ref()
+                        .map(|h| h.vault_id)
+                        .or_else(|| self.lan_state.preparation.as_ref().map(|p| p.vault_id))
+                        .ok_or("no selected vault")?;
+                    self.lan_state.resume(request_id, directory, vault)?;
+                }
+                _ => unreachable!(),
+            }
+            Ok(())
+        })();
+        if let Err(error) = outcome {
+            self.io_pending.remove(&request_id);
+            self.io_status
+                .insert(request_id, IoStatus::Failed(error.clone()));
+            return Err(CommandError::Unavailable(error));
+        }
+        Ok(CommandResult::Accepted { request_id })
+    }
+    #[cfg(feature = "lan")]
+    fn tick_lan(&mut self) {
+        use crate::lan_owner::Action;
+        let mut state = std::mem::take(&mut self.lan_state);
+        let actions = state.tick(&self.lan_context());
+        for action in actions {
+            match action {
+                Action::Status(id, result) => {
+                    self.io_pending.remove(&id);
+                    self.io_status.insert(
+                        id,
+                        match result {
+                            Ok(()) => IoStatus::Completed,
+                            Err(error) => IoStatus::Failed(error),
+                        },
+                    );
+                }
+                Action::Receive {
+                    peer,
+                    bundle,
+                    receipts,
+                } => match self.merge_history(&bundle) {
+                    Ok(generation) => state.received(&peer, generation, receipts),
+                    Err(error) => {
+                        state.fail(&peer, error.to_string());
+                    }
+                },
+                Action::Join {
+                    peer,
+                    session,
+                    transfer,
+                    bundle,
+                } => {
+                    if !self.ids.is_empty()
+                        || self.replica.is_some()
+                        || self.migration.is_some()
+                        || self.lan_join.is_some()
+                    {
+                        state.committing = false;
+                        state.error = Some("join refused: local vault is no longer empty".into());
+                        continue;
+                    }
+                    match crate::sync::Replica::load(&bundle).and_then(|replica| {
+                        replica.project().map(|projection| (replica, projection))
+                    }) {
+                        Ok((replica, projection)) => {
+                            let notes = projection
+                                .into_iter()
+                                .map(|note| NoteRecord {
+                                    id: note.id,
+                                    path: note.path,
+                                    text: note.text,
+                                    trashed: note.trashed,
+                                    revision: Revision::fresh(),
+                                })
+                                .collect::<Vec<_>>();
+                            let request_id = Uuid::new_v4();
+                            self.storage_jobs.push_back(StoreRequest::JoinVault {
+                                request_id,
+                                history: bundle.clone(),
+                                notes: notes.clone(),
+                            });
+                            self.lan_join = Some(JoinCommit {
+                                request_id,
+                                peer,
+                                session,
+                                transfer,
+                                bundle,
+                                replica,
+                                notes,
+                            });
+                        }
+                        Err(error) => {
+                            state.committing = false;
+                            state.error = Some(error.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        self.lan_state = state;
     }
     pub fn sync_enabled(&self) -> bool {
         #[cfg(feature = "sync")]
@@ -377,6 +639,75 @@ impl App {
             self.control_inflight = self.control_inflight.saturating_sub(1);
         }
         match event {
+            #[cfg(feature = "lan")]
+            StoreEvent::Prepared {
+                request_id,
+                preparation,
+                result,
+            } => {
+                self.lan_prepare_pending = false;
+                self.io_pending.remove(&request_id);
+                match result {
+                    Ok(()) => {
+                        self.lan_state.preparation = preparation;
+                        self.io_status.insert(request_id, IoStatus::Completed);
+                    }
+                    Err(error) => {
+                        self.io_status.insert(request_id, IoStatus::Failed(error));
+                    }
+                }
+            }
+            #[cfg(feature = "lan")]
+            StoreEvent::Joined { request_id, result } => {
+                if let Some(join) = self.lan_join.take() {
+                    if join.request_id == request_id {
+                        match result {
+                            Ok(()) => {
+                                self.sync_conflicts = join
+                                    .replica
+                                    .project()
+                                    .unwrap()
+                                    .into_iter()
+                                    .map(|note| (note.id, note.conflicts))
+                                    .collect();
+                                for note in join.notes {
+                                    let id = note.id;
+                                    let revision = note.revision;
+                                    if self.mirror_enabled {
+                                        self.exports.insert(id, note.clone());
+                                    }
+                                    let entity = self
+                                        .world
+                                        .spawn((
+                                            note,
+                                            SaveState {
+                                                accepted: revision,
+                                                persisted: Some(revision),
+                                                error: None,
+                                            },
+                                        ))
+                                        .id();
+                                    self.ids.insert(id, entity);
+                                }
+                                self.replica = Some(join.replica);
+                                self.durable_history = Some(join.bundle.clone());
+                                if let Err(error) = self.lan_state.joined(
+                                    &join.peer,
+                                    join.session,
+                                    join.transfer,
+                                    &join.bundle,
+                                ) {
+                                    self.lan_state.error = Some(error);
+                                }
+                            }
+                            Err(error) => {
+                                self.lan_state.committing = false;
+                                self.lan_state.error = Some(error);
+                            }
+                        }
+                    }
+                }
+            }
             #[cfg(feature = "sync")]
             StoreEvent::Migrated { request_id, result } => {
                 if let Some(mut migration) = self.migration.take() {
@@ -891,6 +1222,8 @@ impl App {
             };
             self.apply_store_event(ack);
         }
+        #[cfg(feature = "lan")]
+        self.tick_lan();
         self.tick_files();
         #[cfg(feature = "sync")]
         {
@@ -997,6 +1330,8 @@ impl App {
                 && self.migration.is_none()
                 && self.history_inflight.is_none()
                 && self.generation == self.persisted_generation;
+            #[cfg(feature = "lan")]
+            let source_idle = source_idle && self.lan_join.is_none();
             if source_idle {
                 return Ok(());
             }
@@ -1012,6 +1347,8 @@ impl App {
     /// keep the application and dirty records alive for recovery or retry.
     pub fn shutdown(&mut self) -> Result<(), StoreError> {
         self.flush()?;
+        #[cfg(feature = "lan")]
+        self.lan_state.pause();
         self.files.take();
         self.store.take();
         Ok(())
@@ -1049,6 +1386,32 @@ impl App {
         }
         if !command.descriptor().allowed(caller) {
             return Err(CommandError::Unauthorized);
+        }
+        #[cfg(feature = "lan")]
+        {
+            if matches!(
+                command,
+                Command::ListenLan { .. }
+                    | Command::GetLanTicket
+                    | Command::PrepareJoin { .. }
+                    | Command::CancelJoin
+                    | Command::ConfirmPeer { .. }
+                    | Command::UnpairPeer { .. }
+                    | Command::ConnectPeer { .. }
+                    | Command::GetLanStatus
+                    | Command::PauseLan
+                    | Command::ResumeLan
+            ) {
+                return self.execute_lan(command);
+            }
+            if self.lan_join.is_some() && command.is_mutation() {
+                return Err(CommandError::Busy);
+            }
+            if matches!(command, Command::EnableSync) && self.lan_state.preparation.is_some() {
+                return Err(CommandError::Unavailable(
+                    "cancel join preparation before creating another vault".into(),
+                ));
+            }
         }
         #[cfg(feature = "sync")]
         if self.migration.is_some()
@@ -1343,6 +1706,214 @@ mod tests {
             assert!(Instant::now() < deadline, "I/O request stuck");
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+    #[cfg(feature = "lan")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lan_two_apps_join_and_live_unicode_history() {
+        async fn pump(a: &mut App, b: &mut App, condition: impl Fn(&App, &App) -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                a.tick();
+                b.tick();
+                if condition(a, b) {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "LAN timeout: {:?} / {:?}",
+                    a.lan_state.error,
+                    b.lan_state.error
+                );
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+        async fn command(a: &mut App, b: &mut App, c: Command) {
+            let id = request(a, c);
+            pump(a, b, |a, _| a.io_status(id) != Some(&IoStatus::Pending)).await;
+            assert_eq!(a.io_status(id), Some(&IoStatus::Completed));
+        }
+        fn ticket(a: &mut App) -> String {
+            match a.execute(Command::GetLanTicket, Caller::Local).unwrap() {
+                CommandResult::LanTicket { ticket } => ticket,
+                _ => panic!("ticket"),
+            }
+        }
+        let root = std::env::temp_dir().join(format!("tanglewood-owner-lan-{}", Uuid::new_v4()));
+        let mut a = App::open(&root.join("a")).unwrap();
+        let mut b = App::open(&root.join("b")).unwrap();
+        a.set_lan_runtime(tokio::runtime::Handle::current());
+        b.set_lan_runtime(tokio::runtime::Handle::current());
+        let original = note(
+            a.execute(
+                Command::CreateNote {
+                    path: "shared.md".into(),
+                    text: "α🦀".into(),
+                },
+                Caller::Local,
+            )
+            .unwrap(),
+        );
+        command(&mut a, &mut b, Command::EnableSync).await;
+        command(
+            &mut a,
+            &mut b,
+            Command::ListenLan {
+                bind: "127.0.0.1:0".into(),
+                advertised_ip: None,
+            },
+        )
+        .await;
+        let at = ticket(&mut a);
+        command(&mut b, &mut a, Command::PrepareJoin { ticket: at.clone() }).await;
+        assert!(b.notes().is_empty());
+        command(
+            &mut b,
+            &mut a,
+            Command::ListenLan {
+                bind: "127.0.0.1:0".into(),
+                advertised_ip: None,
+            },
+        )
+        .await;
+        let bt = ticket(&mut b);
+        command(&mut a, &mut b, Command::ConfirmPeer { ticket: bt }).await;
+        command(&mut b, &mut a, Command::ConfirmPeer { ticket: at.clone() }).await;
+        let fingerprint = crate::lan::Ticket::parse(&at).unwrap().fingerprint.0;
+        command(&mut b, &mut a, Command::ConnectPeer { fingerprint }).await;
+        pump(&mut a, &mut b, |_, b| {
+            b.sync_enabled() && b.notes().len() == 1
+        })
+        .await;
+        assert_ne!(
+            a.durable_history().unwrap().device_id,
+            b.durable_history().unwrap().device_id
+        );
+        assert_eq!(b.note(original.note.id).unwrap().note.text, "α🦀");
+        let current = a.note(original.note.id).unwrap();
+        a.execute(
+            Command::EditNote {
+                id: original.note.id,
+                expected: current.note.revision,
+                edits: vec![TextEdit {
+                    start: 2,
+                    end: 6,
+                    replacement: "🌳β".into(),
+                }],
+            },
+            Caller::Local,
+        )
+        .unwrap();
+        pump(&mut a, &mut b, |a, b| {
+            a.note(original.note.id).unwrap().note.text
+                == b.note(original.note.id).unwrap().note.text
+        })
+        .await;
+        a.flush().unwrap();
+        b.flush().unwrap();
+        assert_eq!(b.note(original.note.id).unwrap().note.text, "α🌳β");
+        command(&mut a, &mut b, Command::PauseLan).await;
+        assert!(a.lan_state.controller.is_none());
+        a.tick();
+        assert!(a.lan_state.controller.is_none());
+        command(&mut b, &mut a, Command::PauseLan).await;
+        let id = original.note.id;
+        let av = a.note(id).unwrap();
+        a.execute(
+            Command::RenameNote {
+                id,
+                expected: av.note.revision,
+                path: "offline.md".into(),
+            },
+            Caller::Local,
+        )
+        .unwrap();
+        let bv = b.note(id).unwrap();
+        b.execute(
+            Command::TrashNote {
+                id,
+                expected: bv.note.revision,
+            },
+            Caller::Local,
+        )
+        .unwrap();
+        a.flush().unwrap();
+        b.flush().unwrap();
+        // A cancelled startup must never install its late controller on tick.
+        let pending = request(&mut a, Command::ResumeLan);
+        request(&mut a, Command::PauseLan);
+        assert!(matches!(a.io_status(pending), Some(IoStatus::Failed(_))));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        a.tick();
+        assert!(a.lan_state.controller.is_none());
+        let cancelled_by_join = request(&mut a, Command::ResumeLan);
+        command(&mut a, &mut b, Command::CancelJoin).await;
+        assert!(matches!(
+            a.io_status(cancelled_by_join),
+            Some(IoStatus::Failed(_))
+        ));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        a.tick();
+        assert!(a.lan_state.controller.is_none());
+        a.shutdown().unwrap();
+        b.shutdown().unwrap();
+        drop(a);
+        drop(b);
+        let mut a = App::open(&root.join("a")).unwrap();
+        let mut b = App::open(&root.join("b")).unwrap();
+        a.set_lan_runtime(tokio::runtime::Handle::current());
+        b.set_lan_runtime(tokio::runtime::Handle::current());
+        for first in [true, false] {
+            if first {
+                command(
+                    &mut a,
+                    &mut b,
+                    Command::ListenLan {
+                        bind: "127.0.0.1:0".into(),
+                        advertised_ip: None,
+                    },
+                )
+                .await;
+            } else {
+                command(
+                    &mut b,
+                    &mut a,
+                    Command::ListenLan {
+                        bind: "127.0.0.1:0".into(),
+                        advertised_ip: None,
+                    },
+                )
+                .await;
+            }
+        }
+        let at = ticket(&mut a);
+        let bt = ticket(&mut b);
+        command(&mut a, &mut b, Command::ConfirmPeer { ticket: bt }).await;
+        command(&mut b, &mut a, Command::ConfirmPeer { ticket: at.clone() }).await;
+        command(
+            &mut b,
+            &mut a,
+            Command::ConnectPeer {
+                fingerprint: crate::lan::Ticket::parse(&at).unwrap().fingerprint.0,
+            },
+        )
+        .await;
+        pump(&mut a, &mut b, |a, b| {
+            let a = a.note(id).unwrap().note;
+            let b = b.note(id).unwrap().note;
+            a.path == "offline.md" && b.path == a.path && a.trashed && b.trashed
+        })
+        .await;
+        a.flush().unwrap();
+        b.flush().unwrap();
+        a.shutdown().unwrap();
+        b.shutdown().unwrap();
+        drop(a);
+        drop(b);
+        let mut reopened = App::open(&root.join("b")).unwrap();
+        assert_eq!(reopened.note(original.note.id).unwrap().note.text, "α🌳β");
+        reopened.shutdown().unwrap();
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[cfg(feature = "sync")]
     #[test]

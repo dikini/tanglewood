@@ -36,6 +36,8 @@ pub struct MirrorConflict {
 }
 #[derive(Default)]
 pub struct StoreStartup {
+    #[cfg(feature = "lan")]
+    pub preparation: Option<crate::lan_owner::Preparation>,
     #[cfg(feature = "sync")]
     pub history: Option<crate::sync::HistoryBundle>,
     pub notes: Vec<NoteRecord>,
@@ -54,6 +56,17 @@ pub struct SaveAck {
 }
 #[derive(Debug)]
 pub enum StoreEvent {
+    #[cfg(feature = "lan")]
+    Prepared {
+        request_id: Uuid,
+        preparation: Option<crate::lan_owner::Preparation>,
+        result: Result<(), String>,
+    },
+    #[cfg(feature = "lan")]
+    Joined {
+        request_id: Uuid,
+        result: Result<(), String>,
+    },
     #[cfg(feature = "sync")]
     Migrated {
         request_id: Uuid,
@@ -84,6 +97,17 @@ pub enum StoreEvent {
 }
 #[derive(Debug)]
 pub enum StoreRequest {
+    #[cfg(feature = "lan")]
+    PrepareJoin {
+        request_id: Uuid,
+        preparation: Option<crate::lan_owner::Preparation>,
+    },
+    #[cfg(feature = "lan")]
+    JoinVault {
+        request_id: Uuid,
+        history: crate::sync::HistoryBundle,
+        notes: Vec<NoteRecord>,
+    },
     #[cfg(feature = "sync")]
     Migrate {
         request_id: Uuid,
@@ -190,6 +214,32 @@ impl Store {
                         }
                         Job::Control(request) => {
                             let event = match request {
+                                #[cfg(feature = "lan")]
+                                StoreRequest::PrepareJoin {
+                                    request_id,
+                                    preparation,
+                                } => {
+                                    let result =
+                                        prepare_join(&mut connection, preparation.as_ref())
+                                            .map_err(|e| e.to_string());
+                                    StoreEvent::Prepared {
+                                        request_id,
+                                        preparation,
+                                        result,
+                                    }
+                                }
+                                #[cfg(feature = "lan")]
+                                StoreRequest::JoinVault {
+                                    request_id,
+                                    history,
+                                    notes,
+                                } => {
+                                    let result =
+                                        migrate(&mut connection, &database, &history, &notes, true)
+                                            .map(|_| ())
+                                            .map_err(|e| e.to_string());
+                                    StoreEvent::Joined { request_id, result }
+                                }
                                 #[cfg(feature = "sync")]
                                 StoreRequest::Migrate {
                                     request_id,
@@ -197,8 +247,14 @@ impl Store {
                                     notes,
                                 } => StoreEvent::Migrated {
                                     request_id,
-                                    result: migrate(&mut connection, &database, &history, &notes)
-                                        .map_err(|error| error.to_string()),
+                                    result: migrate(
+                                        &mut connection,
+                                        &database,
+                                        &history,
+                                        &notes,
+                                        false,
+                                    )
+                                    .map_err(|error| error.to_string()),
                                 },
                                 #[cfg(feature = "sync")]
                                 StoreRequest::SaveHistory {
@@ -389,7 +445,23 @@ COMMIT;").map_err(storage)?;
             .pragma_update(None, "user_version", 2)
             .map_err(storage)?;
     }
+    #[cfg(feature="lan")]
+    connection.execute_batch("CREATE TABLE IF NOT EXISTS lan_preparation(singleton INTEGER PRIMARY KEY CHECK(singleton=1),payload BLOB NOT NULL)").map_err(storage)?;
     let mut state = StoreStartup {
+        #[cfg(feature = "lan")]
+        preparation: {
+            let bytes: Option<Vec<u8>> = connection
+                .query_row(
+                    "SELECT payload FROM lan_preparation WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(storage)?;
+            bytes
+                .map(|bytes| serde_json::from_slice(&bytes).map_err(storage))
+                .transpose()?
+        },
         #[cfg(feature = "sync")]
         history: load_history(&connection).map_err(storage)?,
         notes: load_notes(&connection, "notes").map_err(storage)?,
@@ -565,6 +637,35 @@ fn record_conflict(
     connection.execute("INSERT INTO mirror_conflicts(note_id,path,revision,database_text,trashed,external_text,kind,note_path) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![conflict.note.id.0.to_string(),conflict.path,conflict.note.revision.0.to_string(),conflict.note.text,conflict.note.trashed,conflict.external,conflict.kind,conflict.note.path])?;
     Ok(connection.last_insert_rowid())
 }
+#[cfg(feature = "lan")]
+fn prepare_join(
+    connection: &mut Connection,
+    preparation: Option<&crate::lan_owner::Preparation>,
+) -> Result<(), StoreError> {
+    let transaction = connection.transaction().map_err(storage)?;
+    if preparation.is_some()
+        && (has_history(&transaction).map_err(storage)?
+            || !load_notes(&transaction, "notes")
+                .map_err(storage)?
+                .is_empty())
+    {
+        return Err(StoreError::Storage(
+            "join requires an empty unmigrated vault".into(),
+        ));
+    }
+    match preparation {
+        Some(preparation) => {
+            let bytes = serde_json::to_vec(preparation).map_err(storage)?;
+            transaction.execute("INSERT INTO lan_preparation VALUES(1,?1) ON CONFLICT(singleton) DO UPDATE SET payload=excluded.payload",[bytes]).map_err(storage)?;
+        }
+        None => {
+            transaction
+                .execute("DELETE FROM lan_preparation", [])
+                .map_err(storage)?;
+        }
+    }
+    transaction.commit().map_err(storage)
+}
 fn has_history(connection: &Connection) -> rusqlite::Result<bool> {
     connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='sync_meta')",
@@ -648,6 +749,7 @@ fn migrate(
     database: &Path,
     history: &crate::sync::HistoryBundle,
     notes: &[NoteRecord],
+    joining: bool,
 ) -> Result<String, StoreError> {
     if has_history(connection).map_err(storage)? {
         return Err(StoreError::Storage("vault already migrated".into()));
@@ -656,7 +758,7 @@ fn migrate(
     let mut supplied = notes.to_vec();
     current.sort_by_key(|note| note.id.0);
     supplied.sort_by_key(|note| note.id.0);
-    if current != supplied {
+    if (joining && !current.is_empty()) || (!joining && current != supplied) {
         return Err(StoreError::Storage("migration source changed".into()));
     }
     let backup = database
@@ -699,6 +801,10 @@ fn migrate(
     write_notes(&transaction, notes).map_err(storage)?;
     transaction
         .pragma_update(None, "user_version", 3)
+        .map_err(storage)?;
+    #[cfg(feature = "lan")]
+    transaction
+        .execute("DELETE FROM lan_preparation", [])
         .map_err(storage)?;
     transaction.commit().map_err(storage)?;
     Ok(backup.to_string_lossy().into())

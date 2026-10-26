@@ -10,6 +10,27 @@ pub enum Caller {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LanPeerStatus {
+    pub fingerprint: String,
+    pub connected: bool,
+    pub session: Option<u64>,
+    pub last_receipt: Option<uuid::Uuid>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LanStatus {
+    pub listening: bool,
+    pub paused: bool,
+    pub prepared: bool,
+    pub joining: bool,
+    pub vault_id: Option<uuid::Uuid>,
+    pub ticket: Option<String>,
+    pub peers: Vec<LanPeerStatus>,
+    pub pending_messages: usize,
+    pub error: Option<String>,
+    pub accepted_generation: u64,
+    pub persisted_generation: u64,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub enum ImportDestination {
     Create { path: String },
@@ -18,6 +39,27 @@ pub enum ImportDestination {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub enum Command {
+    ListenLan {
+        bind: String,
+        advertised_ip: Option<String>,
+    },
+    GetLanTicket,
+    PrepareJoin {
+        ticket: String,
+    },
+    CancelJoin,
+    ConfirmPeer {
+        ticket: String,
+    },
+    UnpairPeer {
+        fingerprint: String,
+    },
+    ConnectPeer {
+        fingerprint: String,
+    },
+    GetLanStatus,
+    PauseLan,
+    ResumeLan,
     EnableSync,
     SetMirrorEnabled {
         enabled: bool,
@@ -69,7 +111,77 @@ pub struct CommandDescriptor {
     pub mutation: bool,
     pub local_only: bool,
 }
-const COMMANDS: [CommandDescriptor; 12] = [
+const COMMANDS: [CommandDescriptor; 22] = [
+    CommandDescriptor {
+        name: "lan.listen",
+        wire_variant: "ListenLan",
+        available: cfg!(feature = "lan"),
+        mutation: true,
+        local_only: true,
+    },
+    CommandDescriptor {
+        name: "lan.ticket",
+        wire_variant: "GetLanTicket",
+        available: cfg!(feature = "lan"),
+        mutation: false,
+        local_only: true,
+    },
+    CommandDescriptor {
+        name: "lan.prepare_join",
+        wire_variant: "PrepareJoin",
+        available: cfg!(feature = "lan"),
+        mutation: true,
+        local_only: true,
+    },
+    CommandDescriptor {
+        name: "lan.cancel_join",
+        wire_variant: "CancelJoin",
+        available: cfg!(feature = "lan"),
+        mutation: true,
+        local_only: true,
+    },
+    CommandDescriptor {
+        name: "lan.confirm",
+        wire_variant: "ConfirmPeer",
+        available: cfg!(feature = "lan"),
+        mutation: true,
+        local_only: true,
+    },
+    CommandDescriptor {
+        name: "lan.unpair",
+        wire_variant: "UnpairPeer",
+        available: cfg!(feature = "lan"),
+        mutation: true,
+        local_only: true,
+    },
+    CommandDescriptor {
+        name: "lan.connect",
+        wire_variant: "ConnectPeer",
+        available: cfg!(feature = "lan"),
+        mutation: true,
+        local_only: true,
+    },
+    CommandDescriptor {
+        name: "lan.status",
+        wire_variant: "GetLanStatus",
+        available: cfg!(feature = "lan"),
+        mutation: false,
+        local_only: true,
+    },
+    CommandDescriptor {
+        name: "lan.pause",
+        wire_variant: "PauseLan",
+        available: cfg!(feature = "lan"),
+        mutation: true,
+        local_only: true,
+    },
+    CommandDescriptor {
+        name: "lan.resume",
+        wire_variant: "ResumeLan",
+        available: cfg!(feature = "lan"),
+        mutation: true,
+        local_only: true,
+    },
     CommandDescriptor {
         name: "sync.enable",
         wire_variant: "EnableSync",
@@ -165,18 +277,29 @@ impl CommandDescriptor {
 impl Command {
     pub fn descriptor(&self) -> CommandDescriptor {
         let index = match self {
-            Self::EnableSync => 0,
-            Self::CreateNote { .. } => 1,
-            Self::ReadNote { .. } => 2,
-            Self::EditNote { .. } => 3,
-            Self::RenameNote { .. } => 4,
-            Self::TrashNote { .. } => 5,
-            Self::RestoreNote { .. } => 6,
-            Self::SearchNotes { .. } => 7,
-            Self::SetMirrorEnabled { .. } => 8,
-            Self::ImportMarkdown { .. } => 9,
-            Self::ExportMarkdown { .. } => 10,
-            Self::RescanMirror => 11,
+            Self::ListenLan { .. } => 0,
+            Self::GetLanTicket => 1,
+            Self::PrepareJoin { .. } => 2,
+            Self::CancelJoin => 3,
+            Self::ConfirmPeer { .. } => 4,
+            Self::UnpairPeer { .. } => 5,
+            Self::ConnectPeer { .. } => 6,
+            Self::GetLanStatus => 7,
+            Self::PauseLan => 8,
+            Self::ResumeLan => 9,
+
+            Self::EnableSync => 10,
+            Self::CreateNote { .. } => 11,
+            Self::ReadNote { .. } => 12,
+            Self::EditNote { .. } => 13,
+            Self::RenameNote { .. } => 14,
+            Self::TrashNote { .. } => 15,
+            Self::RestoreNote { .. } => 16,
+            Self::SearchNotes { .. } => 17,
+            Self::SetMirrorEnabled { .. } => 18,
+            Self::ImportMarkdown { .. } => 19,
+            Self::ExportMarkdown { .. } => 20,
+            Self::RescanMirror => 21,
         };
         COMMANDS[index]
     }
@@ -193,6 +316,8 @@ impl Command {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum CommandResult {
+    LanTicket { ticket: String },
+    LanStatus(LanStatus),
     Accepted { request_id: uuid::Uuid },
     Note(NoteView),
     Notes(Vec<NoteView>),

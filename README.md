@@ -47,8 +47,9 @@ see [mirror protocol and recovery](docs/mirror-protocol.md).
 Linux build prerequisites include a C compiler for bundled SQLite, a linker,
 and X11/Wayland/OpenGL runtime support. An isolated X11 window workflow passed;
 see [Linux evidence](docs/linux-smoke.md). Android launch remains unverified.
-See [Android feasibility](docs/android-feasibility.md) for actual prerequisites,
-planned device checks, and the distinction between build and input/lifecycle evidence.
+Use the Java-capable [Android build instructions](docs/android-build.md) for the
+SAF picker and foreground LAN; [Android feasibility](docs/android-feasibility.md)
+records the unverified input/lifecycle/device gates.
 
 Optional D-Bus and external filter execution are deferred. Canonical Markdown,
 single-writer command routing, persistence acknowledgement, and recoverable conflicts
@@ -70,5 +71,8 @@ cargo run --locked --features sync -- --headless --vault /path/to/vault --enable
 
 Migration first makes a recoverable SQLite backup and preserves note IDs.
 Afterward use a binary with `sync` support; an unsupported binary refuses the
-vault rather than editing projections. Authenticated QUIC transport is prepared
-behind `lan`, but App joining/synchronization is still being integrated.
+vault rather than editing projections. The `lan` feature includes authenticated
+QUIC pairing, empty-vault join and durable Automerge synchronization, with manual
+GUI controls and a CLI workflow. See [LAN setup and evidence](docs/lan-sync.md).
+Two-App and actual CLI UDP loopback checks passed; hardware LAN and Android
+networking remain unverified.
