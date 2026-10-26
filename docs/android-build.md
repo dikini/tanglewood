@@ -1,10 +1,11 @@
 # Android build and launch
 
-The NativeActivity, app-private vault, Storage Access Framework picker, mobile
-editor layout and foreground LAN controls are integrated in source. **An Android
-cross-build, APK installation and device workflow have not passed here.** The user has authorized SDK provisioning and selected a local KVM emulator;
-installation is underway.
-See [platform inventory](android-feasibility.md) and [picker details](android-picker.md).
+The NativeActivity, app-private vault, SAF picker, mobile editor, native Editable
+IME bridge and foreground LAN controls passed one AOSP API 35 x86_64 emulator
+workflow, including installation, Unicode input/clipboard, SAF round trip,
+restart durability and Android/Linux foreground sync. See
+[emulator evidence](android-emulator-evidence.md) and [picker details](android-picker.md).
+Physical phone/Wi-Fi and other ABI/API/IME combinations remain unverified.
 
 ## Packaging
 
@@ -12,10 +13,10 @@ Use the Java-capable `android/` Gradle project. A pure-native cargo-apk invocati
 does not package `TanglewoodActivity.java` and cannot deliver this picker.
 The project still builds the existing single Rust package's library.
 
-Candidate pins: Rust 1.94.0, eframe 0.33.3, JNI 0.22.4, Gradle 8.11.1,
+Build pins: Rust 1.94.0, eframe 0.33.3, JNI 0.22.4, Gradle 8.11.1,
 Android Gradle Plugin 8.9.2, API/build-tools 35/35.0.0, NDK 29.0.14206865,
-minimum API 23, Java 17 or compatible newer runtime. These Android combinations
-need an actual build; wrapper checks and host compilation do not establish that.
+minimum API 23, Java 17 or compatible newer runtime. This combination passed the x86_64 build and representative emulator workflow;
+other ABI/API/IME runtime combinations remain unverified.
 
 Once the SDK/NDK and one authorized target are available, on Linux:
 
@@ -59,15 +60,30 @@ an Android lifecycle guarantee. Winit/eframe control rendering suspension; no
 background service is supplied. Bounded App ticks submit edits continuously;
 there is no blocking lifecycle flush. Wait for SQLite Saved before termination.
 
-## Evidence still required
+## Build and runtime evidence
 
-Host combined GUI/Codex/LAN compilation passed, and a temporary host JNI API type
-check passed. Neither compiles Android-specific UI/entry code or Java. Wrapper
-hash, shell syntax, XML and missing-tools preflight checks passed; no Gradle/APK
-result is claimed.
+On 2026-10-26, the initial authorized temporary SDK build passed with no source fixes:
 
-Run the representative device workflow in the inventory: Unicode/composed IME
+```sh
+cd android
+env RUSTC_WRAPPER= ANDROID_HOME=/tmp/tanglewood-android-sdk ANDROID_NDK_ROOT=/tmp/tanglewood-android-sdk/ndk/29.0.14206865 GRADLE_USER_HOME=/tmp/tanglewood-android-gradle ./gradlew :app:assembleDebug -PandroidAbi=x86_64 --no-daemon
+```
+
+The initial cross-build reported BUILD SUCCESSFUL in 1m 26s; the final input-adapter
+build reported BUILD SUCCESSFUL in 22s. This compiled the Android Rust
+`gui,lan` library, Java Activity, DEX and debug APK. The APK contains
+`lib/x86_64/libtanglewood.so` and the Activity DEX. Output:
+`android/app/build/outputs/apk/debug/app-debug.apk`, SHA-256
+`7b2897d9fbbf46e7267164f573432e3c3b20bf8ba9f219f146210be53fdf0ddb`.
+Warnings were an SDK XML parser-version mismatch and unused `durable_history`;
+neither blocked the build. Installation and the representative emulator workflow subsequently passed;
+see the linked emulator evidence for exact operations and final source hashes. Earlier host JNI/wrapper checks remain
+useful preparation evidence, separate from this actual target build.
+
+The representative emulator workflow exercised: Unicode/composed IME
 input, selection/clipboard, keyboard layout, drawer composition recovery,
-background/resume/rotation, acknowledged SQLite restart, SAF import/cancel/stale
-replacement/export/provider failures, and paired foreground LAN reconnect.
-Record device/API/ABI/IME/provider and actual results before closing those gates.
+background/resume/rotation, acknowledged SQLite restart, SAF import/cancel/export,
+and paired foreground LAN reconnect. Concurrent stale-picker manipulation and
+provider fault injection were not performed; shared revision validation was checked separately.
+The linked evidence records API/ABI/IME/provider and results; no physical-device
+or broad compatibility claim follows from it.

@@ -1,7 +1,7 @@
 # Tanglewood
 
-A Rust notes application being implemented against [the MVP plan](docs/plan/tanglewood-mvp.md).
-Current progress and unresolved acceptance gates are recorded in [MVP status](docs/mvp-status.md)
+A Rust notes application for Linux and Android, delivered against [the MVP plan](docs/plan/tanglewood-mvp.md).
+Implementation, acceptance evidence and limitations are recorded in [MVP status](docs/mvp-status.md)
 and [capabilities](docs/capabilities.md).
 
 ## Development
@@ -46,10 +46,10 @@ see [mirror protocol and recovery](docs/mirror-protocol.md).
 
 Linux build prerequisites include a C compiler for bundled SQLite, a linker,
 and X11/Wayland/OpenGL runtime support. An isolated X11 window workflow passed;
-see [Linux evidence](docs/linux-smoke.md). Android launch remains unverified.
-Use the Java-capable [Android build instructions](docs/android-build.md) for the
-SAF picker and foreground LAN; [Android feasibility](docs/android-feasibility.md)
-records the unverified input/lifecycle/device gates.
+see [Linux evidence](docs/linux-smoke.md). The Java-capable x86_64 APK runs on
+an API35 Android emulator; Unicode/composed input, selection/system clipboard,
+SAF, lifecycle/restart and Linux synchronization passed. See [Android evidence](docs/android-emulator-evidence.md).
+Use the [Android build instructions](docs/android-build.md) for the picker and foreground LAN.
 
 Optional D-Bus and external filter execution are deferred. Canonical Markdown,
 single-writer command routing, persistence acknowledgement, and recoverable conflicts
@@ -74,5 +74,6 @@ Afterward use a binary with `sync` support; an unsupported binary refuses the
 vault rather than editing projections. The `lan` feature includes authenticated
 QUIC pairing, empty-vault join and durable Automerge synchronization, with manual
 GUI controls and a CLI workflow. See [LAN setup and evidence](docs/lan-sync.md).
-Two-App and actual CLI UDP loopback checks passed; hardware LAN and Android
-networking remain unverified.
+Two-App and actual Android emulator/Linux pairing, offline edits, reconnect and
+both-owner restart passed; see [cross-platform evidence](docs/android-linux-sync-evidence.md).
+Physical wireless LAN remains untested.

@@ -34,3 +34,6 @@ mod lan_owner;
 
 #[cfg(all(target_os = "android", feature = "gui"))]
 pub mod android_picker;
+
+#[cfg(all(feature = "gui", any(target_os = "android", test)))]
+pub mod android_input;

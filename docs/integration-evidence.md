@@ -77,3 +77,65 @@ KVM exists and is readable/writable outside the sandbox; earlier absence was
 sandbox visibility. Official command-line tools15859902 SHA-256 was verified;
 SDK/NDK installation is underway in `/tmp/tanglewood-android-sdk`. Android Rust
 targets are being installed. No APK/emulator behavior result is claimed yet.
+
+
+## Actual Android emulator and Linux acceptance
+
+Official SDK/NDK provisioning completed with the user's SDK-license acceptance.
+The Java-capable Gradle x86_64 debug APK built and ran on API35 AOSP/KVM,
+`emulator-5580`. SAF import/export preserved all 105 UTF-8 fixture bytes; actual
+picker cancellation, Saved/kill/restart, rotation and background/resume passed.
+Android15 system-bar/IME geometry required a coherent Java WindowInsets bridge;
+its source delta passed independent review and actual screenshots.
+
+Actual Android-source → empty Linux destination pairing/original-history join,
+distinct actors, bidirectional offline edits, Unicode transport, rename, explicit
+reconnect and both-owner durable restart passed. See
+`android-linux-sync-evidence.md` for exact IDs, hashes, commands and limitations.
+These results supersede the earlier pending APK/network statements above.
+
+Actual onscreen accented/emoji input exposed NativeActivity's incomplete IME
+support; a native framework Editable/InputConnection bridge is being implemented.
+Android input/selection/system clipboard remain open until its review and real
+emulator workflow pass. This does not invalidate the recorded SAF or sync results.
+
+
+### Android input adapter integration, pending final acceptance
+
+The complete-state Editable mirror compiled in the real x86_64 Java-capable APK.
+The focused host UTF-16/session regression passed (1 test, 17 filtered), including
+surrogate boundaries, coalescing, owner-epoch exhaustion and old-field composition
+recovery. Actual AOSP onscreen preedit stayed unaccepted until commit; accent,
+emoji and whole-emoji backspace then passed. System clipboard/final restart are
+still in progress.
+
+On the frozen three-fix delta, `cargo fmt --check` passed and
+`RUSTC_WRAPPER= cargo clippy --locked --all-targets --features gui,codex,lan --offline`
+finished successfully in 5.53s. Existing and input-module style/dead-code warnings
+remain. Review approved monotonic owner epochs and old-field recovery; one
+Edit-menu action-closing-frame predicate correction remains. No unchanged domain,
+LAN, SAF or paid Codex workflow was repeated for these input-only changes.
+
+
+### Final Android delivery result
+
+All bounded input findings passed delta review: old-field composition recovery,
+monotonic owner epochs, designated Edit-menu closing-frame protection, and a
+bounded Java main-thread publication drain with ordered controls/lifecycle
+barriers. No findings remain. The final Java/Rust callback delta passed the same
+focused UTF-16/session fixture (1 passed, 17 filtered), the actual x86_64 Gradle
+APK build (22s), and final `cargo fmt --check`. The prior combined host Clippy
+result covers unchanged host code; Android target compilation covers the final
+Java/JNI delta. No unrelated full suite was repeated.
+
+Final APK SHA-256:
+`7b2897d9fbbf46e7267164f573432e3c3b20bf8ba9f219f146210be53fdf0ddb`.
+Real AOSP keyboard accent/emoji/multiline, selection/system Cut/Paste,
+composition cancel and field-handoff recovery passed. On the final APK, queued
+Edit Select-all/Paste and another real commit passed; Saved → force-stop →
+stopped SQLite/WAL read → relaunch → consistent SQLite/WAL read matched the
+original note UUID and all 35 UTF-8 bytes `caf\nAndroid offline\ncafé 😀\nOK \n`,
+SHA-256 `f2efe33381886d4578cc977b363a5f65da5d08b17540c1cfa24a2e600f6fecbb`.
+Cancelled/interrupted test preedit was absent, and the other synced 148-byte note
+was unchanged. This closes the earlier pending Android input/clipboard/restart
+statements. See `android-emulator-evidence.md` for operations and limitations.

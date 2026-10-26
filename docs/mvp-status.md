@@ -1,26 +1,26 @@
 # MVP execution status
 
-Active goal from 2026-10-26. Authority: `plan/tanglewood-mvp.md`; scope: `mvp-goal.md`. Latest committed checkpoint: **499c870**, unsigned (`%G? = N`): authoritative CRDT migration, Codex integration, authenticated LAN transport preparation. Prior checkpoints: **2dcef01**, **5a40e2c**.
+Required MVP increments 0–4 are delivered and independently reviewed, with actual Linux, Android emulator, LAN and live Codex evidence. Goal authority: `plan/tanglewood-mvp.md` and `mvp-goal.md`. Implementation checkpoints before the final Android integration: **ddc8fb3**, **499c870**, **2dcef01**, **5a40e2c**, all unsigned. The final delivery commit is the Git commit containing this record.
 
-## Scope and evidence
-
-Required increments 0–4 remain intact. Optional D-Bus and external filter process runner are deferred to prioritize required delivery. Block editing/general plugin management remain deferred.
-
-| Task | State | Evidence / remaining dependency |
+| Scope | State | Acceptance evidence |
 | --- | --- | --- |
-| Shared core, SQLite, Linux editor | Integrated, reviewed | Stable IDs/revisions, single ECS owner, restart/lock/batch durability; actual Linux edit/save/restart |
-| Markdown/extensions | Integrated, reviewed | Derived views/source origins/fence attributes/callout/fallback and Pandoc example |
-| Mirror/import/export | Integrated, reviewed | Durable outbox/baselines/recoverable conflicts; actual CLI import/rescan/export/restart |
-| MCP | Integrated, reviewed | Single-writer Unix bridge, shared schema/policy, exact persisted replies; actual stdio create/restart |
-| Authoritative CRDT migration | Integrated, reviewed | Backup, schema-3 histories/projections/outbox, generation acknowledgement; CLI migration/restart preserves IDs/revisions/identity |
-| Codex | Integrated, reviewed | Streamed live note read/edit/read with explicit scoped approvals; cancel/disconnect/restart; actual panel responsiveness |
-| LAN | Owner integration implemented; reviewed | 15 combined scenarios passed incl two-App join/offline/reconnect/restart/init pause. Actual CLI tickets/confirmation/join/Unicode/identity/restart passed on loopback; Android emulator/two-device gates open |
-| Android | Picker/packaging, mobile editor and foreground LAN integrated in source; reviewed | NativeActivity/app-private storage prepared. SDK/NDK provisioning active; Android Rust targets installed. APK, input/clipboard/lifecycle/restart/network acceptance open |
+| Shared core / SQLite / Linux editor | done | Stable IDs/revisions, single ECS owner, exact durable acknowledgement, restart/lock/batch recovery; actual Linux window edit/save/restart |
+| Markdown / extensions | done | Derived reader/filter/render/source-origin/fence contracts, callout and Pandoc-compatible example, canonical fallback |
+| Import/export / Linux mirror | done | Durable outbox/baselines/recoverable conflicts, actual CLI import/rescan/export/restart |
+| MCP / Codex | done | Private single-writer socket, shared validation, persisted replies; live scoped read/edit/read, stream/cancel/disconnect/restart and panel responsiveness |
+| CRDT / authenticated LAN | done | Backup/migration, authoritative histories, generation barriers, pinned TLS, empty join, offline merge/conflicts; actual Android/Linux pairing/reconnect/both-owner restart |
+| Android packaging / SAF / lifecycle | done | Java-capable API35 x86_64 APK, exact-byte SAF round trip/cancel, system/keyboard insets, rotation/background/restart |
+| Android text input | done | Framework Editable/InputConnection mirror; real AOSP preedit/commit/accent/emoji, selection, system cut/paste, cancel/handoff and exact Saved/kill/restart |
+| Delivery / review | done | Reproducible build/launch/configuration docs and capability table; scoped independent reviews and relevant integration checks |
 
-Exact checks and boundaries: `integration-evidence.md`, `linux-smoke.md`, `codex-live-evidence.md`, `crdt-migration.md`, `lan-sync.md`. Combined 15 library scenarios passed; combined build and Clippy exit 0; actual LAN CLI workflow passed. No host check proves Android or hardware LAN.
+## Final integration evidence
 
-## Ownership and resume point
+`integration-evidence.md` records commands/results. Combined 15 domain/adapter scenarios passed before final LAN corrections; focused post-correction scenarios, final host build and real CLI smoke passed. The Android input fixture passed UTF-16/surrogate/session/coalescing/epoch/handoff/menu regressions. Combined host all-target Clippy (`gui,codex,lan`) and final formatting passed. Actual final x86_64 Rust+Java APK build passed; SHA-256 `7b2897d9fbbf46e7267164f573432e3c3b20bf8ba9f219f146210be53fdf0ddb`.
 
-PM owns manifest/lock/main/status/index and checkpoint integration. Core owns App/store/commands/sync/lan/lib for the approved `lan-owner-integration.md` implementation. PM wires CLI after public contracts stabilize. Platform owns UI/android entry and Android packaging/docs, now adding explicit LAN controls and a retained foreground runtime. Picker JNI host type-check passed. Platform review is ready after callback spool ownership, IME drawer transition, bounded Sync scrolling and nonblocking runtime teardown fixes. Core must guarantee immediate Pause cancellation including pending listener initialization. New source remains uncommitted pending coherent host integration checks and core review. LAN review is ready after receive-generation barriers, ordered/session-correlated retry, cancelled control outcomes, serialized pin persistence and owner revocation fixes. Final focused checks, host binary build and actual CLI workflow passed. Cargo is free for the selected Android emulator cross-build. Platform source review is ready; host UI/CLI compilation passed. PM retains main/docs/status/index. Only PM stages/commits; no publication authorized.
+Final Android input changes were independently reviewed after composition recovery, monotonic owner epochs, designated Edit-menu closing-frame protection and bounded Java publication ordering fixes. No findings remain. Exact final committed text `caf\nAndroid offline\ncafé 😀\nOK \n` (35 UTF-8 bytes) survived force-stop/relaunch, SHA-256 `f2efe33381886d4578cc977b363a5f65da5d08b17540c1cfa24a2e600f6fecbb`. See `android-emulator-evidence.md`; cross-platform IDs/actors/history/restart evidence is in `android-linux-sync-evidence.md`.
 
-Next: checkpoint the reviewed LAN/Android source increment, finish temporary SDK/NDK provisioning, build the x86_64 APK and run emulator acceptance. The user accepted the SDK license and chose a local emulator. KVM is readable/writable outside the sandbox. A representative Android emulator plus Linux app can satisfy the plan’s platform/two-device workflow; physical wireless testing is additional evidence, not a new release gate. Goal remains active and incomplete.
+## Scope and limitations
+
+Optional D-Bus and the external filter process runner were explicitly deferred; native contracts/example are delivered. Block editing/general plugin management and other plan-deferred features remain outside this MVP. Physical wireless LAN, ARM64 runtime and other Android devices/keyboards were not tested. A representative API35 emulator plus Linux owner satisfies the planned platform/two-device gate; it does not prove a broad hardware matrix. Android sync remains explicit and foreground-only. Wait for SQLite Saved before terminating; unsaved drafts/preedit are not durable acknowledgements.
+
+The user accepted the SDK license and chose the emulator. Temporary SDK/NDK: `/tmp/tanglewood-android-sdk`; AVD `Tanglewood_API35`, serial `emulator-5580`. No external publication is authorized or performed. Only PM stages/commits, unsigned. No required implementation or acceptance task remains.

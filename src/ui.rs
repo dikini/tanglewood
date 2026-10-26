@@ -10,6 +10,46 @@ use crate::{
     notes::{NoteId, NoteView, Revision, TextEdit},
 };
 
+fn field_single(ui: &mut egui::Ui, text: &mut String, name: &str) -> egui::Response {
+    #[cfg(target_os = "android")]
+    {
+        let id = egui::Id::new(("android-field", name));
+        let change = crate::android_input::before(ui.ctx(), id, text);
+        let output = egui::TextEdit::singleline(text).id(id).show(ui);
+        crate::android_input::after(ui.ctx(), &output, text);
+        let mut response = output.response;
+        if change.changed {
+            response.mark_changed();
+        }
+        response
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = name;
+        ui.text_edit_singleline(text)
+    }
+}
+#[cfg(feature = "lan")]
+fn field_multi(ui: &mut egui::Ui, text: &mut String, name: &str) -> egui::Response {
+    #[cfg(target_os = "android")]
+    {
+        let id = egui::Id::new(("android-field", name));
+        let change = crate::android_input::before(ui.ctx(), id, text);
+        let output = egui::TextEdit::multiline(text).id(id).show(ui);
+        crate::android_input::after(ui.ctx(), &output, text);
+        let mut response = output.response;
+        if change.changed {
+            response.mark_changed();
+        }
+        response
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = name;
+        ui.text_edit_multiline(text)
+    }
+}
+
 struct Draft {
     text: String,
     base_text: String,
@@ -147,7 +187,7 @@ impl TanglewoodUi {
         let mut result = None;
         ui.horizontal_wrapped(|ui| {
             ui.label("Import into new vault path:");
-            ui.text_edit_singleline(&mut self.new_path);
+            field_single(ui, &mut self.new_path, "document-import-path");
             if ui
                 .add_enabled(!pending, egui::Button::new("Choose document to import"))
                 .clicked()
@@ -392,9 +432,9 @@ impl LanPanel {
                 }
             });
             ui.label("Listen bind address (IP:port)");
-            ui.text_edit_singleline(&mut self.bind);
+            field_single(ui, &mut self.bind, "lan-bind");
             ui.label("Advertised IP (required for wildcard bind)");
-            ui.text_edit_singleline(&mut self.advertised);
+            field_single(ui, &mut self.advertised, "lan-advertised");
             if ui.button("Listen on this address").clicked() {
                 command = Some(Command::ListenLan {
                     bind: self.bind.clone(),
@@ -414,10 +454,12 @@ impl LanPanel {
                 Self::ticket_identity(ui, &self.ticket);
                 if ui.button("Copy local ticket").clicked() {
                     ctx.copy_text(self.ticket.clone());
+                    #[cfg(target_os="android")]
+                    crate::android_input::copy_text(&self.ticket);
                 }
             }
             ui.label("Source ticket for an empty joining vault");
-            ui.text_edit_multiline(&mut self.source_ticket);
+            field_multi(ui, &mut self.source_ticket, "lan-source_ticket");
             Self::ticket_identity(ui, &self.source_ticket);
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Prepare empty join").clicked() {
@@ -430,7 +472,7 @@ impl LanPanel {
                 }
             });
             ui.label("Peer ticket: compare fingerprint out of band before confirming trust");
-            ui.text_edit_multiline(&mut self.peer_ticket);
+            field_multi(ui, &mut self.peer_ticket, "lan-peer_ticket");
             Self::ticket_identity(ui, &self.peer_ticket);
             if ui.button("Confirm this peer ticket").clicked() {
                 command = Some(Command::ConfirmPeer {
@@ -438,7 +480,7 @@ impl LanPanel {
                 });
             }
             ui.label("Peer fingerprint");
-            ui.text_edit_singleline(&mut self.fingerprint);
+            field_single(ui, &mut self.fingerprint, "lan-fingerprint");
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Connect fingerprint").clicked() {
                     command = Some(Command::ConnectPeer {
@@ -534,6 +576,8 @@ impl eframe::App for TanglewoodUi {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.heading("Tanglewood");
+                #[cfg(target_os = "android")]
+                crate::android_input::menu(ui);
                 let opened_notes =
                     ui.toggle_value(&mut self.show_notes, "Notes").changed() && self.show_notes;
                 #[cfg(target_os = "android")]
@@ -559,6 +603,8 @@ impl eframe::App for TanglewoodUi {
                     retry = true;
                 }
             });
+            #[cfg(target_os = "android")]
+            crate::android_input::notice(ui);
             #[cfg(feature = "lan")]
             self.lan_panel.show(ui, ctx, &mut self.app);
             #[cfg(target_os = "android")]
@@ -585,6 +631,9 @@ impl eframe::App for TanglewoodUi {
                     230.0
                 })
                 .show(ctx, |ui| {
+                    #[cfg(target_os = "android")]
+                    field_single(ui, &mut self.query, "quick-switch");
+                    #[cfg(not(target_os = "android"))]
                     ui.add(
                         egui::TextEdit::singleline(&mut self.query)
                             .id(egui::Id::new("quick-switch"))
@@ -616,7 +665,7 @@ impl eframe::App for TanglewoodUi {
                             }
                         });
                     ui.separator();
-                    ui.text_edit_singleline(&mut self.new_path);
+                    field_single(ui, &mut self.new_path, "new-path");
                     if ui.button("Create note").clicked() {
                         command = Some(Command::CreateNote {
                             path: self.new_path.clone(),
@@ -632,7 +681,7 @@ impl eframe::App for TanglewoodUi {
                 ui.label("Create or select a Markdown note."); return;
             };
             ui.horizontal_wrapped(|ui| {
-                ui.text_edit_singleline(&mut self.rename_path);
+                field_single(ui, &mut self.rename_path, "rename-path");
                 if ui.button("Rename").clicked() {
                     command = Some(Command::RenameNote { id: view.note.id, expected: view.note.revision, path: self.rename_path.clone() });
                 }
@@ -662,10 +711,18 @@ impl eframe::App for TanglewoodUi {
                 if ui.button("Discard local draft and adopt current note").clicked() { adopt = Some(view.clone()); }
             }
             if draft.text != draft.base_text { ui.label("Local draft has changes not accepted by the application."); }
-            let response = ui.add_enabled(!view.note.trashed,
-                egui::TextEdit::multiline(&mut draft.text)
-                    .id(egui::Id::new(("source", view.note.id.0, draft.widget_generation)))
-                    .desired_width(f32::INFINITY).desired_rows(16));
+            let source_id=egui::Id::new(("source",view.note.id.0,draft.widget_generation));
+            #[cfg(target_os="android")]
+            let native_change=crate::android_input::before(ctx,source_id,&mut draft.text);
+            #[cfg(target_os="android")]
+            { if native_change.active { draft.composing=native_change.composing; } draft.conflict |= native_change.conflict; }
+            let output=ui.add_enabled_ui(!view.note.trashed, |ui| egui::TextEdit::multiline(&mut draft.text)
+                .id(source_id).desired_width(f32::INFINITY).desired_rows(16).show(ui)).inner;
+            #[cfg(target_os="android")]
+            crate::android_input::after(ctx,&output,&draft.text);
+            let response=output.response;
+            #[cfg(target_os="android")]
+            let response = { let mut response=response; if native_change.changed || native_change.finished { response.mark_changed(); } response };
             // Composition stays in the widget draft until the IME commits.
             let mut ime_finished = false;
             ctx.input(|input| {
