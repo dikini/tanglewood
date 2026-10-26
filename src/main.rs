@@ -11,6 +11,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let mut vault = None;
     let mut headless = false;
+    let mut startup = Vec::new();
+    let mut mcp_path = None;
+    let mut mcp_write = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--vault" => {
@@ -19,9 +22,41 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 ))
             }
             "--headless" => headless = true,
+            "--mcp-socket" => {
+                mcp_path = Some(PathBuf::from(
+                    args.next().ok_or("--mcp-socket needs a path")?,
+                ))
+            }
+            "--mcp-write" => mcp_write = true,
+            "--mirror" => {
+                startup.push(tanglewood::commands::Command::SetMirrorEnabled { enabled: true })
+            }
+            "--no-mirror" => {
+                startup.push(tanglewood::commands::Command::SetMirrorEnabled { enabled: false })
+            }
+            "--rescan" => startup.push(tanglewood::commands::Command::RescanMirror),
+            "--import" => {
+                let source_path = args.next().ok_or("--import needs SOURCE and NOTE_PATH")?;
+                let path = args.next().ok_or("--import needs SOURCE and NOTE_PATH")?;
+                startup.push(tanglewood::commands::Command::ImportMarkdown {
+                    source_path,
+                    destination: tanglewood::commands::ImportDestination::Create { path },
+                });
+            }
+            "--export" => {
+                let id = tanglewood::notes::NoteId(uuid::Uuid::parse_str(
+                    &args
+                        .next()
+                        .ok_or("--export needs NOTE_UUID and DESTINATION")?,
+                )?);
+                let path = args
+                    .next()
+                    .ok_or("--export needs NOTE_UUID and DESTINATION")?;
+                startup.push(tanglewood::commands::Command::ExportMarkdown { id, path });
+            }
             "--help" | "-h" => {
                 println!(
-                    "tanglewood [--vault DIRECTORY] [--headless]\nHeadless mode opens the vault and lists note paths. Build with --features gui for the editor."
+                    "tanglewood [--vault DIRECTORY] [--headless] [--mirror|--no-mirror] [--rescan] [--import SOURCE NOTE_PATH] [--export NOTE_UUID DESTINATION] [--mcp-socket SOCKET] [--mcp-write]\nHeadless mode opens the vault and lists note paths. Build with --features gui for the editor."
                 );
                 return Ok(());
             }
@@ -37,8 +72,60 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|| PathBuf::from("."))
             .join("tanglewood/vault")
     });
+    if (mcp_path.is_some() || mcp_write) && !cfg!(all(target_os = "linux", feature = "mcp")) {
+        return Err("MCP requires Linux and --features mcp".into());
+    }
+    if mcp_write && mcp_path.is_none() {
+        return Err("--mcp-write requires --mcp-socket".into());
+    }
     let mut app = tanglewood::App::open(&vault)?;
+    for command in startup {
+        if let tanglewood::commands::CommandResult::Accepted { request_id } =
+            app.execute(command, tanglewood::commands::Caller::Local)?
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                app.tick();
+                match app.io_status(request_id) {
+                    Some(tanglewood::app::IoStatus::Completed) => break,
+                    Some(tanglewood::app::IoStatus::Failed(error)) => {
+                        return Err(error.clone().into());
+                    }
+                    Some(tanglewood::app::IoStatus::Conflict(id)) => {
+                        return Err(format!("recoverable file conflict {id}").into());
+                    }
+                    _ if std::time::Instant::now() >= deadline => {
+                        return Err(
+                            "I/O request timed out; its outcome may still be pending".into()
+                        );
+                    }
+                    _ => std::thread::sleep(std::time::Duration::from_millis(2)),
+                }
+            }
+            app.flush()?;
+        }
+    }
+    #[cfg(all(target_os = "linux", feature = "mcp"))]
+    let mut owner = mcp_path
+        .map(|path| {
+            tanglewood::mcp::OwnerSocket::bind(
+                &path,
+                if mcp_write {
+                    tanglewood::mcp::AccessPolicy::ReadWrite
+                } else {
+                    tanglewood::mcp::AccessPolicy::ReadOnly
+                },
+            )
+        })
+        .transpose()?;
     if headless || !cfg!(feature = "gui") {
+        #[cfg(all(target_os = "linux", feature = "mcp"))]
+        if let Some(socket) = &mut owner {
+            loop {
+                socket.poll(&mut app);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
         for view in app.notes() {
             println!(
                 "{}\t{}{}",
@@ -47,6 +134,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if view.note.trashed { " [trash]" } else { "" }
             );
         }
+        app.flush_files()?;
         app.shutdown()?;
         return Ok(());
     }
@@ -59,7 +147,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         eframe::run_native(
             "Tanglewood",
             options,
-            Box::new(move |_| Ok(Box::new(tanglewood::ui::TanglewoodUi::new(app)))),
+            Box::new(move |_| {
+                let editor = tanglewood::ui::TanglewoodUi::new(app);
+                #[cfg(all(target_os = "linux", feature = "mcp"))]
+                let editor = match owner {
+                    Some(socket) => editor.with_mcp(socket),
+                    None => editor,
+                };
+                Ok(Box::new(editor))
+            }),
         )?;
     }
     Ok(())

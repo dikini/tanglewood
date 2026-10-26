@@ -32,6 +32,8 @@ pub struct TanglewoodUi {
     error: Option<String>,
     show_notes: bool,
     closing: bool,
+    #[cfg(all(target_os = "linux", feature = "mcp"))]
+    mcp: Option<crate::mcp::OwnerSocket>,
 }
 
 impl TanglewoodUi {
@@ -49,7 +51,15 @@ impl TanglewoodUi {
             error: None,
             show_notes: true,
             closing: false,
+            #[cfg(all(target_os = "linux", feature = "mcp"))]
+            mcp: None,
         }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "mcp"))]
+    pub fn with_mcp(mut self, socket: crate::mcp::OwnerSocket) -> Self {
+        self.mcp = Some(socket);
+        self
     }
 
     fn select(&mut self, id: NoteId) {
@@ -101,6 +111,9 @@ impl TanglewoodUi {
                 self.select(view.note.id);
             }
             Ok(CommandResult::Notes(_)) => {}
+            Ok(CommandResult::Accepted { .. }) => {
+                self.error = Some("Operation queued; waiting for completion.".into());
+            }
             Err(error) => self.error = Some(error.to_string()),
         }
     }
@@ -138,6 +151,15 @@ impl TanglewoodUi {
 impl eframe::App for TanglewoodUi {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.app.tick();
+        #[cfg(all(target_os = "linux", feature = "mcp"))]
+        if let Some(socket) = &mut self.mcp {
+            let context = ctx.clone();
+            socket.set_waker(move || context.request_repaint());
+            socket.poll(&mut self.app);
+            if socket.has_pending() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(20));
+            }
+        }
         let notes = self.app.notes();
         self.refresh(&notes);
         if self.selected.is_none() {
@@ -236,6 +258,15 @@ impl eframe::App for TanglewoodUi {
             if let Some(error) = &view.save.error { ui.colored_label(egui::Color32::LIGHT_RED, format!("Save failed: {error}")); }
             else if view.save.persisted == Some(view.save.accepted) { ui.label("Saved"); }
             else { ui.label("Unsaved — waiting for storage"); }
+            if self.app.mirror_enabled() {
+                let export = self.app.export_status(view.note.id);
+                if let Some(error) = export.error { ui.colored_label(egui::Color32::LIGHT_RED, format!("Markdown export failed: {error}")); }
+                else if export.pending { ui.label("Markdown export pending"); }
+                else { ui.label("Markdown mirror up to date"); }
+            }
+            for conflict in self.app.mirror_conflicts().iter().filter(|conflict| conflict.note.id == view.note.id) {
+                ui.colored_label(egui::Color32::YELLOW, format!("Retained mirror conflict: {} ({})", conflict.path, conflict.kind));
+            }
             let draft = self.drafts.get_mut(&view.note.id).expect("refresh creates draft");
             if draft.conflict {
                 ui.colored_label(egui::Color32::YELLOW, "Note changed elsewhere. Your draft is retained; copy it before adopting the stored version.");
@@ -345,7 +376,11 @@ impl eframe::App for TanglewoodUi {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
-        if pending {
+        if pending
+            || current
+                .iter()
+                .any(|view| self.app.export_status(view.note.id).pending)
+        {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }

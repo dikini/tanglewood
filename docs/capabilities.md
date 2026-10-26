@@ -8,10 +8,10 @@ This table describes implemented behavior separately from GUI exposure and runti
 | Search/list | Linear path/body search; optional trash inclusion | Search/quick switch | Host core; read-only allowed | Included C0 scenario |
 | Durable save/restart | SQLite bounded worker; explicit flush/shutdown; batch-safe renames | Autosave/error/retry/close guard | Host Linux; Android build open | Restart/lock/stale ack/40-note cycle scenarios passed; Linux window restart passed |
 | Markdown reader/filter/render contracts | Implemented derived views, source origins/fence attrs | Preview, internal links/backlinks | Native reader and callout example; external runner deferred | Fixture passed; independent review ready |
-| Markdown import/export/mirror | Pending | Pending | Linux mirror; Android picker required | Not verified |
+| Markdown import/export/mirror | Local-only async commands; durable outbox/baselines/conflicts | Separate export status; CLI actions | Linux; Android picker still required | Recovery scenarios and real CLI import/rescan/export/restart passed; independent review ready |
 | Android input/lifecycle/storage | Pending | Pending | Tooling/device absent here | Gate open; see android-feasibility.md |
-| CRDT/LAN pairing/reconnect | Pending | Pending | Foreground Android and Linux | Not verified |
-| MCP single-writer bridge | Pending | Independent of GUI | Linux optional feature | Not verified |
+| CRDT/LAN pairing/reconnect | Offline Automerge engine prepared; migration/transport pending | Pending | Optional sync engine; foreground Android and Linux transport still required | Replica Unicode/rename/tombstone/history scenario passed; no LAN claim |
+| MCP single-writer bridge | rmcp stdio -> private Unix socket -> App dispatch/durability | Optional owner attachment | Linux mcp; read-only default, explicit write allowlist | Socket policy/revision fixture and live stdio persisted create/restart passed; review ready |
 | Codex conversation/tools | Pending | Pending | Linux optional feature | Not verified |
 | D-Bus / external filter process | Deferred optional tracks | None | Unavailable | No support claimed |
 

@@ -6,7 +6,7 @@ and [capabilities](docs/capabilities.md).
 
 ## Development
 
-Rust 1.94 is available in the current development environment. The lockfile records
+Rust 1.94.0 is pinned for reproducible host builds. The lockfile records
 resolved dependencies. The core is independent of graphics:
 
 ```sh
@@ -20,7 +20,7 @@ Dependency downloads require network access; an offline run needs a populated ca
 Launch the current Linux source editor with a selected vault:
 
 ```sh
-cargo run --locked --features gui -- --vault /path/to/vault
+cargo run --locked --bin tanglewood --features gui -- --vault /path/to/vault
 ```
 
 Without `--vault`, storage defaults to `$XDG_DATA_HOME/tanglewood/vault` or
@@ -29,7 +29,20 @@ without graphics. One process may write a vault at a time. Source edits autosave
 “Saved” means SQLite acknowledged that revision. Save failures retain accepted
 content in memory and show a retry action. Wait for Saved before terminating.
 The editor also provides search, rename/trash/restore, links/backlinks and preview.
-Markdown import/export and directory mirroring are still being integrated.
+Explicit Markdown I/O and Linux directory mirroring are available through the shared
+API and CLI. Imports/exports use local filesystem paths; note paths remain relative
+to the vault. The mirror lives in `<vault>/markdown`:
+
+```sh
+cargo run --locked --bin tanglewood -- --headless --vault /path/to/vault --import /path/to/source.md Notes/source.md --mirror
+cargo run --locked --bin tanglewood -- --headless --vault /path/to/vault --rescan
+cargo run --locked --bin tanglewood -- --headless --vault /path/to/vault --export NOTE_UUID /path/to/export.md
+```
+
+The headless list prints note UUIDs. Mirror enablement persists across launches;
+`--no-mirror` disables new exports and retains pending work. File export failures
+are separate from database Saved status. External conflicts retain both versions;
+see [mirror protocol and recovery](docs/mirror-protocol.md).
 
 Linux build prerequisites include a C compiler for bundled SQLite, a linker,
 and X11/Wayland/OpenGL runtime support. An isolated X11 window workflow passed;
@@ -40,3 +53,10 @@ planned device checks, and the distinction between build and input/lifecycle evi
 Optional D-Bus and external filter execution are deferred. Canonical Markdown,
 single-writer command routing, persistence acknowledgement, and recoverable conflicts
 are required boundaries throughout implementation.
+
+Linux automation uses an optional [MCP stdio bridge](docs/mcp.md) into the running
+app; it never opens a second vault writer. Enable it with `--features gui,mcp`,
+`--mcp-socket /private/directory/owner.sock`, and optionally `--mcp-write`.
+Default MCP policy is read-only. Codex integration remains under implementation.
+The optional `sync` feature currently provides a tested CRDT engine; persistent
+migration and authenticated LAN transport are not yet available.

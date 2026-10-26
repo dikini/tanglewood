@@ -10,7 +10,26 @@ pub enum Caller {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
+pub enum ImportDestination {
+    Create { path: String },
+    Replace { id: NoteId, expected: Revision },
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub enum Command {
+    SetMirrorEnabled {
+        enabled: bool,
+    },
+    ImportMarkdown {
+        source_path: String,
+        destination: ImportDestination,
+    },
+    ExportMarkdown {
+        id: NoteId,
+        path: String,
+    },
+    RescanMirror,
     CreateNote {
         path: String,
         text: String,
@@ -44,30 +63,120 @@ pub enum Command {
 #[derive(Clone, Copy, Debug)]
 pub struct CommandDescriptor {
     pub name: &'static str,
+    pub wire_variant: &'static str,
     pub available: bool,
     pub mutation: bool,
+    pub local_only: bool,
 }
+const COMMANDS: [CommandDescriptor; 11] = [
+    CommandDescriptor {
+        name: "note.create",
+        wire_variant: "CreateNote",
+        available: true,
+        mutation: true,
+        local_only: false,
+    },
+    CommandDescriptor {
+        name: "note.read",
+        wire_variant: "ReadNote",
+        available: true,
+        mutation: false,
+        local_only: false,
+    },
+    CommandDescriptor {
+        name: "note.edit",
+        wire_variant: "EditNote",
+        available: true,
+        mutation: true,
+        local_only: false,
+    },
+    CommandDescriptor {
+        name: "note.rename",
+        wire_variant: "RenameNote",
+        available: true,
+        mutation: true,
+        local_only: false,
+    },
+    CommandDescriptor {
+        name: "note.trash",
+        wire_variant: "TrashNote",
+        available: true,
+        mutation: true,
+        local_only: false,
+    },
+    CommandDescriptor {
+        name: "note.restore",
+        wire_variant: "RestoreNote",
+        available: true,
+        mutation: true,
+        local_only: false,
+    },
+    CommandDescriptor {
+        name: "note.search",
+        wire_variant: "SearchNotes",
+        available: true,
+        mutation: false,
+        local_only: false,
+    },
+    CommandDescriptor {
+        name: "mirror.configure",
+        wire_variant: "SetMirrorEnabled",
+        available: cfg!(target_os = "linux"),
+        mutation: true,
+        local_only: true,
+    },
+    CommandDescriptor {
+        name: "markdown.import",
+        wire_variant: "ImportMarkdown",
+        available: true,
+        mutation: true,
+        local_only: true,
+    },
+    CommandDescriptor {
+        name: "markdown.export",
+        wire_variant: "ExportMarkdown",
+        available: true,
+        mutation: false,
+        local_only: true,
+    },
+    CommandDescriptor {
+        name: "mirror.rescan",
+        wire_variant: "RescanMirror",
+        available: cfg!(target_os = "linux"),
+        mutation: true,
+        local_only: true,
+    },
+];
 impl CommandDescriptor {
     pub fn allowed(self, caller: Caller) -> bool {
-        self.available && !(self.mutation && caller == Caller::AutomationReadOnly)
+        self.available
+            && (!self.local_only || caller == Caller::Local)
+            && !(self.mutation && caller == Caller::AutomationReadOnly)
     }
 }
 impl Command {
     pub fn descriptor(&self) -> CommandDescriptor {
-        let name = match self {
-            Self::CreateNote { .. } => "note.create",
-            Self::ReadNote { .. } => "note.read",
-            Self::EditNote { .. } => "note.edit",
-            Self::RenameNote { .. } => "note.rename",
-            Self::TrashNote { .. } => "note.trash",
-            Self::RestoreNote { .. } => "note.restore",
-            Self::SearchNotes { .. } => "note.search",
+        let index = match self {
+            Self::CreateNote { .. } => 0,
+            Self::ReadNote { .. } => 1,
+            Self::EditNote { .. } => 2,
+            Self::RenameNote { .. } => 3,
+            Self::TrashNote { .. } => 4,
+            Self::RestoreNote { .. } => 5,
+            Self::SearchNotes { .. } => 6,
+            Self::SetMirrorEnabled { .. } => 7,
+            Self::ImportMarkdown { .. } => 8,
+            Self::ExportMarkdown { .. } => 9,
+            Self::RescanMirror => 10,
         };
-        CommandDescriptor {
-            name,
-            available: true,
-            mutation: self.is_mutation(),
-        }
+        COMMANDS[index]
+    }
+    pub fn automation_variants(caller: Caller) -> Vec<(&'static str, &'static str)> {
+        COMMANDS
+            .iter()
+            .filter(|descriptor| descriptor.allowed(caller) && !descriptor.local_only)
+            .map(|descriptor| (descriptor.wire_variant, descriptor.name))
+            .collect()
     }
     pub fn is_mutation(&self) -> bool {
         !matches!(self, Self::ReadNote { .. } | Self::SearchNotes { .. })
@@ -75,6 +184,7 @@ impl Command {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum CommandResult {
+    Accepted { request_id: uuid::Uuid },
     Note(NoteView),
     Notes(Vec<NoteView>),
 }
@@ -83,6 +193,8 @@ pub enum CommandResult {
 pub enum CommandError {
     #[error("caller is not authorized for this command")]
     Unauthorized,
+    #[error("I/O queue is full")]
+    Busy,
     #[error("note does not exist")]
     NotFound,
     #[error("note revision changed")]

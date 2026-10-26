@@ -3,10 +3,12 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct NoteId(pub Uuid);
 
 /// Opaque equality token. Revisions have no ordering semantics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct Revision(pub Uuid);
 impl Revision {
     pub(crate) fn fresh() -> Self {
@@ -39,6 +41,7 @@ pub struct NoteView {
 
 /// Ranges are UTF-8 byte offsets into the original source, before any edit.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct TextEdit {
     pub start: usize,
     pub end: usize,
