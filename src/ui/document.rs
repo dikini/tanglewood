@@ -160,7 +160,7 @@ fn prose_impl(
         Some(1) => 28.0,
         Some(2) => 23.0,
         Some(_) => 19.0,
-        None => 15.5,
+        None => super::theme::READING_FONT_SIZE,
     };
     let mut job = egui::text::LayoutJob::default();
     job.wrap.max_width = ui.available_width().max(1.0);
@@ -209,18 +209,27 @@ fn prose_impl(
             },
             color,
             italics: emphasis,
-            line_height: Some(if heading.is_some() { size * 1.3 } else { 27.0 }),
+            line_height: Some(match heading {
+                Some(1) => 36.0,
+                Some(2) => 30.0,
+                Some(_) => 26.0,
+                None => super::theme::READING_LINE_HEIGHT,
+            }),
             ..Default::default()
         };
         if let Some((target, wiki)) = link {
-            format.underline = egui::Stroke::new(0.6, ui.visuals().weak_text_color());
+            format.color = super::theme::colors(ui.visuals().dark_mode).accent;
+            format.underline = egui::Stroke::new(0.6, format.color);
             links.push((chars..chars + text.chars().count(), target.clone(), wiki));
         }
         if mono {
             // Reserve actual horizontal padding so the background cannot collide
             // with neighbouring prose. These spaces belong only to the view.
+            let padding_font = egui::FontId::proportional(size);
+            let padding_width = ui.fonts_mut(|fonts| fonts.glyph_width(&padding_font, '\u{2009}'));
             let padding = egui::TextFormat {
-                font_id: egui::FontId::proportional(size),
+                font_id: padding_font,
+                extra_letter_spacing: (4.0 - padding_width).max(0.0),
                 ..format.clone()
             };
             let start = chars;
@@ -242,7 +251,7 @@ fn prose_impl(
         egui::Sense::click()
     };
     let (rect, response) = ui.allocate_exact_size(galley.size(), sense);
-    let code_fill = egui::Color32::from_gray(if ui.visuals().dark_mode { 38 } else { 232 });
+    let code_fill = super::theme::colors(ui.visuals().dark_mode).hover;
     for highlight in code_highlights(&galley, &code_spans) {
         ui.painter()
             .rect_filled(highlight.translate(rect.min.to_vec2()), 4.0, code_fill);
@@ -284,7 +293,7 @@ fn prose_impl(
             ui.painter().rect_stroke(
                 rect.expand(3.0),
                 3.0,
-                egui::Stroke::new(0.8, ui.visuals().weak_text_color()),
+                egui::Stroke::new(2.0, super::theme::colors(ui.visuals().dark_mode).accent),
                 egui::StrokeKind::Outside,
             );
         }
@@ -360,12 +369,10 @@ fn prose_impl(
         .response
         .on_hover_text("Links in this paragraph");
     }
-    ui.add_space(if compact {
-        7.0
-    } else if heading.is_some() {
-        17.0
+    ui.add_space(if heading.is_some() {
+        12.0
     } else {
-        18.0
+        super::theme::PARAGRAPH_GAP
     });
 }
 
@@ -392,8 +399,8 @@ fn code_highlights(galley: &egui::Galley, spans: &[Range<usize>]) -> Vec<egui::R
                 .map(|g| g.pos.y - g.font_ascent + g.font_height)
                 .fold(f32::NEG_INFINITY, f32::max);
             highlights.push(egui::Rect::from_min_max(
-                row.pos + egui::vec2(glyphs[0].pos.x, top - 1.0),
-                row.pos + egui::vec2(glyphs.last().unwrap().max_x(), bottom + 1.0),
+                row.pos + egui::vec2(glyphs[0].pos.x, top - 2.0),
+                row.pos + egui::vec2(glyphs.last().unwrap().max_x(), bottom + 2.0),
             ));
         }
         offset = end + usize::from(row.ends_with_newline);

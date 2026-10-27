@@ -29,14 +29,19 @@ fn layout(ui: &egui::Ui, source: &str, language: &str) -> egui::text::LayoutJob 
         .find_syntax_by_token(language)
         .map(|syntax| syntax.name.as_str())
         .unwrap_or(language);
-    egui_extras::syntax_highlighting::highlight_with(
+    let mut job = egui_extras::syntax_highlighting::highlight_with(
         ui.ctx(),
         ui.style(),
         &CodeTheme::from_style(ui.style()),
         source,
         language,
         settings,
-    )
+    );
+    for section in &mut job.sections {
+        section.format.font_id = egui::FontId::monospace(super::theme::CODE_FONT_SIZE);
+        section.format.line_height = Some(super::theme::CODE_LINE_HEIGHT);
+    }
+    job
 }
 
 pub(super) fn show(ui: &mut egui::Ui, source: &str, language: &str) {
@@ -49,13 +54,10 @@ pub(super) fn show_copy(ui: &mut egui::Ui, source: &str, language: &str) {
 }
 
 fn show_inner(ui: &mut egui::Ui, source: &str, language: &str, copy: bool) {
-    let dark = ui.visuals().dark_mode;
+    let colors = super::theme::colors(ui.visuals().dark_mode);
     egui::Frame::new()
-        .fill(egui::Color32::from_gray(if dark { 20 } else { 242 }))
-        .stroke(egui::Stroke::new(
-            1.0,
-            egui::Color32::from_gray(if dark { 46 } else { 220 }),
-        ))
+        .fill(colors.raised)
+        .stroke(egui::Stroke::new(1.0, colors.border))
         .corner_radius(12)
         .inner_margin(egui::Margin::symmetric(16, 12))
         .show(ui, |ui| {
@@ -70,10 +72,13 @@ fn show_inner(ui: &mut egui::Ui, source: &str, language: &str, copy: bool) {
                         "python" | "py" => "Python",
                         _ => language,
                     })
-                    .size(11.0)
+                    .size(12.0)
                     .color(super::theme::muted(ui)),
                 );
-                if copy && ui.small_button("Copy").on_hover_text("Copy code").clicked() {
+                if copy
+                    && super::theme::button(ui, super::theme::Icon::Copy, "Copy code", true)
+                        .clicked()
+                {
                     ui.ctx().copy_text(source.to_owned());
                 }
             });
@@ -90,7 +95,7 @@ fn show_inner(ui: &mut egui::Ui, source: &str, language: &str, copy: bool) {
                 });
             super::navigation::scroll_focus(ui.ctx(), &scroll);
         });
-    ui.add_space(18.0);
+    ui.add_space(super::theme::PARAGRAPH_GAP);
 }
 
 #[cfg(test)]

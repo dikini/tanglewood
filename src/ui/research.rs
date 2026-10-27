@@ -438,15 +438,11 @@ impl ResearchUi {
         }
         let mut navigated = false;
         ui.horizontal(|ui| {
-            let action_width = if cfg!(target_os = "android") {
-                44.0
-            } else {
-                34.0
-            };
+            let action_width = theme::control_size(ui);
             let picker_width =
                 (ui.available_width() - action_width - ui.spacing().item_spacing.x).max(60.0);
             ui.allocate_ui_with_layout(
-                egui::vec2(picker_width, 34.0),
+                egui::vec2(picker_width, action_width),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
                     egui::ComboBox::from_id_salt("research-workspace")
@@ -3140,9 +3136,9 @@ fn reader_layout_with_matches(
     selected: Option<usize>,
 ) -> egui::text::LayoutJob {
     let format = egui::TextFormat {
-        font_id: egui::FontId::proportional(15.5),
+        font_id: egui::FontId::proportional(theme::READING_FONT_SIZE),
         color,
-        line_height: Some(24.0),
+        line_height: Some(theme::READING_LINE_HEIGHT),
         ..Default::default()
     };
     let mut job = egui::text::LayoutJob::default();
@@ -3369,12 +3365,9 @@ mod tests {
         let text = "Exact  spacing\r\n\tUnicode: é → λ\n";
         let job = reader_layout(text, 680.0, egui::Color32::WHITE);
         assert_eq!(job.text.as_bytes(), text.as_bytes());
-        assert!(
-            job.sections
-                .iter()
-                .all(|section| section.format.line_height == Some(24.0)
-                    && section.format.font_id.size == 15.5)
-        );
+        assert!(job.sections.iter().all(|section| section.format.line_height
+            == Some(theme::READING_LINE_HEIGHT)
+            && section.format.font_id.size == theme::READING_FONT_SIZE));
     }
     #[test]
     fn evidence_binding_rejects_workspace_revision_query_and_inclusion_changes() {

@@ -10,6 +10,7 @@ mod codex_context;
 mod codex_markdown;
 mod document;
 mod editor;
+mod layout;
 mod navigation;
 mod processing;
 mod research;
@@ -148,7 +149,10 @@ pub struct TanglewoodUi {
     research: research::ResearchUi,
     research_chats_open: bool,
     research_outcomes_open: bool,
-    research_outcomes_narrow: bool,
+    layout: layout::Responsive,
+    layout_plan: Option<layout::Plan>,
+    touch_input: bool,
+    right_pane: layout::Pane,
     #[cfg(feature = "lan")]
     lan_panel: LanPanel,
     #[cfg(target_os = "android")]
@@ -193,7 +197,10 @@ impl TanglewoodUi {
             research: research::ResearchUi::default(),
             research_chats_open: false,
             research_outcomes_open: true,
-            research_outcomes_narrow: false,
+            layout: layout::Responsive::default(),
+            layout_plan: None,
+            touch_input: cfg!(target_os = "android"),
+            right_pane: layout::Pane::Outcomes,
             #[cfg(feature = "lan")]
             lan_panel: LanPanel::default(),
             #[cfg(target_os = "android")]
@@ -384,7 +391,278 @@ impl TanglewoodUi {
         self.note_dialog = Some(dialog);
     }
 
+    fn navigation_contents(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        notes: &[NoteView],
+        overlay: bool,
+        select: &mut Option<NoteId>,
+    ) {
+        let view = notes
+            .iter()
+            .find(|view| Some(view.note.id) == self.selected);
+        #[cfg(all(target_os = "linux", feature = "codex"))]
+        let codex_mode = self.sidebar_view == SidebarView::Codex && self.conversation.is_some();
+        #[cfg(not(all(target_os = "linux", feature = "codex")))]
+        let codex_mode = false;
+        ui.scope_builder(
+            egui::UiBuilder::new().id("shell-navigation-content"),
+            |ui| {
+                #[cfg(all(target_os = "linux", feature = "codex"))]
+                if codex_mode {
+                    if let Some(panel) = &mut self.conversation {
+                        panel.sidebar(ui, ctx);
+                    }
+                    return;
+                }
+                if self.sidebar_view == SidebarView::Research {
+                    if self.research.sidebar(ui, &mut self.app) && overlay {
+                        self.layout.close();
+                    }
+                    return;
+                }
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    ui.strong("Tanglewood");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::button(ui, theme::Icon::New, "New note", true).clicked() {
+                            self.open_note_dialog(NoteDialog::New);
+                        }
+                    });
+                });
+                ui.add_space(18.0);
+                if self.sidebar_view == SidebarView::Search {
+                    #[cfg(target_os = "android")]
+                    field_single(ui, &mut self.query, "quick-switch");
+                    #[cfg(not(target_os = "android"))]
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.query)
+                            .id(egui::Id::new("quick-switch"))
+                            .hint_text("Search notes…")
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.add_space(8.0);
+                }
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(match self.sidebar_view {
+                        SidebarView::Codex => "Codex",
+                        SidebarView::Research => "Research",
+                        SidebarView::Backlinks => "Backlinks",
+                        SidebarView::Search => "Search",
+                        SidebarView::Notes => {
+                            if self.show_trash {
+                                "Trash"
+                            } else {
+                                "Notes"
+                            }
+                        }
+                    })
+                    .size(12.0)
+                    .color(theme::muted(ui)),
+                );
+                let needle = if self.sidebar_view == SidebarView::Search {
+                    self.query.to_lowercase()
+                } else {
+                    String::new()
+                };
+                let note_scroll = egui::ScrollArea::vertical()
+                    .id_salt("note-list")
+                    .auto_shrink([false, false])
+                    .max_height((ui.available_height() - 32.0).max(1.0))
+                    .show(ui, |ui| {
+                        let mut count = 0;
+                        for other in notes {
+                            if (self.show_trash && !other.note.trashed)
+                                || (!self.show_trash && other.note.trashed)
+                            {
+                                continue;
+                            }
+                            if !needle.is_empty()
+                                && !other.note.path.to_lowercase().contains(&needle)
+                                && !other.note.text.to_lowercase().contains(&needle)
+                            {
+                                continue;
+                            }
+                            if self.sidebar_view == SidebarView::Backlinks
+                                && !view.is_some_and(|selected| {
+                                    other.note.id != selected.note.id
+                                        && self.parsed.get(&other.note.id).is_some_and(|doc| {
+                                            doc.links().iter().any(|target| {
+                                                resolve_note_target(
+                                                    &notes,
+                                                    &other.note.path,
+                                                    target,
+                                                ) == Some(selected.note.id)
+                                            })
+                                        })
+                                })
+                            {
+                                continue;
+                            }
+                            count += 1;
+                            let selected = self.selected == Some(other.note.id);
+                            let row = ui
+                                .add_sized(
+                                    [ui.available_width(), theme::control_size(ui).max(36.0)],
+                                    egui::Button::new("")
+                                        .selected(selected)
+                                        .frame(true)
+                                        .frame_when_inactive(selected)
+                                        .corner_radius(6),
+                                )
+                                .on_hover_text(&other.note.path);
+                            row.widget_info(|| {
+                                egui::WidgetInfo::labeled(
+                                    egui::WidgetType::Button,
+                                    true,
+                                    &other.note.path,
+                                )
+                            });
+                            let mut job = egui::text::LayoutJob::simple(
+                                note_title(&other.note.path).to_owned(),
+                                egui::FontId::proportional(14.0),
+                                ui.visuals().text_color(),
+                                (row.rect.width() - 22.0).max(1.0),
+                            );
+                            job.wrap.max_rows = 1;
+                            let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+                            let pos = egui::pos2(
+                                row.rect.left() + 11.0,
+                                row.rect.center().y - galley.size().y * 0.5,
+                            );
+                            ui.painter().galley(pos, galley, ui.visuals().text_color());
+                            if row.clicked() {
+                                *select = Some(other.note.id);
+                            }
+                        }
+                        if count == 0 {
+                            ui.label(
+                                egui::RichText::new(
+                                    if self.sidebar_view == SidebarView::Backlinks {
+                                        "No backlinks"
+                                    } else {
+                                        "No notes"
+                                    },
+                                )
+                                .small()
+                                .color(theme::muted(ui)),
+                            );
+                        }
+                    });
+                navigation::scroll_focus(ctx, &note_scroll);
+                ui.label(
+                    egui::RichText::new("Personal vault")
+                        .small()
+                        .color(theme::muted(ui)),
+                );
+            },
+        );
+    }
+
+    fn pane_transition_allowed(&mut self) -> bool {
+        if self
+            .selected
+            .and_then(|id| self.drafts.get(&id))
+            .is_some_and(|d| d.composing)
+        {
+            return false;
+        }
+        self.selected.is_none_or(|id| self.prepare_transition(id))
+    }
+
+    fn toggle_navigation(&mut self) {
+        self.sidebar(self.sidebar_view, true);
+    }
+
+    fn request_pane(&mut self, pane: layout::Pane) {
+        if !self.pane_transition_allowed() {
+            return;
+        }
+        if pane == layout::Pane::Navigation {
+            self.toggle_navigation();
+            return;
+        }
+        let docked = self.layout_plan.is_some_and(|plan| plan.right);
+        if docked && pane.right() {
+            if self.sidebar_view == SidebarView::Research {
+                self.research_outcomes_open =
+                    !self.research_outcomes_open || self.right_pane != pane;
+                self.right_pane = pane;
+            }
+            #[cfg(all(target_os = "linux", feature = "codex"))]
+            if pane == layout::Pane::Context {
+                if let Some(panel) = &mut self.conversation {
+                    panel.context.open = true;
+                }
+            }
+        } else {
+            self.layout.toggle(pane);
+        }
+    }
+
+    fn right_contents(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        pane: layout::Pane,
+        notes: &[NoteView],
+    ) -> Option<research::Action> {
+        let mut action = None;
+        #[allow(unused_mut)]
+        let mut context_closed = false;
+        ui.scope_builder(
+            egui::UiBuilder::new().id(if pane == layout::Pane::Outcomes {
+                "shell-outcomes-content"
+            } else {
+                "shell-context-content"
+            }),
+            |ui| {
+                if pane == layout::Pane::Outcomes {
+                    action = self.research.outcomes(ui, ctx, &mut self.app, notes);
+                }
+                #[cfg(all(target_os = "linux", feature = "codex"))]
+                if pane == layout::Pane::Context {
+                    if let Some(panel) = &mut self.conversation {
+                        let ready = panel.ready
+                            && panel.pending_thread.is_none()
+                            && !panel.disconnecting
+                            && panel.context_goal_pending.is_none();
+                        let cwd = panel.config.cwd.clone();
+                        panel.context.open = true;
+                        if let Some(action) = panel.context.panel(ui, ctx, &cwd, ready) {
+                            panel.context_action(action);
+                        }
+                        context_closed = !panel.context.open;
+                    }
+                }
+            },
+        );
+        if context_closed {
+            if self.layout.overlay == Some(layout::Pane::Context) {
+                self.layout.close();
+            } else if self.sidebar_view == SidebarView::Research {
+                self.research_outcomes_open = false;
+            }
+        }
+        action
+    }
+
     fn sidebar(&mut self, view: SidebarView, toggle: bool) {
+        if self.layout_plan.is_some_and(|plan| !plan.left) {
+            if !self.pane_transition_allowed() {
+                return;
+            }
+            let same = self.sidebar_view == view;
+            self.sidebar_view = view;
+            if toggle && same {
+                self.layout.toggle(layout::Pane::Navigation);
+            } else {
+                self.layout.open(layout::Pane::Navigation);
+            }
+            return;
+        }
         if toggle && self.show_notes && self.sidebar_view == view {
             self.show_notes = false;
             return;
@@ -797,6 +1075,11 @@ impl LanPanel {
 
 impl eframe::App for TanglewoodUi {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.show_frame(ctx);
+    }
+}
+impl TanglewoodUi {
+    fn show_frame(&mut self, ctx: &egui::Context) {
         if !self.theme_installed {
             theme::install(ctx);
             self.theme_installed = true;
@@ -951,10 +1234,86 @@ impl eframe::App for TanglewoodUi {
         if ctx.input(|input| input.viewport().close_requested()) {
             self.closing = true;
         }
-        let mobile = cfg!(target_os = "android") || ctx.content_rect().width() < 600.0;
+        self.layout.focus_before_frame = ctx.memory(|m| m.focused());
+        if ctx.input(|i| {
+            i.events
+                .iter()
+                .any(|e| matches!(e, egui::Event::Touch { .. }))
+        }) {
+            self.touch_input = true;
+        }
+        theme::set_touch_density(ctx, self.touch_input);
+        let width = ctx.content_rect().width();
+        let left_width = egui::containers::panel::PanelState::load(ctx, egui::Id::new("notes"))
+            .map_or(theme::SIDEBAR_WIDTH, |s| s.rect.width())
+            .clamp(200.0, 360.0);
+        let right_width =
+            egui::containers::panel::PanelState::load(ctx, egui::Id::new("shell-right"))
+                .map_or(theme::CONTEXT_WIDTH, |s| s.rect.width())
+                .clamp(240.0, 360.0);
+        #[cfg(all(target_os = "linux", feature = "codex"))]
+        let context_before = self.conversation.as_ref().is_some_and(|p| p.context.open);
+        #[cfg(not(all(target_os = "linux", feature = "codex")))]
+        let context_before = false;
+        // Test docking capacity even when a pane is closed, so its toggle can reopen it.
+        let plan = self
+            .layout
+            .plan(width, self.touch_input, Some(left_width), Some(right_width));
+        if let Some(previous) = self.layout.previous {
+            let focused = self
+                .layout
+                .focus_before_frame
+                .and_then(|id| ctx.read_response(id))
+                .map(|r| r.rect.center());
+            if previous.left
+                && !plan.left
+                && focused.is_some_and(|p| self.layout.left_rect.is_some_and(|r| r.contains(p)))
+            {
+                self.layout.open(layout::Pane::Navigation);
+            }
+            if previous.right
+                && !plan.right
+                && focused.is_some_and(|p| self.layout.right_rect.is_some_and(|r| r.contains(p)))
+            {
+                self.layout
+                    .open(if self.sidebar_view == SidebarView::Research {
+                        self.right_pane
+                    } else {
+                        layout::Pane::Context
+                    });
+            }
+        }
+        // A pane has exactly one host per frame; reuse its stable child IDs.
+        if self.layout.overlay.is_some_and(|pane| match pane {
+            layout::Pane::Navigation => plan.left && self.show_notes,
+            layout::Pane::Outcomes => {
+                plan.right
+                    && self.sidebar_view == SidebarView::Research
+                    && self.research_outcomes_open
+                    && self.right_pane == pane
+            }
+            layout::Pane::Context => {
+                plan.right
+                    && ((self.sidebar_view == SidebarView::Codex && context_before)
+                        || (self.sidebar_view == SidebarView::Research
+                            && self.research_outcomes_open
+                            && self.right_pane == pane))
+            }
+            layout::Pane::Conversations => false,
+        }) {
+            self.layout.close();
+        }
+        self.layout_plan = Some(plan);
+        self.layout.previous = Some(plan);
+        let mobile = plan.compact();
+        ctx.data_mut(|d| {
+            d.insert_temp(egui::Id::new("shell-context-undocked"), !plan.right);
+            d.insert_temp(egui::Id::new("shell-active-overlay"), self.layout.overlay);
+        });
         let dark = ctx.style().visuals.dark_mode;
-        let main_fill = egui::Color32::from_gray(if dark { 25 } else { 250 });
-        let side_fill = egui::Color32::from_gray(if dark { 22 } else { 242 });
+        let colors = theme::colors(dark);
+        let main_fill = colors.content;
+        let side_fill = colors.navigation;
         if ctx.input(|input| input.modifiers.command && input.key_pressed(egui::Key::P)) {
             self.sidebar(SidebarView::Search, false);
             #[cfg(target_os = "android")]
@@ -968,7 +1327,8 @@ impl eframe::App for TanglewoodUi {
             .find(|view| Some(view.note.id) == self.selected);
         if navigation::enter_reader(
             ctx,
-            self.sidebar_view != SidebarView::Codex
+            self.layout.overlay.is_none()
+                && self.sidebar_view != SidebarView::Codex
                 && self.sidebar_view != SidebarView::Research
                 && self.show_preview
                 && !self.show_settings
@@ -989,337 +1349,246 @@ impl eframe::App for TanglewoodUi {
         let codex_mode = self.sidebar_view == SidebarView::Codex && self.conversation.is_some();
         #[cfg(not(all(target_os = "linux", feature = "codex")))]
         let codex_mode = false;
-        egui::SidePanel::left("activity-rail")
-            .resizable(false)
-            .exact_width(48.0)
-            .frame(
-                egui::Frame::new()
-                    .fill(side_fill)
-                    .inner_margin(egui::Margin::symmetric(if mobile { 2 } else { 7 }, 14)),
-            )
-            .show(ctx, |ui| {
-                ui.spacing_mut().item_spacing.y = 14.0;
-                if theme::selected_button(
-                    ui,
-                    theme::Icon::Notes,
-                    "Notes",
-                    true,
-                    self.show_notes && self.sidebar_view == SidebarView::Notes,
+        if !mobile {
+            egui::SidePanel::left("activity-rail")
+                .resizable(false)
+                .exact_width(plan.rail)
+                .frame(
+                    egui::Frame::new()
+                        .fill(side_fill)
+                        .inner_margin(egui::Margin::symmetric(if mobile { 2 } else { 7 }, 14)),
                 )
-                .clicked()
-                {
-                    self.sidebar(SidebarView::Notes, true);
-                }
-                if theme::selected_button(
-                    ui,
-                    theme::Icon::Search,
-                    "Search notes · Ctrl P",
-                    true,
-                    self.show_notes && self.sidebar_view == SidebarView::Search,
-                )
-                .clicked()
-                {
-                    self.sidebar(SidebarView::Search, false);
-                }
-                if theme::selected_button(
-                    ui,
-                    theme::Icon::Links,
-                    "Backlinks",
-                    true,
-                    self.show_notes && self.sidebar_view == SidebarView::Backlinks,
-                )
-                .clicked()
-                {
-                    self.sidebar(SidebarView::Backlinks, false);
-                }
-                if theme::selected_button(
-                    ui,
-                    theme::Icon::Folder,
-                    "Research",
-                    true,
-                    self.sidebar_view == SidebarView::Research,
-                )
-                .clicked()
-                {
-                    if self.selected.is_none_or(|id| self.prepare_transition(id)) {
-                        self.sidebar(SidebarView::Research, false);
+                .show(ctx, |ui| {
+                    ui.spacing_mut().item_spacing.y = 14.0;
+                    if theme::selected_button(
+                        ui,
+                        theme::Icon::Notes,
+                        "Notes",
+                        true,
+                        self.show_notes && self.sidebar_view == SidebarView::Notes,
+                    )
+                    .clicked()
+                    {
+                        self.sidebar(SidebarView::Notes, true);
                     }
-                }
-                #[cfg(all(target_os = "linux", feature = "codex"))]
-                if self.conversation.is_some() {
-                    if theme::selected_button(ui, theme::Icon::Codex, "Codex", true, codex_mode)
+                    if theme::selected_button(
+                        ui,
+                        theme::Icon::Search,
+                        "Search notes · Ctrl P",
+                        true,
+                        self.show_notes && self.sidebar_view == SidebarView::Search,
+                    )
+                    .clicked()
+                    {
+                        self.sidebar(SidebarView::Search, false);
+                    }
+                    if theme::selected_button(
+                        ui,
+                        theme::Icon::Links,
+                        "Backlinks",
+                        true,
+                        self.show_notes && self.sidebar_view == SidebarView::Backlinks,
+                    )
+                    .clicked()
+                    {
+                        self.sidebar(SidebarView::Backlinks, false);
+                    }
+                    if theme::selected_button(
+                        ui,
+                        theme::Icon::Folder,
+                        "Research",
+                        true,
+                        self.sidebar_view == SidebarView::Research,
+                    )
+                    .clicked()
+                    {
+                        if self.selected.is_none_or(|id| self.prepare_transition(id)) {
+                            self.sidebar(SidebarView::Research, false);
+                        }
+                    }
+                    #[cfg(all(target_os = "linux", feature = "codex"))]
+                    if self.conversation.is_some() {
+                        if theme::selected_button(ui, theme::Icon::Codex, "Codex", true, codex_mode)
+                            .clicked()
+                        {
+                            self.sidebar(SidebarView::Codex, false);
+                        }
+                    }
+                    let bottom_controls_height =
+                        2.0 * theme::control_size(ui) + ui.spacing().item_spacing.y;
+                    ui.add_space((ui.available_height() - bottom_controls_height).max(0.0));
+                    ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                        if theme::selected_button(
+                            ui,
+                            theme::Icon::Connections,
+                            "Sync and connections",
+                            true,
+                            self.show_settings && self.settings_page == SettingsPage::Connections,
+                        )
                         .clicked()
-                    {
-                        self.sidebar(SidebarView::Codex, false);
-                    }
-                }
-                let bottom_controls_height =
-                    2.0 * if mobile { 44.0 } else { 34.0 } + ui.spacing().item_spacing.y;
-                ui.add_space((ui.available_height() - bottom_controls_height).max(0.0));
-                ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
-                    if theme::selected_button(
-                        ui,
-                        theme::Icon::Connections,
-                        "Sync and connections",
-                        true,
-                        self.show_settings && self.settings_page == SettingsPage::Connections,
-                    )
-                    .clicked()
-                    {
-                        self.settings_page = SettingsPage::Connections;
-                        self.show_settings = true;
-                    }
-                    if theme::selected_button(
-                        ui,
-                        theme::Icon::Settings,
-                        "Settings",
-                        true,
-                        self.show_settings && self.settings_page == SettingsPage::Processing,
-                    )
-                    .clicked()
-                    {
-                        self.settings_page = SettingsPage::Processing;
-                        self.show_settings = true;
-                    }
+                        {
+                            self.settings_page = SettingsPage::Connections;
+                            self.show_settings = true;
+                        }
+                        if theme::selected_button(
+                            ui,
+                            theme::Icon::Settings,
+                            "Settings",
+                            true,
+                            self.show_settings && self.settings_page == SettingsPage::Processing,
+                        )
+                        .clicked()
+                        {
+                            self.settings_page = SettingsPage::Processing;
+                            self.show_settings = true;
+                        }
+                    });
                 });
-            });
-        if self.show_notes {
-            egui::SidePanel::left("notes")
-                .resizable(!mobile)
-                .default_width(if mobile {
-                    ctx.available_rect().width()
-                } else {
-                    228.0
-                })
-                .width_range(if mobile && self.sidebar_view == SidebarView::Research {
-                    let width = ctx.available_rect().width();
-                    width..=width
-                } else if mobile {
-                    180.0..=ctx.available_rect().width().max(180.0)
-                } else {
-                    180.0..=360.0
-                })
+        } else {
+            egui::TopBottomPanel::top("compact-navigation")
+                .exact_height(theme::HEADER_HEIGHT)
+                .frame(
+                    egui::Frame::new()
+                        .fill(side_fill)
+                        .inner_margin(egui::Margin::symmetric(8, 4)),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if theme::button(ui, theme::Icon::Sidebar, "Toggle navigation pane", true)
+                            .clicked()
+                        {
+                            self.toggle_navigation();
+                        }
+                        let mut destination = self.sidebar_view;
+                        egui::ComboBox::from_id_salt("compact-destination")
+                            .selected_text(match destination {
+                                SidebarView::Notes => "Notes",
+                                SidebarView::Search => "Search",
+                                SidebarView::Backlinks => "Backlinks",
+                                SidebarView::Research => "Research",
+                                SidebarView::Codex => "Codex",
+                            })
+                            .width((ui.available_width() - 110.0).clamp(70.0, 180.0))
+                            .show_ui(ui, |ui| {
+                                for (value, label) in [
+                                    (SidebarView::Notes, "Notes"),
+                                    (SidebarView::Search, "Search"),
+                                    (SidebarView::Backlinks, "Backlinks"),
+                                    (SidebarView::Research, "Research"),
+                                ] {
+                                    ui.selectable_value(&mut destination, value, label);
+                                }
+                                #[cfg(all(target_os = "linux", feature = "codex"))]
+                                if self.conversation.is_some() {
+                                    ui.selectable_value(
+                                        &mut destination,
+                                        SidebarView::Codex,
+                                        "Codex",
+                                    );
+                                }
+                            });
+                        if destination != self.sidebar_view {
+                            self.sidebar(destination, false);
+                        }
+                        if self.sidebar_view == SidebarView::Codex
+                            && theme::button(ui, theme::Icon::Source, "Conversation context", true)
+                                .clicked()
+                        {
+                            self.request_pane(layout::Pane::Context);
+                        }
+                        let more =
+                            theme::button(ui, theme::Icon::More, "Application actions", true);
+                        egui::Popup::menu(&more).show(|ui| {
+                            if ui.button("Settings").clicked() {
+                                self.show_settings = true;
+                                ui.close();
+                            }
+                            if ui.button("Connections").clicked() {
+                                self.settings_page = SettingsPage::Connections;
+                                self.show_settings = true;
+                                ui.close();
+                            }
+                        });
+                    });
+                });
+        }
+        if self.show_notes && plan.left {
+            let pane = egui::SidePanel::left("notes")
+                .resizable(true)
+                .default_width(theme::SIDEBAR_WIDTH)
+                .width_range(200.0..=360.0)
                 .frame(
                     egui::Frame::new()
                         .fill(side_fill)
                         .inner_margin(egui::Margin::symmetric(12, 17)),
                 )
                 .show(ctx, |ui| {
-                    #[cfg(all(target_os = "linux", feature = "codex"))]
-                    if codex_mode {
-                        if let Some(panel) = &mut self.conversation {
-                            panel.sidebar(ui, ctx);
-                        }
-                        return;
-                    }
-                    if self.sidebar_view == SidebarView::Research {
-                        if mobile
-                            && theme::button(ui, theme::Icon::Sidebar, "Back to conversation", true)
-                                .clicked()
-                        {
-                            self.show_notes = false;
-                        }
-                        if self.research.sidebar(ui, &mut self.app) && mobile {
-                            self.show_notes = false;
-                        }
-                        return;
-                    }
-                    ui.horizontal(|ui| {
-                        ui.add_space(8.0);
-                        ui.strong("Tanglewood");
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if theme::button(ui, theme::Icon::New, "New note", true).clicked() {
-                                self.open_note_dialog(NoteDialog::New);
-                            }
-                        });
-                    });
-                    ui.add_space(18.0);
-                    if self.sidebar_view == SidebarView::Search {
-                        #[cfg(target_os = "android")]
-                        field_single(ui, &mut self.query, "quick-switch");
-                        #[cfg(not(target_os = "android"))]
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.query)
-                                .id(egui::Id::new("quick-switch"))
-                                .hint_text("Search notes…")
-                                .desired_width(f32::INFINITY),
-                        );
-                        ui.add_space(8.0);
-                    }
-                    ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new(match self.sidebar_view {
-                            SidebarView::Codex => "Codex",
-                            SidebarView::Research => "Research",
-                            SidebarView::Backlinks => "Backlinks",
-                            SidebarView::Search => "Search",
-                            SidebarView::Notes => {
-                                if self.show_trash {
-                                    "Trash"
-                                } else {
-                                    "Notes"
-                                }
-                            }
-                        })
-                        .size(12.0)
-                        .color(theme::muted(ui)),
-                    );
-                    let needle = if self.sidebar_view == SidebarView::Search {
-                        self.query.to_lowercase()
-                    } else {
-                        String::new()
-                    };
-                    let note_scroll = egui::ScrollArea::vertical()
-                        .id_salt("note-list")
-                        .auto_shrink([false, false])
-                        .max_height((ui.available_height() - 32.0).max(1.0))
-                        .show(ui, |ui| {
-                            let mut count = 0;
-                            for other in &notes {
-                                if (self.show_trash && !other.note.trashed)
-                                    || (!self.show_trash && other.note.trashed)
-                                {
-                                    continue;
-                                }
-                                if !needle.is_empty()
-                                    && !other.note.path.to_lowercase().contains(&needle)
-                                    && !other.note.text.to_lowercase().contains(&needle)
-                                {
-                                    continue;
-                                }
-                                if self.sidebar_view == SidebarView::Backlinks
-                                    && !view.is_some_and(|selected| {
-                                        other.note.id != selected.note.id
-                                            && self.parsed.get(&other.note.id).is_some_and(|doc| {
-                                                doc.links().iter().any(|target| {
-                                                    resolve_note_target(
-                                                        &notes,
-                                                        &other.note.path,
-                                                        target,
-                                                    ) == Some(selected.note.id)
-                                                })
-                                            })
-                                    })
-                                {
-                                    continue;
-                                }
-                                count += 1;
-                                let selected = self.selected == Some(other.note.id);
-                                let row = ui
-                                    .add_sized(
-                                        [ui.available_width(), if mobile { 44.0 } else { 34.0 }],
-                                        egui::Button::new("")
-                                            .selected(selected)
-                                            .frame(true)
-                                            .frame_when_inactive(selected)
-                                            .corner_radius(6),
-                                    )
-                                    .on_hover_text(&other.note.path);
-                                row.widget_info(|| {
-                                    egui::WidgetInfo::labeled(
-                                        egui::WidgetType::Button,
-                                        true,
-                                        &other.note.path,
-                                    )
-                                });
-                                let mut job = egui::text::LayoutJob::simple(
-                                    note_title(&other.note.path).to_owned(),
-                                    egui::FontId::proportional(14.0),
-                                    ui.visuals().text_color(),
-                                    (row.rect.width() - 22.0).max(1.0),
-                                );
-                                job.wrap.max_rows = 1;
-                                let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
-                                let pos = egui::pos2(
-                                    row.rect.left() + 11.0,
-                                    row.rect.center().y - galley.size().y * 0.5,
-                                );
-                                ui.painter().galley(pos, galley, ui.visuals().text_color());
-                                if row.clicked() {
-                                    select = Some(other.note.id);
-                                }
-                            }
-                            if count == 0 {
-                                ui.label(
-                                    egui::RichText::new(
-                                        if self.sidebar_view == SidebarView::Backlinks {
-                                            "No backlinks"
-                                        } else {
-                                            "No notes"
-                                        },
-                                    )
-                                    .small()
-                                    .color(theme::muted(ui)),
-                                );
-                            }
-                        });
-                    navigation::scroll_focus(ctx, &note_scroll);
-                    ui.label(
-                        egui::RichText::new("Personal vault")
-                            .small()
-                            .color(theme::muted(ui)),
-                    );
+                    self.navigation_contents(ui, ctx, &notes, false, &mut select);
                 });
-            if !mobile {
-                navigation::panel_focus(ctx, egui::Id::new("notes"), false, "Resize notes pane");
-            }
+            self.layout.left_rect = Some(pane.response.rect);
+            navigation::panel_focus(ctx, egui::Id::new("notes"), false, "Resize notes pane");
         }
-        if self.sidebar_view == SidebarView::Research && (!mobile || !self.show_notes) {
-            let wide_research = ctx.content_rect().width() >= 1050.0;
+        if self.sidebar_view == SidebarView::Research {
+            let wide_research = plan.right;
             #[cfg(all(target_os = "linux", feature = "codex"))]
             let conversation_available = self.conversation.is_some();
             #[cfg(not(all(target_os = "linux", feature = "codex")))]
             let conversation_available = false;
             egui::TopBottomPanel::top("research-header")
-                .exact_height(58.0)
-                .frame(egui::Frame::new().fill(main_fill).inner_margin(12))
+                .exact_height(theme::HEADER_HEIGHT)
+                .frame(
+                    egui::Frame::new()
+                        .fill(main_fill)
+                        .inner_margin(egui::Margin::symmetric(12, 4)),
+                )
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        if theme::button(ui, theme::Icon::Sidebar, "Toggle sources", true).clicked()
+                        if !mobile
+                            && theme::button(ui, theme::Icon::Sidebar, "Toggle sources", true)
+                                .clicked()
                         {
-                            self.show_notes = !self.show_notes;
+                            self.toggle_navigation();
                         }
                         let title = self.research.selected_title(&self.app);
-                        let width = (ui.available_width() - 84.0).max(20.0);
+                        let action_count = if conversation_available { 3.0 } else { 1.0 };
+                        let width = (ui.available_width()
+                            - action_count
+                                * (theme::control_size(ui) + ui.spacing().item_spacing.x))
+                            .max(1.0);
                         ui.add_sized([width, 34.0], egui::Label::new(title).truncate());
-                        if theme::button(
-                            ui,
-                            theme::Icon::Codex,
-                            "Conversations",
-                            conversation_available,
-                        )
-                        .clicked()
+                        if conversation_available
+                            && theme::button(ui, theme::Icon::Codex, "Conversations", true)
+                                .clicked()
                         {
-                            self.research_chats_open = !self.research_chats_open;
+                            self.request_pane(layout::Pane::Conversations);
+                        }
+                        if conversation_available
+                            && theme::button(ui, theme::Icon::Source, "Conversation context", true)
+                                .clicked()
+                        {
+                            self.request_pane(layout::Pane::Context);
                         }
                         if theme::button(ui, theme::Icon::Notes, "Toggle outcomes", true).clicked()
                         {
-                            if wide_research {
-                                self.research_outcomes_open = !self.research_outcomes_open;
-                            } else {
-                                self.research_outcomes_narrow = !self.research_outcomes_narrow;
-                            }
+                            self.request_pane(layout::Pane::Outcomes);
                         }
                     });
                 });
             if wide_research && self.research_outcomes_open {
-                egui::SidePanel::right("research-outcomes")
-                    .default_width(260.0)
-                    .width_range(220.0..=360.0)
+                let pane = egui::SidePanel::right("shell-right")
+                    .default_width(theme::CONTEXT_WIDTH)
+                    .width_range(240.0..=360.0)
                     .frame(egui::Frame::new().fill(side_fill).inner_margin(16))
                     .show(ctx, |ui| {
-                        research_action = self.research.outcomes(ui, ctx, &mut self.app, &notes);
+                        research_action = self.right_contents(ui, ctx, self.right_pane, &notes);
                     });
-            } else if !wide_research && self.research_outcomes_narrow {
-                // A requested pane overlays narrow windows instead of squeezing the chat.
-                let mut open = true;
-                egui::Window::new("Research outcomes")
-                    .open(&mut open)
-                    .default_width(300.0)
-                    .show(ctx, |ui| {
-                        research_action = self.research.outcomes(ui, ctx, &mut self.app, &notes);
-                    });
-                self.research_outcomes_narrow = open;
+                self.layout.right_rect = Some(pane.response.rect);
+                navigation::panel_focus(
+                    ctx,
+                    egui::Id::new("shell-right"),
+                    true,
+                    "Resize context pane",
+                );
             }
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(main_fill).inner_margin(20))
@@ -1358,56 +1627,22 @@ impl eframe::App for TanglewoodUi {
                         },
                     );
                 });
-            #[cfg(all(target_os = "linux", feature = "codex"))]
-            if let Some(panel) = &mut self.conversation {
-                if self.research_chats_open {
-                    egui::Window::new("Conversations")
-                        .open(&mut self.research_chats_open)
-                        .default_width(320.0)
-                        .vscroll(true)
-                        .show(ctx, |ui| panel.sidebar(ui, ctx));
-                }
-                if panel.context.open {
-                    let ready = panel.ready
-                        && panel.pending_thread.is_none()
-                        && !panel.disconnecting
-                        && panel.context_goal_pending.is_none();
-                    let cwd = panel.config.cwd.clone();
-                    let mut action = None;
-                    let mut context_open = true;
-                    egui::Window::new("Conversation context")
-                        .open(&mut context_open)
-                        .default_width(320.0)
-                        .show(ctx, |ui| {
-                            action = panel.context.panel(ui, ctx, &cwd, ready);
-                        });
-                    panel.context.open &= context_open;
-                    if let Some(action) = action {
-                        panel.context_action(action);
-                    }
-                }
-            }
         } else if codex_mode {
-            #[cfg(all(target_os = "linux", feature = "codex"))]
-            if let Some(panel) = &mut self.conversation {
-                if panel.context.open {
-                    let ready = panel.ready
-                        && panel.pending_thread.is_none()
-                        && !panel.disconnecting
-                        && panel.context_goal_pending.is_none();
-                    let cwd = panel.config.cwd.clone();
-                    let mut action = None;
-                    egui::SidePanel::right("codex-thread-context")
-                        .default_width(320.0)
-                        .width_range(240.0..=480.0)
-                        .frame(egui::Frame::new().fill(side_fill).inner_margin(16))
-                        .show(ctx, |ui| {
-                            action = panel.context.panel(ui, ctx, &cwd, ready);
-                        });
-                    if let Some(action) = action {
-                        panel.context_action(action);
-                    }
-                }
+            if plan.right && context_before {
+                let pane = egui::SidePanel::right("shell-right")
+                    .default_width(theme::CONTEXT_WIDTH)
+                    .width_range(240.0..=360.0)
+                    .frame(egui::Frame::new().fill(side_fill).inner_margin(16))
+                    .show(ctx, |ui| {
+                        let _ = self.right_contents(ui, ctx, layout::Pane::Context, &notes);
+                    });
+                self.layout.right_rect = Some(pane.response.rect);
+                navigation::panel_focus(
+                    ctx,
+                    egui::Id::new("shell-right"),
+                    true,
+                    "Resize context pane",
+                );
             }
             #[cfg(all(target_os = "linux", feature = "codex"))]
             egui::CentralPanel::default()
@@ -1417,25 +1652,28 @@ impl eframe::App for TanglewoodUi {
                         panel.show(ui, ctx, &self.app, self.selected);
                     }
                 });
-        } else if self.sidebar_view != SidebarView::Research && (!mobile || !self.show_notes) {
+        } else if self.sidebar_view != SidebarView::Research {
             egui::TopBottomPanel::top("document-header")
-                .exact_height(66.0)
+                .exact_height(theme::HEADER_HEIGHT)
                 .frame(
                     egui::Frame::new()
                         .fill(main_fill)
                         .inner_margin(egui::Margin::symmetric(
                             if mobile { 12 } else { 24 },
-                            if mobile { 11 } else { 16 },
+                            if self.touch_input { 4 } else { 11 },
                         )),
                 )
                 .show(ctx, |ui| {
                     ui.horizontal_centered(|ui| {
-                        if theme::button(ui, theme::Icon::Sidebar, "Toggle sidebar", true).clicked()
+                        if !mobile
+                            && theme::button(ui, theme::Icon::Sidebar, "Toggle sidebar", true)
+                                .clicked()
                         {
-                            self.sidebar(SidebarView::Notes, true);
+                            self.toggle_navigation();
                         }
-                        let actions_width = if mobile { 96.0 } else { 76.0 };
-                        let title_width = (ui.available_width() - actions_width - 8.0).max(0.0);
+                        let actions_width =
+                            2.0 * (theme::control_size(ui) + ui.spacing().item_spacing.x);
+                        let title_width = (ui.available_width() - actions_width).max(0.0);
                         ui.add_sized(
                             [title_width, 34.0],
                             egui::Label::new(
@@ -1667,12 +1905,12 @@ impl eframe::App for TanglewoodUi {
                 });
             egui::CentralPanel::default().frame(egui::Frame::new().fill(main_fill)).show(ctx,|ui| {
                 let document_scroll = egui::ScrollArea::vertical().id_salt("editor-scroll").auto_shrink([false,false]).show(ui,|ui| {
-                    let width=ui.available_width().min(730.0);
+                    let width=ui.available_width().min(theme::READING_WIDTH);
                     let margin=((ui.available_width()-width)*0.5).max(0.0);
                     ui.horizontal_top(|ui| {
                         ui.add_space(margin);
                         ui.allocate_ui_with_layout(egui::vec2(width,0.0),egui::Layout::top_down(egui::Align::Min),|ui| {
-                            egui::Frame::new().inner_margin(egui::Margin{left:if mobile {30} else {52},right:if mobile {30} else {52},top:if mobile {22} else {32},bottom:46}).show(ui,|ui| {
+                            egui::Frame::new().inner_margin(egui::Margin{left:plan.gutter(),right:plan.gutter(),top:if mobile {22} else {32},bottom:46}).show(ui,|ui| {
                                 let Some(view)=view else {return;};
                                 #[cfg(target_os="android")]
                                 crate::android_input::notice(ui);
@@ -1743,6 +1981,128 @@ impl eframe::App for TanglewoodUi {
                     }
                 }
             }
+        }
+        if self.research_chats_open {
+            self.layout.open(layout::Pane::Conversations);
+            self.research_chats_open = false;
+        }
+        #[cfg(all(target_os = "linux", feature = "codex"))]
+        if self.conversation.as_ref().is_some_and(|p| p.context.open)
+            && !context_before
+            && !plan.right
+        {
+            self.layout.open(layout::Pane::Context);
+        }
+        if let Some(request) = ctx.data_mut(|d| {
+            d.remove_temp::<Option<layout::Pane>>(egui::Id::new("shell-pane-request"))
+                .flatten()
+        }) {
+            self.request_pane(request);
+        }
+        let mut panes = vec![layout::Pane::Navigation];
+        if self.sidebar_view == SidebarView::Research {
+            panes.push(layout::Pane::Outcomes);
+        }
+        #[cfg(all(target_os = "linux", feature = "codex"))]
+        if self.conversation.is_some()
+            && matches!(
+                self.sidebar_view,
+                SidebarView::Research | SidebarView::Codex
+            )
+        {
+            panes.extend([layout::Pane::Context, layout::Pane::Conversations]);
+        }
+        if self
+            .layout
+            .overlay
+            .is_some_and(|pane| !panes.contains(&pane))
+        {
+            self.layout.close();
+        }
+        ctx.data_mut(|d| {
+            d.insert_temp(egui::Id::new("shell-context-undocked"), !plan.right);
+            d.insert_temp(egui::Id::new("shell-active-overlay"), self.layout.overlay);
+        });
+        if let Some(pane) = self.layout.overlay {
+            let newly_opened = std::mem::take(&mut self.layout.newly_opened);
+            let can_dock = if pane == layout::Pane::Navigation {
+                plan.left
+            } else {
+                pane.right() && plan.right
+            };
+            let result = layout::pullout(
+                ctx,
+                pane,
+                if pane == layout::Pane::Navigation {
+                    left_width.max(300.0)
+                } else {
+                    right_width.max(340.0)
+                },
+                &panes,
+                can_dock,
+                |ui| {
+                    if pane == layout::Pane::Navigation {
+                        self.navigation_contents(ui, ctx, &notes, true, &mut select);
+                    } else if pane.right() {
+                        if let Some(action) = self.right_contents(ui, ctx, pane, &notes) {
+                            research_action = Some(action);
+                        }
+                    }
+                    #[cfg(all(target_os = "linux", feature = "codex"))]
+                    if pane == layout::Pane::Conversations {
+                        if let Some(panel) = &mut self.conversation {
+                            ui.scope_builder(
+                                egui::UiBuilder::new().id("research-conversations"),
+                                |ui| panel.sidebar(ui, ctx),
+                            );
+                        }
+                    }
+                },
+            );
+            if newly_opened {
+                ctx.memory_mut(|m| m.request_focus(result.focus));
+                ctx.request_repaint();
+            }
+            if result.close && self.pane_transition_allowed() {
+                self.layout.close();
+            }
+            if let Some(next) = result.switch {
+                if self.pane_transition_allowed() {
+                    if next == layout::Pane::Navigation && plan.left {
+                        self.show_notes = true;
+                        self.layout.close();
+                    } else if next.right() && plan.right {
+                        self.right_pane = next;
+                        self.research_outcomes_open = true;
+                        #[cfg(all(target_os = "linux", feature = "codex"))]
+                        if let Some(panel) = &mut self.conversation {
+                            if next == layout::Pane::Context {
+                                panel.context.open = true;
+                            }
+                        }
+                        self.layout.close();
+                    } else {
+                        self.layout.open(next);
+                    }
+                }
+            }
+            if result.dock {
+                if pane == layout::Pane::Navigation {
+                    self.show_notes = true;
+                } else {
+                    self.right_pane = pane;
+                    self.research_outcomes_open = true;
+                    #[cfg(all(target_os = "linux", feature = "codex"))]
+                    if let Some(panel) = &mut self.conversation {
+                        panel.context.open = pane == layout::Pane::Context;
+                    }
+                }
+                self.layout.close();
+            }
+        }
+        if let Some(id) = self.layout.restore_focus.take() {
+            ctx.memory_mut(|m| m.request_focus(id));
+            ctx.request_repaint();
         }
         if let Some(action) = editor_action {
             if let Some(view) = view {
@@ -1928,6 +2288,7 @@ impl eframe::App for TanglewoodUi {
                                 theme::palette(ctx);
                             }
                         });
+                        ui.checkbox(&mut self.touch_input,"Touch-friendly controls").on_hover_text("Larger targets on any platform; does not change text size or pane layout.");
                     }
                     SettingsPage::Connections => {
                         #[cfg(all(target_os = "linux", feature = "mcp"))]
@@ -2173,8 +2534,8 @@ impl eframe::App for TanglewoodUi {
         }
         if let Some(id) = select {
             self.select(id);
-            if mobile && self.selected == Some(id) {
-                self.show_notes = false;
+            if self.selected == Some(id) && self.layout.overlay == Some(layout::Pane::Navigation) {
+                self.layout.close();
             }
         }
         if retry {
@@ -2324,6 +2685,70 @@ mod tests {
     use super::{
         App, Caller, Command, CommandResult, contiguous_edit, linked_path, resolve_note_target,
     };
+
+    #[test]
+    fn responsive_frames_preserve_source_draft_and_use_one_pane_host() {
+        let ctx = eframe::egui::Context::default();
+        let mut shell = super::TanglewoodUi::new(App::new());
+        shell.dispatch(Command::CreateNote {
+            path: "Draft.md".into(),
+            text: "Original source".into(),
+        });
+        let note = shell.selected.unwrap();
+        shell.refresh(&shell.app.notes());
+        shell.show_preview = false;
+        shell.drafts.get_mut(&note).unwrap().text = "Unsubmitted α draft".into();
+        let generation = shell.drafts[&note].widget_generation;
+        let frame = |shell: &mut super::TanglewoodUi, width: f32| {
+            let _ = ctx.run(
+                eframe::egui::RawInput {
+                    screen_rect: Some(eframe::egui::Rect::from_min_size(
+                        eframe::egui::Pos2::ZERO,
+                        eframe::egui::vec2(width, 844.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| shell.show_frame(ctx),
+            );
+        };
+        frame(&mut shell, 1440.0);
+        frame(&mut shell, 390.0);
+        shell.toggle_navigation();
+        assert_eq!(shell.layout.overlay, Some(super::layout::Pane::Navigation));
+        frame(&mut shell, 390.0);
+        let overlay_focus = ctx.memory(|m| m.focused());
+        let _ = ctx.run(
+            eframe::egui::RawInput {
+                screen_rect: Some(eframe::egui::Rect::from_min_size(
+                    eframe::egui::Pos2::ZERO,
+                    eframe::egui::vec2(390.0, 844.0),
+                )),
+                events: vec![
+                    eframe::egui::Event::Text("Must not enter covered draft".into()),
+                    eframe::egui::Event::Key {
+                        key: eframe::egui::Key::F6,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: eframe::egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| shell.show_frame(ctx),
+        );
+        assert_eq!(shell.drafts[&note].text, "Unsubmitted α draft");
+        assert_eq!(ctx.memory(|m| m.focused()), overlay_focus);
+        frame(&mut shell, 1440.0);
+        assert_eq!(shell.layout.overlay, None); // preferred dock restored, no duplicate global IDs
+        assert_eq!(shell.drafts[&note].text, "Unsubmitted α draft");
+        assert_eq!(shell.drafts[&note].widget_generation, generation);
+        assert_eq!(shell.app.note(note).unwrap().note.text, "Original source");
+        assert!(!shell.show_preview);
+        shell.touch_input = true;
+        frame(&mut shell, 390.0);
+        assert_eq!(ctx.style().spacing.interact_size.y, 48.0);
+    }
 
     #[cfg(all(target_os = "linux", feature = "codex"))]
     #[test]
@@ -4893,13 +5318,42 @@ impl ConversationPanel {
                 if ui
                     .add(
                         egui::Button::new("Context")
-                            .selected(self.context.open)
+                            .selected(
+                                if ctx
+                                    .data(|d| {
+                                        d.get_temp::<bool>(egui::Id::new("shell-context-undocked"))
+                                    })
+                                    .unwrap_or(false)
+                                {
+                                    ctx.data(|d| {
+                                        d.get_temp::<Option<layout::Pane>>(egui::Id::new(
+                                            "shell-active-overlay",
+                                        ))
+                                    })
+                                    .flatten()
+                                        == Some(layout::Pane::Context)
+                                } else {
+                                    self.context.open
+                                },
+                            )
                             .corner_radius(6),
                     )
                     .on_hover_text("Show goal, plan, files and plugins")
                     .clicked()
                 {
-                    self.context.open = !self.context.open;
+                    if ctx
+                        .data(|d| d.get_temp::<bool>(egui::Id::new("shell-context-undocked")))
+                        .unwrap_or(false)
+                    {
+                        ctx.data_mut(|d| {
+                            d.insert_temp(
+                                egui::Id::new("shell-pane-request"),
+                                Some(layout::Pane::Context),
+                            )
+                        });
+                    } else {
+                        self.context.open = !self.context.open;
+                    }
                 }
             });
         }
@@ -5206,10 +5660,13 @@ impl ConversationPanel {
             .corner_radius(20)
             .inner_margin(egui::Margin::symmetric(14, 12))
             .show(ui, |ui| {
+                let mut automatic_evidence=String::new();
+                egui::ScrollArea::vertical().id_salt("composer-body").max_height((ctx.content_rect().height()*0.35).clamp(48.0,320.0)).auto_shrink([false,true]).show(ui,|ui| {
                 let can_edit_context = !self.busy();
                 ui.add_enabled_ui(can_edit_context, |ui| self.context.chips(ui));
                 ui.add(
                     egui::TextEdit::multiline(&mut self.prompt)
+                        .id(egui::Id::new(("codex-composer",self.thread.as_deref())))
                         .frame(false)
                         .interactive(
                             self.thread.is_some()
@@ -5225,7 +5682,6 @@ impl ConversationPanel {
                         .desired_width(f32::INFINITY)
                         .char_limit(256 * 1024),
                 );
-                let mut automatic_evidence=String::new();
                 if research && self.relevant_sources {
                     if let Some(workspace)=self.research_workspace.and_then(|id|app.research_workspace(id)) {
                         let stale=self.relevant_cache.as_ref().is_none_or(|(id,revision,query,_)|*id!=workspace.id || *revision!=workspace.revision || query!=&self.prompt);
@@ -5241,6 +5697,7 @@ impl ConversationPanel {
                         }
                     }
                 }
+                });
                 ui.add_space(8.0);
                 ui.horizontal_wrapped(|ui| {
                     if let Some(action) = self.context.composer(

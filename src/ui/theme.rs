@@ -1,6 +1,70 @@
 //! Small application theme over native egui controls and trusted bundled assets.
 use eframe::egui;
 
+pub(super) const READING_WIDTH: f32 = 730.0;
+pub(super) const READING_FONT_SIZE: f32 = 16.0;
+pub(super) const READING_LINE_HEIGHT: f32 = 26.0;
+pub(super) const HEADER_HEIGHT: f32 = 56.0;
+pub(super) const SIDEBAR_WIDTH: f32 = 228.0;
+pub(super) const CONTEXT_WIDTH: f32 = 260.0;
+pub(super) const PARAGRAPH_GAP: f32 = 16.0;
+pub(super) const CODE_FONT_SIZE: f32 = 13.0;
+pub(super) const CODE_LINE_HEIGHT: f32 = 21.0;
+
+/// Semantic presentation tokens shared by shell, notes and conversation.
+pub(super) struct Colors {
+    pub content: egui::Color32,
+    pub navigation: egui::Color32,
+    pub raised: egui::Color32,
+    pub hover: egui::Color32,
+    pub selected: egui::Color32,
+    pub text: egui::Color32,
+    pub secondary: egui::Color32,
+    pub border: egui::Color32,
+    pub accent: egui::Color32,
+    pub success: egui::Color32,
+    pub warning: egui::Color32,
+    pub error: egui::Color32,
+}
+pub(super) fn colors(dark: bool) -> Colors {
+    let gray = |d, l| egui::Color32::from_gray(if dark { d } else { l });
+    let rgb = |d: [u8; 3], l: [u8; 3]| {
+        let [r, g, b] = if dark { d } else { l };
+        egui::Color32::from_rgb(r, g, b)
+    };
+    Colors {
+        content: gray(25, 250),
+        navigation: gray(22, 242),
+        raised: gray(34, 255),
+        hover: gray(43, 229),
+        selected: gray(48, 222),
+        text: gray(223, 41),
+        secondary: gray(170, 102),
+        border: gray(48, 222),
+        accent: rgb([138, 180, 248], [36, 93, 179]),
+        success: rgb([131, 201, 149], [36, 106, 55]),
+        warning: rgb([229, 186, 115], [121, 81, 0]),
+        error: rgb([239, 153, 153], [163, 34, 34]),
+    }
+}
+
+/// Input density is independent of OS. Fonts and user zoom are untouched.
+pub(super) fn set_touch_density(ctx: &egui::Context, touch: bool) {
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new("touch-density"), touch));
+    ctx.style_mut(|style| {
+        style.spacing.interact_size = egui::Vec2::splat(if touch { 48.0 } else { 34.0 });
+    });
+}
+fn touch(ui: &egui::Ui) -> bool {
+    ui.ctx().data(|data| {
+        data.get_temp::<bool>(egui::Id::new("touch-density"))
+            .unwrap_or(false)
+    })
+}
+pub(super) fn control_size(ui: &egui::Ui) -> f32 {
+    if touch(ui) { 48.0 } else { 34.0 }
+}
+
 pub(super) fn install(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     for (name, bytes) in [
@@ -41,67 +105,52 @@ pub(super) fn install(ctx: &egui::Context) {
 }
 
 pub(super) fn background(ui: &egui::Ui) -> egui::Color32 {
-    if ui.visuals().dark_mode {
-        egui::Color32::from_rgb(25, 25, 25)
-    } else {
-        egui::Color32::from_rgb(250, 250, 250)
-    }
+    colors(ui.visuals().dark_mode).content
 }
 pub(super) fn sidebar(ui: &egui::Ui) -> egui::Color32 {
-    if ui.visuals().dark_mode {
-        egui::Color32::from_rgb(22, 22, 22)
-    } else {
-        egui::Color32::from_rgb(242, 242, 242)
-    }
+    colors(ui.visuals().dark_mode).navigation
 }
 pub(super) fn muted(ui: &egui::Ui) -> egui::Color32 {
-    if ui.visuals().dark_mode {
-        egui::Color32::from_rgb(153, 153, 153)
-    } else {
-        egui::Color32::from_rgb(115, 115, 115)
-    }
+    colors(ui.visuals().dark_mode).secondary
 }
 pub(super) fn palette(ctx: &egui::Context) {
     ctx.style_mut(|style| {
-        let dark = style.visuals.dark_mode;
-        let color = |d, l| egui::Color32::from_gray(if dark { d } else { l });
-        style.visuals.override_text_color = Some(color(223, 41));
-        style.visuals.panel_fill = color(22, 242);
-        style.visuals.window_fill = color(34, 255);
-        style.visuals.extreme_bg_color = color(34, 255);
-        style.visuals.faint_bg_color = color(28, 246);
-        style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, color(48, 229));
-        style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, color(48, 229));
-        style.visuals.widgets.hovered.weak_bg_fill = color(43, 229);
-        style.visuals.widgets.active.weak_bg_fill = color(48, 220);
-        style.visuals.selection.bg_fill = color(43, 229);
-        style.visuals.selection.stroke = egui::Stroke::new(1.0, color(223, 41));
-        style.visuals.window_corner_radius = egui::CornerRadius::same(10);
+        let c = colors(style.visuals.dark_mode);
+        style.visuals.override_text_color = Some(c.text);
+        style.visuals.panel_fill = c.navigation;
+        style.visuals.window_fill = c.raised;
+        style.visuals.extreme_bg_color = c.raised;
+        style.visuals.faint_bg_color = c.hover;
+        style.visuals.hyperlink_color = c.accent;
+        style.visuals.warn_fg_color = c.warning;
+        style.visuals.error_fg_color = c.error;
+        style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, c.border);
+        style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, c.border);
+        style.visuals.widgets.hovered.weak_bg_fill = c.hover;
+        style.visuals.widgets.hovered.bg_fill = c.hover;
+        style.visuals.widgets.active.weak_bg_fill = c.selected;
+        style.visuals.widgets.active.bg_fill = c.selected;
+        style.visuals.widgets.active.bg_stroke = egui::Stroke::new(2.0, c.accent);
+        style.visuals.selection.bg_fill = c.selected;
+        style.visuals.selection.stroke = egui::Stroke::new(1.0, c.text);
+        style.visuals.window_corner_radius = egui::CornerRadius::same(12);
         style.spacing.item_spacing = egui::vec2(8.0, 8.0);
         style.spacing.button_padding = egui::vec2(7.0, 7.0);
-        style.spacing.interact_size = egui::vec2(
-            34.0,
-            if cfg!(target_os = "android") {
-                44.0
-            } else {
-                34.0
-            },
+        style.spacing.interact_size = egui::Vec2::splat(34.0);
+        for (role, size) in [
+            (egui::TextStyle::Body, 14.0),
+            (egui::TextStyle::Button, 14.0),
+            (egui::TextStyle::Small, 12.0),
+            (egui::TextStyle::Heading, 19.0),
+        ] {
+            style
+                .text_styles
+                .insert(role, egui::FontId::proportional(size));
+        }
+        style.text_styles.insert(
+            egui::TextStyle::Monospace,
+            egui::FontId::monospace(CODE_FONT_SIZE),
         );
-        style
-            .text_styles
-            .insert(egui::TextStyle::Body, egui::FontId::proportional(15.0));
-        style
-            .text_styles
-            .insert(egui::TextStyle::Button, egui::FontId::proportional(14.0));
-        style
-            .text_styles
-            .insert(egui::TextStyle::Small, egui::FontId::proportional(11.0));
-        style
-            .text_styles
-            .insert(egui::TextStyle::Heading, egui::FontId::proportional(18.0));
-        style
-            .text_styles
-            .insert(egui::TextStyle::Monospace, egui::FontId::monospace(13.0));
     });
 }
 
@@ -162,15 +211,11 @@ pub(super) fn image(ui: &egui::Ui, icon: Icon) -> egui::Image<'static> {
         .replace("stroke-width=\"2\"", "stroke-width=\"1.6\"")
         .into_bytes();
     egui::Image::from_bytes(format!("bytes://quiet-{name}.svg"), bytes)
-        .fit_to_exact_size(egui::vec2(18.0, 18.0))
+        .fit_to_exact_size(egui::Vec2::splat(if touch(ui) { 20.0 } else { 18.0 }))
         .tint(ui.visuals().text_color())
 }
 pub(super) fn control(ui: &egui::Ui, icon: Icon) -> egui::Button<'static> {
-    let size = if cfg!(target_os = "android") {
-        44.0
-    } else {
-        34.0
-    };
+    let size = control_size(ui);
     egui::Button::new(image(ui, icon))
         .frame(true)
         .corner_radius(6)
@@ -186,16 +231,13 @@ pub(super) fn selected_button(
     enabled: bool,
     selected: bool,
 ) -> egui::Response {
-    let size = if cfg!(target_os = "android") {
-        44.0
-    } else {
-        34.0
-    };
+    let size = control_size(ui);
     let response = ui
         .scope(|ui| {
             // Equal padding centres the 18px icon in the square hit target,
             // independently of the surrounding panel's left-aligned layout.
-            ui.spacing_mut().button_padding = egui::Vec2::splat((size - 18.0) * 0.5);
+            ui.spacing_mut().button_padding =
+                egui::Vec2::splat((size - if touch(ui) { 20.0 } else { 18.0 }) * 0.5);
             ui.add_enabled(
                 enabled,
                 control(ui, icon)
@@ -205,6 +247,43 @@ pub(super) fn selected_button(
         })
         .inner
         .on_hover_text(label);
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            response.rect.shrink(1.0),
+            6.0,
+            egui::Stroke::new(2.0, colors(ui.visuals().dark_mode).accent),
+            egui::StrokeKind::Inside,
+        );
+    }
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn density_follows_input_without_resetting_typography() {
+        let ctx = egui::Context::default();
+        palette(&ctx);
+        ctx.style_mut(|style| {
+            style
+                .text_styles
+                .insert(egui::TextStyle::Body, egui::FontId::proportional(19.0));
+        });
+        for (touch, expected) in [(true, 48.0), (false, 34.0)] {
+            set_touch_density(&ctx, touch);
+            assert_eq!(
+                ctx.style().spacing.interact_size,
+                egui::Vec2::splat(expected)
+            );
+            assert_eq!(ctx.style().text_styles[&egui::TextStyle::Body].size, 19.0);
+        }
+        for dark in [true, false] {
+            let c = colors(dark);
+            assert_ne!(c.selected, c.hover);
+            assert_ne!(c.selected, c.accent);
+        }
+    }
 }

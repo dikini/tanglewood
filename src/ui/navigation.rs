@@ -81,8 +81,8 @@ pub(super) fn panel_focus(ctx: &egui::Context, id: egui::Id, right: bool, label:
     if delta != 0.0 {
         ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
         if let Some(mut state) = egui::containers::panel::PanelState::load(ctx, id) {
-            let width =
-                (state.rect.width() + if right { -delta } else { delta }).clamp(180.0, 360.0);
+            let width = (state.rect.width() + if right { -delta } else { delta })
+                .clamp(if right { 240.0 } else { 200.0 }, 360.0);
             if right {
                 state.rect.min.x = state.rect.max.x - width;
             } else {
