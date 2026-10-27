@@ -1522,6 +1522,9 @@ impl Protocol {
                 "turn/completed" => {
                     self.command_output.clear();
                     self.activity_items.clear();
+                    if let Some(error) = params["turn"].get("error").filter(|v| !v.is_null()) {
+                        events.push(CodexEvent::Error(error_text(error)));
+                    }
                     events.push(CodexEvent::TurnCompleted {
                         thread: thread.into(),
                         turn: turn.into(),
@@ -1536,7 +1539,8 @@ impl Protocol {
                 "error" => events.push(CodexEvent::Error(
                     params
                         .get("error")
-                        .map(Value::to_string)
+                        .filter(|value| !value.is_null())
+                        .map(error_text)
                         .unwrap_or_else(|| "Codex turn error".into()),
                 )),
                 _ => {}
@@ -1546,6 +1550,7 @@ impl Protocol {
                 return Ok((writes, events));
             };
             if let Some(error) = frame.get("error") {
+                let error = error_text(error);
                 if matches!(
                     pending.kind,
                     RequestKind::Initialize | RequestKind::Thread | RequestKind::Project
@@ -2010,13 +2015,58 @@ fn byte_prefix(text: &str, limit: usize) -> &str {
     }
     &text[..end]
 }
+
+fn error_text(error: &Value) -> String {
+    let mut text = error
+        .as_str()
+        .or_else(|| error.get("message").and_then(Value::as_str))
+        .filter(|text| !text.is_empty())
+        .map_or_else(|| error.to_string(), str::to_owned);
+    if let Some(code) = error.get("code").and_then(Value::as_i64) {
+        text.push_str(&format!(" (code {code})"));
+    }
+    for key in ["additionalDetails", "data", "codexErrorInfo"] {
+        if let Some(details) = error.get(key).filter(|value| !value.is_null()) {
+            let details = details
+                .as_str()
+                .map_or_else(|| details.to_string(), str::to_owned);
+            if !details.is_empty() && details != text {
+                text.push('\n');
+                text.push_str(&details);
+            }
+        }
+    }
+    byte_prefix(&text, 4096).into()
+}
+
+/// Only decode our versioned domain envelope after an explicit tool failure.
+fn tool_error_text(server: &str, text: &str) -> (String, bool) {
+    if server == "tanglewood" && text.len() <= 8192 {
+        if let Ok(response) = serde_json::from_str::<crate::mcp::ResponseEnvelope>(text) {
+            if response.version == crate::mcp::PROTOCOL_VERSION {
+                match response.outcome {
+                    crate::mcp::Outcome::Error(error) => return (error.to_string(), false),
+                    crate::mcp::Outcome::Rejected(reason) => {
+                        return (format!("Request rejected: {reason}"), false);
+                    }
+                    crate::mcp::Outcome::UnknownOutcome(reason) => {
+                        return (format!("Outcome unknown: {reason}"), true);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    (byte_prefix(text, 4096).into(), false)
+}
+
 fn parse_activity(item: &Value, completed: bool) -> Option<Activity> {
     let kind = item["type"].as_str()?;
     let id = item["id"].as_str()?;
     if id.is_empty() || id.len() > 1024 {
         return None;
     }
-    let (title, details) = match kind {
+    let (mut title, details) = match kind {
         "mcpToolCall" => (
             format!(
                 "{}.{}",
@@ -2037,17 +2087,40 @@ fn parse_activity(item: &Value, completed: bool) -> Option<Activity> {
         ),
         _ => return None,
     };
+    let mut status =
+        item["status"]
+            .as_str()
+            .unwrap_or(if completed { "completed" } else { "inProgress" });
+    let error = item.get("error").filter(|value| !value.is_null());
+    if error.is_some()
+        || item.pointer("/result/isError").and_then(Value::as_bool) == Some(true)
+        || status == "failed"
+    {
+        status = "failed";
+        let message = error.map(error_text).or_else(|| {
+            item.pointer("/result/content")
+                .and_then(Value::as_array)?
+                .iter()
+                .filter(|content| content["type"] == "text")
+                .filter_map(|content| content["text"].as_str())
+                .find(|text| !text.trim().is_empty())
+                .map(str::to_owned)
+        });
+        if let Some(message) = message {
+            let (message, uncertain) =
+                tool_error_text(item["server"].as_str().unwrap_or_default(), &message);
+            if uncertain {
+                status = "unknownOutcome";
+            }
+            title.push_str(" — ");
+            title.push_str(&message);
+        }
+    }
     Some(Activity {
         item: id.into(),
         kind: kind.into(),
         title: byte_prefix(&title, 512).into(),
-        status: byte_prefix(
-            item["status"]
-                .as_str()
-                .unwrap_or(if completed { "completed" } else { "inProgress" }),
-            64,
-        )
-        .into(),
+        status: byte_prefix(status, 64).into(),
         details: byte_prefix(&details, 8192).into(),
         truncated: details.len() > 8192,
     })
@@ -2609,6 +2682,79 @@ mod tests {
                 matches!(&events[0],CodexEvent::Activity {activity,..} if activity.kind==kind && activity.status=="inProgress")
             );
         }
+    }
+    #[test]
+    fn structured_errors_keep_their_meaning() {
+        // Shapes captured from the morning Tanglewood session; identities removed.
+        let message = "invalid command arguments: missing field `include_trash`";
+        let uncertain = "accepted but storage failed: downloaded content is not a PDF; inspect state before retry";
+        for (result, expected, status) in [
+            (
+                json!({"isError":true,"content":[{"type":"text","text":message}]}),
+                message.to_owned(),
+                "failed",
+            ),
+            (
+                json!({"isError":true,"content":[{"type":"text","text":json!({"version":1,"request_id":"00000000-0000-0000-0000-000000000001","outcome":{"Error":{"InvalidResearch":"only local text and PDF imports are supported"}}}).to_string()}]}),
+                "invalid research request: only local text and PDF imports are supported".into(),
+                "failed",
+            ),
+            (
+                json!({"isError":true,"content":[{"type":"text","text":json!({"version":1,"request_id":"00000000-0000-0000-0000-000000000001","outcome":{"UnknownOutcome":uncertain}}).to_string()}]}),
+                format!("Outcome unknown: {uncertain}"),
+                "unknownOutcome",
+            ),
+        ] {
+            let item = json!({"type":"mcpToolCall","id":"tool","server":"tanglewood","tool":"execute","status":"failed","result":result});
+            let activity = parse_activity(&item, true).unwrap();
+            assert_eq!(activity.status, status);
+            assert!(activity.title.contains(&expected), "{}", activity.title);
+            let details: Value = serde_json::from_str(&activity.details).unwrap();
+            assert_eq!(details["result"], item["result"]);
+        }
+        let item = json!({"type":"mcpToolCall","id":"tool","server":"other","tool":"read","status":"completed","error":{"message":"Permission denied"}});
+        let activity = parse_activity(&item, true).unwrap();
+        assert_eq!(activity.status, "failed");
+        assert!(activity.title.contains("Permission denied"));
+        let item = json!({"type":"mcpToolCall","id":"tool","server":"tanglewood","tool":"read","status":"completed","result":{"isError":false,"content":[{"type":"text","text":"An example containing the word error"}]}});
+        let activity = parse_activity(&item, true).unwrap();
+        assert_eq!(activity.status, "completed");
+        assert_eq!(activity.title, "tanglewood.read");
+        let item = json!({"type":"mcpToolCall","id":"tool","server":"other","tool":"read","status":"failed","error":{"message":"é".repeat(10000)}});
+        let activity = parse_activity(&item, true).unwrap();
+        assert!(activity.title.len() <= 512 && activity.details.len() <= 8192);
+        assert!(activity.truncated);
+
+        let config = CodexConfig {
+            executable: "codex".into(),
+            cwd: "/tmp".into(),
+            mcp_bridge: "bridge".into(),
+            socket: "owner".into(),
+            resume_thread: None,
+            project: None,
+        };
+        let mut protocol = Protocol::new(&config);
+        protocol.thread = Some("a".into());
+        protocol.turn = Some("turn".into());
+        for error in [
+            json!("Connection interrupted"),
+            json!({"message":"Connection interrupted","additionalDetails":"Reconnect when ready."}),
+        ] {
+            let (_, events) = protocol.frame(json!({"method":"error","params":{"threadId":"a","turnId":"turn","willRetry":false,"error":error}})).unwrap();
+            let expected = if error.is_string() {
+                "Connection interrupted"
+            } else {
+                "Connection interrupted\nReconnect when ready."
+            };
+            assert!(matches!(&events[..], [CodexEvent::Error(text)] if text == expected));
+        }
+        let (_, events) = protocol.frame(json!({"method":"error","params":{"threadId":"other","turnId":"turn","willRetry":false,"error":{"message":"Unrelated"}}})).unwrap();
+        assert!(events.is_empty());
+        let (_, events) = protocol.frame(json!({"method":"turn/completed","params":{"threadId":"a","turn":{"id":"turn","status":"failed","error":{"message":"Download failed","additionalDetails":"Inspect state before retrying."}}}})).unwrap();
+        assert!(
+            matches!(&events[..], [CodexEvent::Error(text), CodexEvent::TurnCompleted {status,..}] if text == "Download failed\nInspect state before retrying." && status == "failed")
+        );
+        assert!(protocol.turn.is_none());
     }
     #[test]
     fn client_rejection_does_not_cancel_independent_goal_turn() {

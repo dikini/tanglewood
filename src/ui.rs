@@ -3058,6 +3058,17 @@ mod tests {
         panel.command_card("A".into(), "turn".into(), no_aggregate);
         assert_eq!(panel.messages[0].text, "test done");
         assert!(panel.messages[0].command.as_ref().unwrap().truncated);
+        // Completion is a lifecycle signal, not a successful exit status.
+        assert_eq!(super::chat_status("completed", Some(101)), ("Failed", true));
+        assert_eq!(super::chat_status("failed", None), ("Failed", true));
+        assert_eq!(
+            super::chat_status("unknownOutcome", None),
+            ("Outcome unknown", true)
+        );
+        assert_eq!(
+            super::chat_status("awaitingInput", None),
+            ("awaitingInput", false)
+        );
         panel.context.goal_loaded = false;
         assert!(!panel.mode_consistent());
         panel
@@ -3467,6 +3478,48 @@ use crate::codex::{
     ApprovalDecision, ApprovalMode, CodexAdapter, CodexConfig, CodexEvent, CodexRequest,
     ThreadAction, ThreadWorkState, TurnControls, WorkMode,
 };
+
+#[cfg(all(target_os = "linux", feature = "codex"))]
+fn chat_status(status: &str, exit_code: Option<i64>) -> (&str, bool) {
+    if exit_code.is_some_and(|code| code != 0) {
+        return ("Failed", true);
+    }
+    match status {
+        "inProgress" | "started" | "running" => ("Running", false),
+        "completed" | "done" => ("Done", false),
+        "failed" | "error" => ("Failed", true),
+        "unknownOutcome" => ("Outcome unknown", true),
+        "stopped" | "interrupted" | "cancelled" | "canceled" => ("Stopped", false),
+        "" => ("Unknown", false),
+        other => (other, false),
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "codex"))]
+fn chat_event_icon(
+    ui: &mut egui::Ui,
+    openness: f32,
+    response: &egui::Response,
+    icon: theme::Icon,
+    running: bool,
+    color: egui::Color32,
+) {
+    egui::collapsing_header::paint_default_icon(ui, openness, response);
+    let center = response.rect.center() + egui::vec2(ui.spacing().indent / 2.0 + 7.0, 0.0);
+    theme::image(ui, icon)
+        .fit_to_exact_size(egui::Vec2::splat(14.0))
+        .tint(color)
+        .paint_at(
+            ui,
+            egui::Rect::from_center_size(center, egui::Vec2::splat(14.0)),
+        );
+    if running {
+        egui::Spinner::new().size(12.0).color(color).paint_at(
+            ui,
+            egui::Rect::from_center_size(center + egui::vec2(20.0, 0.0), egui::Vec2::splat(12.0)),
+        );
+    }
+}
 
 #[cfg(all(target_os = "linux", feature = "codex"))]
 struct ConversationMessage {
@@ -5538,34 +5591,56 @@ impl ConversationPanel {
             .show(ui, |ui| {
                 for (index, message) in self.messages.iter().enumerate() {
                     if let Some(activity) = &message.activity {
-                        let running = self.active_turn.is_some()
-                            && self.active_turn.as_deref()
-                                == message.key.as_ref().map(|(_, turn, _)| turn.as_str())
-                            && matches!(
-                                activity.status.as_str(),
-                                "inProgress" | "started" | "running"
-                            );
-                        let title = egui::RichText::new(&activity.title)
-                            .size(13.0)
-                            .color(theme::muted(ui));
-                        let header =
-                            egui::CollapsingHeader::new(title).id_salt(("activity", &message.key));
-                        let header = if running {
-                            header.icon(|ui, _, response| {
-                                egui::Spinner::new()
-                                    .size(12.0)
-                                    .color(theme::muted(ui))
-                                    .paint_at(ui, response.rect.shrink(3.0))
-                            })
-                        } else {
-                            header
+                        let (status, failed) = chat_status(&activity.status, None);
+                        let running = status == "Running"
+                            && message.key.as_ref().is_some_and(|(thread, turn, _)| {
+                                self.thread.as_ref() == Some(thread)
+                                    && self.active_turn.as_ref() == Some(turn)
+                            });
+                        let kind = match activity.kind.as_str() {
+                            "webSearch" => "Search",
+                            "mcpToolCall" => "Tool",
+                            "fileChange" => "Files",
+                            other => other,
                         };
+                        let icon = match activity.kind.as_str() {
+                            "webSearch" => theme::Icon::Search,
+                            "mcpToolCall" => theme::Icon::Tool,
+                            _ => theme::Icon::Notes,
+                        };
+                        let color = if failed {
+                            theme::colors(ui.visuals().dark_mode).error
+                        } else {
+                            theme::muted(ui)
+                        };
+                        let width = (ui.available_width()
+                            - ui.spacing().indent
+                            - 2.0 * ui.spacing().button_padding.x)
+                            .max(1.0);
+                        let mut title = egui::text::LayoutJob::simple(
+                            format!("{kind} · {status} — {}", activity.title),
+                            egui::FontId::proportional(13.0),
+                            color,
+                            width,
+                        );
+                        // Reserve actual layout space for the topical icon and optional spinner.
+                        title.sections[0].leading_space = if running { 40.0 } else { 20.0 };
+                        title.wrap = egui::text::TextWrapping::truncate_at_width(width);
+                        let title = ui.fonts_mut(|fonts| fonts.layout_job(title));
+                        let header = egui::CollapsingHeader::new(title)
+                            .id_salt(("activity", &message.key))
+                            .icon(move |ui, openness, response| {
+                                chat_event_icon(ui, openness, response, icon, running, color)
+                            });
                         header.show(ui, |ui| {
-                            ui.weak(&activity.status);
+                            ui.weak(format!("{kind} · {status}"));
                             egui::ScrollArea::both()
                                 .id_salt(("activity-details", &message.key))
                                 .max_height(200.0)
                                 .show(ui, |ui| {
+                                    ui.add(
+                                        egui::Label::new(&activity.title).selectable(true).wrap(),
+                                    );
                                     ui.add(
                                         egui::Label::new(
                                             egui::RichText::new(&message.text)
@@ -5580,24 +5655,47 @@ impl ConversationPanel {
                             }
                         });
                     } else if let Some(command) = &message.command {
-                        let symbol = if command.status == "inProgress" {
-                            "◌"
-                        } else if command.exit_code == Some(0) {
-                            "✓"
+                        let (status, failed) = chat_status(&command.status, command.exit_code);
+                        let running = status == "Running"
+                            && message.key.as_ref().is_some_and(|(thread, turn, _)| {
+                                self.thread.as_ref() == Some(thread)
+                                    && self.active_turn.as_ref() == Some(turn)
+                            });
+                        let color = if failed {
+                            theme::colors(ui.visuals().dark_mode).error
                         } else {
-                            "·"
+                            theme::muted(ui)
                         };
-                        egui::CollapsingHeader::new(
-                            egui::RichText::new(format!("{symbol}  {}", command.command))
-                                .size(13.0)
-                                .color(theme::muted(ui)),
-                        )
-                        .id_salt(("command", &message.key))
-                        .show(ui, |ui| {
+                        let width = (ui.available_width()
+                            - ui.spacing().indent
+                            - 2.0 * ui.spacing().button_padding.x)
+                            .max(1.0);
+                        let mut title = egui::text::LayoutJob::simple(
+                            format!("Command · {status} — {}", command.command),
+                            egui::FontId::proportional(13.0),
+                            color,
+                            width,
+                        );
+                        title.sections[0].leading_space = if running { 40.0 } else { 20.0 };
+                        title.wrap = egui::text::TextWrapping::truncate_at_width(width);
+                        let title = ui.fonts_mut(|fonts| fonts.layout_job(title));
+                        let header = egui::CollapsingHeader::new(title)
+                            .id_salt(("command", &message.key))
+                            .icon(move |ui, openness, response| {
+                                chat_event_icon(
+                                    ui,
+                                    openness,
+                                    response,
+                                    theme::Icon::Terminal,
+                                    running,
+                                    color,
+                                )
+                            });
+                        header.show(ui, |ui| {
                             ui.weak(format!(
                                 "{} · {}{}",
                                 command.cwd,
-                                command.status,
+                                status,
                                 command
                                     .exit_code
                                     .map(|c| format!(" · exit {c}"))
@@ -5607,6 +5705,9 @@ impl ConversationPanel {
                                 .id_salt(("command-output", &message.key))
                                 .max_height(240.0)
                                 .show(ui, |ui| {
+                                    ui.add(
+                                        egui::Label::new(&command.command).selectable(true).wrap(),
+                                    );
                                     ui.add(
                                         egui::Label::new(
                                             egui::RichText::new(&message.text).monospace(),
@@ -5620,13 +5721,15 @@ impl ConversationPanel {
                         });
                     } else if message.role == "You" {
                         egui::Frame::new()
-                            .fill(ui.visuals().widgets.inactive.bg_fill)
+                            .fill(theme::colors(ui.visuals().dark_mode).selected)
                             .corner_radius(14)
                             .inner_margin(12)
                             .show(ui, |ui| {
+                                ui.strong("You");
                                 ui.add(egui::Label::new(&message.text).selectable(true).wrap());
                             });
                     } else {
+                        ui.strong("Codex");
                         self.markdown
                             .show(ui, (&self.thread, &message.key, index), &message.text);
                         let copy =
@@ -5664,6 +5767,7 @@ impl ConversationPanel {
                         20.0
                     });
                 }
+                self.context.transcript_files(ui, ctx, &self.config.cwd);
                 self.plan_rows(ui);
                 if self.starting || self.active_turn.is_some() {
                     ui.horizontal(|ui| {
@@ -5895,6 +5999,7 @@ pub fn run_transcript_preview() -> eframe::Result {
     }
     impl eframe::App for Preview {
         fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+            self.panel.context.poll(ctx);
             if self.panel.context.open {
                 egui::SidePanel::right("preview-context")
                     .default_width(300.0)
@@ -5927,7 +6032,7 @@ pub fn run_transcript_preview() -> eframe::Result {
             theme::palette(&cc.egui_ctx);
             let mut panel = ConversationPanel::new(CodexConfig {
                 executable: "codex".into(),
-                cwd: std::env::temp_dir(),
+                cwd: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")),
                 mcp_bridge: "unused".into(),
                 socket: "unused".into(),
                 resume_thread: None,
@@ -5954,6 +6059,59 @@ pub fn run_transcript_preview() -> eframe::Result {
                     truncated: false,
                 },
             );
+            panel.command_card(
+                "local-preview".into(),
+                "fixture".into(),
+                crate::codex::CommandExecution {
+                    item: "command-failed".into(),
+                    command: "cargo test --offline".into(),
+                    cwd: env!("CARGO_MANIFEST_DIR").into(),
+                    status: "completed".into(),
+                    exit_code: Some(101),
+                    output:
+                        "error: local fixture test failed\nNo command was executed in this preview."
+                            .into(),
+                    truncated: false,
+                    output_complete: true,
+                },
+            );
+            panel.activity_card(
+                "local-preview".into(),
+                "fixture".into(),
+                crate::codex::Activity {
+                    item: "tool-failed".into(),
+                    kind: "mcpToolCall".into(),
+                    title: "invalid command arguments: missing field `include_trash`".into(),
+                    status: "failed".into(),
+                    details: "invalid command arguments: missing field `include_trash`".into(),
+                    truncated: false,
+                },
+            );
+            panel.activity_card("local-preview".into(), "fixture".into(), crate::codex::Activity {
+                item: "tool-unknown-outcome".into(), kind: "mcpToolCall".into(),
+                title: "accepted but storage failed: downloaded content is not a PDF; inspect state before retry".into(),
+                status: "unknownOutcome".into(),
+                details: "accepted but storage failed: downloaded content is not a PDF; inspect state before retry".into(),
+                truncated: false,
+            });
+            panel.context.files = vec![
+                crate::codex::ContextFile {
+                    path: "docs/fixtures/mvp-2/codex-response.md".into(),
+                    kind: "file".into(),
+                },
+                crate::codex::ContextFile {
+                    path: "docs/design-system/evidence/expanded-dark.png".into(),
+                    kind: "image".into(),
+                },
+                crate::codex::ContextFile {
+                    path: "docs/plans/2026-10-27-chat-hierarchy.md".into(),
+                    kind: "file".into(),
+                },
+                crate::codex::ContextFile {
+                    path: "Cargo.toml".into(),
+                    kind: "file".into(),
+                },
+            ];
             panel.messages.push(ConversationMessage {
                 role: "Codex",
                 key: Some(("local-preview".into(), "fixture".into(), "reply".into())),

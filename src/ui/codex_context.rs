@@ -73,7 +73,122 @@ pub(super) struct ContextUi {
     preview_generation: u64,
     error: Option<String>,
 }
+/// Reported metadata only: opening a card is the sole trigger for reading a file.
+fn file_card(ui: &mut egui::Ui, file: &ContextFile, enabled: bool) -> bool {
+    let path = std::path::Path::new(&file.path);
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&file.path);
+    let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+    let kind = if extension.is_empty() {
+        file.kind.clone()
+    } else {
+        extension.to_ascii_uppercase()
+    };
+    let mut preview = false;
+    egui::Frame::new()
+        .fill(theme::colors(ui.visuals().dark_mode).raised)
+        .stroke(egui::Stroke::new(
+            1.0,
+            theme::colors(ui.visuals().dark_mode).border,
+        ))
+        .corner_radius(8)
+        .inner_margin(10)
+        .show(ui, |ui| {
+            ui.horizontal_top(|ui| {
+                let (_, icon_rect) = ui.allocate_space(egui::vec2(
+                    14.0,
+                    ui.text_style_height(&egui::TextStyle::Body),
+                ));
+                theme::image(ui, theme::Icon::Notes)
+                    .fit_to_exact_size(egui::Vec2::splat(14.0))
+                    .tint(theme::muted(ui))
+                    .paint_at(
+                        ui,
+                        egui::Rect::from_center_size(icon_rect.center(), egui::Vec2::splat(14.0)),
+                    );
+                let name = ui
+                    .add(egui::Label::new(egui::RichText::new(name).strong()).wrap())
+                    .on_hover_text(&file.path);
+                name.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &file.path)
+                });
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.weak(kind);
+                let button = ui.add_enabled(enabled, egui::Button::new("Preview"));
+                button.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button,
+                        enabled,
+                        format!("Preview {}", file.path),
+                    )
+                });
+                if button.has_focus() && !button.hovered() {
+                    egui::Tooltip::for_widget(&button).show(|ui| {
+                        ui.label(&file.path);
+                    });
+                }
+                preview = button.on_hover_text(&file.path).clicked();
+            });
+        });
+    preview
+}
+
 impl ContextUi {
+    fn file_cards(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        cwd: &std::path::Path,
+        limit: usize,
+    ) {
+        let mut open = None;
+        for file in self.files.iter().take(limit) {
+            ui.push_id(&file.path, |ui| {
+                if file_card(ui, file, !self.loading()) {
+                    open = Some(file.path.clone());
+                }
+            });
+        }
+        if let Some(path) = open {
+            let path = PathBuf::from(path);
+            self.open = true;
+            self.tab = 2;
+            self.load(
+                if path.is_absolute() {
+                    path
+                } else {
+                    cwd.join(path)
+                },
+                false,
+                ctx,
+            );
+        }
+    }
+    pub fn transcript_files(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        cwd: &std::path::Path,
+    ) {
+        if self.files.is_empty() {
+            return;
+        }
+        ui.add_space(8.0);
+        ui.strong("Files and artifacts");
+        ui.weak("Reported in this conversation");
+        self.file_cards(ui, ctx, cwd, 3);
+        if self.files.len() > 3
+            && ui
+                .button(format!("View all {} files", self.files.len()))
+                .clicked()
+        {
+            self.open = true;
+            self.tab = 2;
+        }
+    }
     pub fn open_goal_dialog(&mut self, prefill: String) {
         self.goal_dialog = Some(prefill.chars().take(4000).collect());
     }
@@ -568,9 +683,7 @@ impl ContextUi {
             }
             2=>{
                 if self.files.is_empty() {ui.weak("No files or images reported in loaded history.");}
-                let mut open=None;
-                for file in &self.files {if ui.button(&file.path).on_hover_text(&file.kind).clicked() {open=Some(file.path.clone());}}
-                if let Some(path)=open {let path=PathBuf::from(path);self.load(if path.is_absolute() {path} else {cwd.join(path)},false,ctx);}
+                self.file_cards(ui, ctx, cwd, usize::MAX);
                 if let Some((name,payload))=&mut self.preview {ui.separator();ui.weak(name.as_str());match payload {PreviewPayload::Text(text)=>{ui.add(egui::TextEdit::multiline(text).interactive(false).desired_width(f32::INFINITY));},PreviewPayload::Image(texture)=>{ui.add(egui::Image::new((texture.id(),texture.size_vec2())).max_width(ui.available_width()));}}}
             }
             _=>{

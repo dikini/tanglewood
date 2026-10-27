@@ -13,6 +13,23 @@ Required MVP increments 0–4 are delivered and independently reviewed, with act
 | Android text input | done | Framework Editable/InputConnection mirror; real AOSP preedit/commit/accent/emoji, selection, system cut/paste, cancel/handoff and exact Saved/kill/restart |
 | Delivery / review | done | Reproducible build/launch/configuration docs and capability table; scoped independent reviews and relevant integration checks |
 
+## Chat hierarchy follow-up (2026-10-27)
+
+Approved quiet presentation and bounded error handling: `plans/2026-10-27-chat-hierarchy.md`. Root owns integration and the shared index; the existing MVP scope remains complete.
+
+| Task | Owner / paths | State | Acceptance evidence |
+| --- | --- | --- | --- |
+| CH1 message/event/artifact presentation | developer; ui.rs, ui/codex_context.rs | done | Native wide/narrow hierarchy, explicit failures, bounded cards and real Preview |
+| CH2 structured error correction | root; codex.rs | done | Morning session causes and uncertainty reproduced; 16 parser/protocol tests pass |
+| CH3 integration / native evidence | root; docs/captures | done | 35 UI tests, build, scoped Clippy, formatting/diff checks; native Markdown/PNG Preview and View all |
+| CH4 independent review | reviewer; read-only | done | READY for frozen combined source and native evidence; no material findings |
+| CH5 topical icons | developer; root assets/docs | done | 14pt magnifier/wrench/terminal/document icons, native wide/narrow/disclosure/card checks, independent READY |
+
+Evidence and limits are recorded in the plan. Notes styling is committed at
+`f850060`; this chat follow-up is included in the Git commit containing this
+record. No new dependencies, bundled fonts or production polling loops were
+introduced.
+
 ## Final integration evidence
 
 `integration-evidence.md` records commands/results. Combined 15 domain/adapter scenarios passed before final LAN corrections; focused post-correction scenarios, final host build and real CLI smoke passed. The Android input fixture passed UTF-16/surrogate/session/coalescing/epoch/handoff/menu regressions. Combined host all-target Clippy (`gui,codex,lan`) and final formatting passed. Actual final x86_64 Rust+Java APK build passed; SHA-256 `7b2897d9fbbf46e7267164f573432e3c3b20bf8ba9f219f146210be53fdf0ddb`.
