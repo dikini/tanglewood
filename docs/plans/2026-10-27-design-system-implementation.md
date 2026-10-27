@@ -27,3 +27,10 @@ passed; formatting/diff clean. Native dark/light/touch and pullout evidence is i
 docs/design-system/adoption.md. Modal backdrop is an explicit implementation
 choice; mobile runtime validation remains deferred. Worktree attached. User-authorized unsigned commits separate the prerequisite
 foundation from the design-system increment; no merge or publication.
+
+## Finalization
+
+User-authorized fast-forward merge to main completed through `4e05aa5`. Source
+matches the reviewed implementation; post-merge formatting/diff checks passed.
+Worktree archival requested through the app; no push/publication. Unrelated local
+UX audit work and caches preserved. See docs/design-system/adoption.md.

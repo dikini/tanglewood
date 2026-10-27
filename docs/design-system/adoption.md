@@ -34,7 +34,8 @@
 Managed worktree: `/home/dikini/.codex/worktrees/design-system/tanglewood`.
 Branch: `codex/design-system`. Committed unsigned at the user’s request: the inherited
 research/Codex foundation is a separate prerequisite commit, followed by this
-design-system increment. No merge or publication performed.
+design-system increment. Both were fast-forwarded into main on 2026-10-27;
+no external publication performed.
 The worktree was seeded with the current checkout's tracked/untracked project
 files because HEAD predates the existing research/Codex work. Caches were excluded.
 That inherited uncommitted baseline is not part of this increment's authored diff.
@@ -92,3 +93,15 @@ not proven by desktop rendering. Mobile/sync delivery remains deferred. This is 
 initial adoption of shared contracts, not a claim that every legacy settings form
 or external PDF/output document is a fully tokenized component. No new tabs/docking
 framework, plugin UI, presentation editor or theme marketplace is introduced.
+
+## Final integration
+
+Merged into main through `4e05aa5`, preserving the separately committed prerequisite
+`e778b91`. Main source matched the reviewed worktree exactly; formatting and diff
+checks passed after integration. Prior focused tests/build remain applicable because
+merge introduced no source changes. Both commits are unsigned.
+
+Managed worktree archival requested after integration; the app returned queued.
+The task-only patch was preserved at `/tmp/tanglewood-design-system-final.patch`.
+Unrelated UX audit documents and local caches in the original checkout remain
+uncommitted and were not included or removed.
