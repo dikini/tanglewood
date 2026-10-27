@@ -163,7 +163,12 @@ fn prose_impl(
         None => super::theme::READING_FONT_SIZE,
     };
     let mut job = egui::text::LayoutJob::default();
-    job.wrap.max_width = ui.available_width().max(1.0);
+    job.wrap.max_width = if heading.is_none() {
+        ui.available_width().min(super::theme::READING_WIDTH)
+    } else {
+        ui.available_width()
+    }
+    .max(1.0);
     let mut emphasis = false;
     let mut strong = heading.is_some();
     let mut links = Vec::new();

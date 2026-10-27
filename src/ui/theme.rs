@@ -1,9 +1,10 @@
 //! Small application theme over native egui controls and trusted bundled assets.
 use eframe::egui;
 
-pub(super) const READING_WIDTH: f32 = 730.0;
+/// Maximum prose measure; responsive page gutters are added outside it.
+pub(super) const READING_WIDTH: f32 = 560.0;
 pub(super) const READING_FONT_SIZE: f32 = 16.0;
-pub(super) const READING_LINE_HEIGHT: f32 = 26.0;
+pub(super) const READING_LINE_HEIGHT: f32 = 29.0;
 pub(super) const HEADER_HEIGHT: f32 = 56.0;
 pub(super) const SIDEBAR_WIDTH: f32 = 228.0;
 pub(super) const CONTEXT_WIDTH: f32 = 260.0;

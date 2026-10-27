@@ -1929,7 +1929,8 @@ impl TanglewoodUi {
                 });
             egui::CentralPanel::default().frame(egui::Frame::new().fill(main_fill)).show(ctx,|ui| {
                 let document_scroll = egui::ScrollArea::vertical().id_salt("editor-scroll").auto_shrink([false,false]).show(ui,|ui| {
-                    let width=ui.available_width().min(theme::READING_WIDTH);
+                    // The contextual edit action reserves another 32 points beside the text.
+                    let width=ui.available_width().min(theme::READING_WIDTH + 32.0 + 2.0 * f32::from(plan.gutter()));
                     let margin=((ui.available_width()-width)*0.5).max(0.0);
                     ui.horizontal_top(|ui| {
                         ui.add_space(margin);

@@ -143,12 +143,21 @@ pub(super) fn source_editor(
         draft.conflict |= change.conflict;
     }
     let job = if inline {
-        let size = draft.inline_block().map_or(15.5, |block| match block.kind {
-            crate::markdown::BlockKind::Heading(1) => 28.0,
-            crate::markdown::BlockKind::Heading(2) => 23.0,
-            crate::markdown::BlockKind::Heading(_) => 19.0,
-            _ => 15.5,
+        let heading = draft.inline_block().and_then(|block| match block.kind {
+            crate::markdown::BlockKind::Heading(level) => Some(level),
+            _ => None,
         });
+        let size = match heading {
+            Some(1) => 28.0,
+            Some(2) => 23.0,
+            Some(_) => 19.0,
+            None => super::theme::READING_FONT_SIZE,
+        };
+        let line_height = if heading.is_some() {
+            (size * 1.3).max(27.0)
+        } else {
+            super::theme::READING_LINE_HEIGHT
+        };
         let mut job = egui::text::LayoutJob::simple(
             draft.text.clone(),
             egui::FontId::proportional(size),
@@ -156,7 +165,7 @@ pub(super) fn source_editor(
             ui.available_width(),
         );
         for section in &mut job.sections {
-            section.format.line_height = Some((size * 1.3).max(27.0));
+            section.format.line_height = Some(line_height);
         }
         job
     } else {

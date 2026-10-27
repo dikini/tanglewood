@@ -3212,7 +3212,7 @@ fn reader_layout_with_matches(
         ..Default::default()
     };
     let mut job = egui::text::LayoutJob::default();
-    job.wrap.max_width = width;
+    job.wrap.max_width = width.min(theme::READING_WIDTH).max(1.0);
     let mut end = 0;
     for range in reader_matches(text, query) {
         job.append(&text[end..range.start], 0.0, format.clone());
