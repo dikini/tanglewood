@@ -199,3 +199,24 @@ main and worktree/branch cleanup. No remote publication is included.
 | UM3 implementation and focused validation | model_flow_develop (GPT-6.1 Terra max) | done | ECS records and App-owned clients; bounded background polling; focused regressions and feature builds pass |
 | UM3a pure model/Connections widgets | model_picker_widgets (GPT-6.1 Terra max) | done | Pure renderer frozen, rustfmt passed; ownership handed to primary for integration, no standalone Cargo |
 | UM4 native acceptance and evidence | root | done with limits | Native fixture concurrent/targeted/reconnect/compact pass; real installed catalogs/search and normal close pass; docs/model-picker-evidence.md |
+
+## Wasmtime extension goal (2026-10-28)
+
+Delivered on `codex/wasmtime-wit-extensions`; this record is included in the
+unsigned implementation commit. See [guide](wasm-extensions.md),
+[plan](plans/2026-10-28-wasm-extensions.md) and
+[acceptance evidence](wasm-extensions-evidence.md).
+
+| Task | Owner / owned paths | State | Evidence / next action |
+| --- | --- | --- | --- |
+| W1 runtime/contracts | Terra 6.1 max; wit/, src/wasm_extensions.rs, runtime tests | done | Real compiled/Rhai calls, capability/resource/cancellation/isolation/recovery scenario; count-limit regression passed |
+| W2 guest examples/docs | Terra 6.1 max; examples/wasm-extensions/, build script, guide | done | Four locked guests build; guest formatting/strict Clippy and import inspection passed |
+| W3 integration | PM; Cargo.*, lib/main, CLI test, status/capabilities | done | Actual note imported/read through existing commands; both shipped Rhai scripts invoked without rebuilding |
+| W4 independent review | Sol 6.1 max; frozen combined changes | done | Count-error classification finding fixed and regression verified; final lint delta reviewed; no remaining material findings |
+| W5 acceptance | PM + runtime owner; integration evidence | done | Baseline serial 44 passed/1 ignored; 3 runtime/CLI scenarios passed; host/guest Clippy and scoped formatting passed |
+
+Limits: existing repository-wide formatting drift and an intermittent parallel
+baseline vault-lock failure are recorded in the evidence. Debug cold Rhai
+compilation takes about 50 seconds here and is outside the execution deadline.
+No Android or GUI-runtime claim; GUI controls, document-filter wiring and other
+interpreters remain outside this goal.

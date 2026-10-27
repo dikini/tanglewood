@@ -1,0 +1,24 @@
+// This test-only variant adds an unregistered import to the compiled world.
+package tanglewood:extensions@0.1.0;
+
+interface host {
+    enum log-level { debug, info, warn, error }
+    variant host-error { denied, unavailable, limit-exceeded }
+    record note { id: string, path: string, revision: string, text: string }
+    log: func(level: log-level, message: string) -> result<_, host-error>;
+    read-note: func() -> result<note, host-error>;
+}
+
+interface compiled {
+    run: func(input: string) -> result<string, string>;
+}
+
+interface unregistered {
+    ping: func();
+}
+
+world compiled-extension {
+    import host;
+    import unregistered;
+    export compiled;
+}

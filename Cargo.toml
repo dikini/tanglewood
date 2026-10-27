@@ -6,6 +6,7 @@ default-run = "tanglewood"
 
 [features]
 default = []
+wasm-extensions = ["dep:wasmtime", "dep:wasmtime-wasi"]
 gui = ["documents", "dep:eframe", "dep:jni", "dep:egui_extras", "dep:image", "dep:syntect"]
 sync = ["dep:automerge"]
 lan = ["sync", "dep:quinn", "dep:rustls", "dep:rcgen", "dep:sha2", "dep:tokio"]
@@ -16,6 +17,9 @@ kimi = ["conversation"]
 documents = ["dep:libc", "dep:sha2", "dep:yaml-rust2", "dep:quick-xml", "dep:png", "dep:regex", "dep:percent-encoding", "dep:flate2", "dep:crc32fast"]
 
 [dependencies]
+wasmtime = { version = "=47.0.4", optional = true, default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
+wasmtime-wasi = { version = "=47.0.4", optional = true, default-features = false, features = ["p2"] }
+log = "0.4"
 bevy_ecs = { version = "0.18", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
@@ -54,7 +58,6 @@ eframe = { version = "=0.33.3", optional = true, default-features = false, featu
 
 winit = { version = "0.30.13", default-features = false, features = ["android-native-activity"] }
 android_logger = "0.15.1"
-log = "0.4"
 
 [lib]
 crate-type = ["lib", "cdylib"]

@@ -1,0 +1,12 @@
+[package]
+name = "tanglewood-wasm-unauthorized-fixture"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen.workspace = true

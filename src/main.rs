@@ -11,6 +11,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let mut vault = None;
     let mut headless = false;
+    let mut wasm = WasmOptions::default();
     let mut startup = Vec::new();
     let mut mcp_path = None;
     let mut mcp_write = false;
@@ -31,6 +32,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 ))
             }
             "--headless" => headless = true,
+            "--wasm-component" => {
+                wasm.component = Some(PathBuf::from(
+                    args.next().ok_or("--wasm-component needs a path")?,
+                ));
+            }
+            "--wasm-script" => {
+                wasm.script = Some(PathBuf::from(
+                    args.next().ok_or("--wasm-script needs a path")?,
+                ));
+            }
+            "--wasm-input" => {
+                wasm.input = Some(args.next().ok_or("--wasm-input needs a string")?);
+            }
+            "--wasm-note" => {
+                wasm.note = Some(tanglewood::notes::NoteId(uuid::Uuid::parse_str(
+                    &args.next().ok_or("--wasm-note needs a note UUID")?,
+                )?));
+            }
             "--mcp-socket" => {
                 mcp_path = Some(PathBuf::from(
                     args.next().ok_or("--mcp-socket needs a path")?,
@@ -153,9 +172,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!(
                     "tanglewood [--vault DIRECTORY] [--headless] [--mirror|--no-mirror] [--rescan] [--enable-sync] [--import SOURCE NOTE_PATH] [--export NOTE_UUID DESTINATION] [--mcp-socket SOCKET] [--mcp-write] [--codex [--codex-cwd DIRECTORY] [--codex-resume THREAD]] [--kimi [--kimi-cwd DIRECTORY] [--kimi-resume SESSION]]\nHeadless mode opens the vault and lists note paths. Build with --features gui for the editor.\nLAN (--features lan): --prepare-join TICKET | --cancel-join | --lan-listen ADDRESS:PORT [--lan-advertise IP] | --lan-ticket | --confirm-peer TICKET | --connect-peer FINGERPRINT | --unpair-peer FINGERPRINT | --lan-status | --pause-lan | --resume-lan | --lan-serve. Startup actions run in argument order; use fixed ports for ticket exchange across restarts."
                 );
+                println!(
+                    "Wasm (--features wasm-extensions, --headless): --wasm-component PATH [--wasm-script SOURCE.rhai] [--wasm-input STRING] [--wasm-note NOTE_UUID]. Grants logging and read-only access to the selected note; interpreter mode is selected by --wasm-script."
+                );
                 return Ok(());
             }
             _ => return Err(format!("unknown argument: {arg}").into()),
+        }
+    }
+    if wasm.component.is_none()
+        && (wasm.script.is_some() || wasm.input.is_some() || wasm.note.is_some())
+    {
+        return Err("Wasm options require --wasm-component".into());
+    }
+    if wasm.component.is_some() {
+        if !cfg!(feature = "wasm-extensions") {
+            return Err("Wasm extensions require --features wasm-extensions".into());
+        }
+        if !headless {
+            return Err("--wasm-component requires --headless".into());
         }
     }
     if lan_requested && !cfg!(feature = "lan") {
@@ -288,6 +323,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             app.flush()?;
         }
     }
+    #[cfg(feature = "wasm-extensions")]
+    if wasm.component.is_some() {
+        let result = run_wasm_extension(&mut app, wasm);
+        // Flush accepted startup work even when the guest fails.
+        app.flush_files()?;
+        app.shutdown()?;
+        return result;
+    }
     #[cfg(all(target_os = "linux", feature = "mcp"))]
     let mut owner = mcp_path
         .map(|path| {
@@ -361,5 +404,82 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }),
         )?;
     }
+    Ok(())
+}
+
+#[derive(Default)]
+struct WasmOptions {
+    component: Option<PathBuf>,
+    script: Option<PathBuf>,
+    input: Option<String>,
+    note: Option<tanglewood::notes::NoteId>,
+}
+
+#[cfg(feature = "wasm-extensions")]
+fn run_wasm_extension(
+    app: &mut tanglewood::App,
+    options: WasmOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Read;
+    use tanglewood::commands::{Caller, Command, CommandResult};
+    use tanglewood::wasm_extensions::{Capabilities, Invocation, NoteSnapshot, Runtime};
+
+    let note = options
+        .note
+        .map(|id| {
+            let CommandResult::Note(view) =
+                app.execute(Command::ReadNote { id }, Caller::AutomationReadOnly)?
+            else {
+                return Err("unexpected read-note command result".into());
+            };
+            Ok::<_, Box<dyn std::error::Error>>(NoteSnapshot {
+                id: view.note.id.0.to_string(),
+                path: view.note.path,
+                revision: view.note.revision.0.to_string(),
+                text: view.note.text,
+            })
+        })
+        .transpose()?;
+    let input = options.input.unwrap_or_default();
+    let invocation = match options.script {
+        Some(path) => {
+            // Bound source reading before allocating; the runtime also validates its input.
+            const MAX_SCRIPT_BYTES: u64 = 1024 * 1024;
+            let mut source = String::new();
+            std::fs::File::open(path)?
+                .take(MAX_SCRIPT_BYTES + 1)
+                .read_to_string(&mut source)?;
+            if source.len() as u64 > MAX_SCRIPT_BYTES {
+                return Err("Wasm script exceeds 1 MiB".into());
+            }
+            Invocation::Interpreter { source, input }
+        }
+        None => Invocation::Compiled { input },
+    };
+    let runtime = Runtime::new();
+    let job = runtime.start(
+        options.component.ok_or("missing Wasm component")?,
+        invocation,
+        Capabilities { log: true, note },
+    )?;
+    let result = loop {
+        app.tick();
+        if let Some(result) = job.try_result() {
+            match result {
+                Ok(result) => break result,
+                Err(error) => {
+                    for diagnostic in job.diagnostics() {
+                        eprintln!("Wasm {:?}: {}", diagnostic.level, diagnostic.message);
+                    }
+                    return Err(error.into());
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    };
+    for diagnostic in result.diagnostics {
+        eprintln!("Wasm {:?}: {}", diagnostic.level, diagnostic.message);
+    }
+    println!("{}", result.output);
     Ok(())
 }

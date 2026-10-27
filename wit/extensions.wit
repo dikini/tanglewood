@@ -1,0 +1,36 @@
+package tanglewood:extensions@0.1.0;
+
+/// Capabilities explicitly provided for one invocation.
+interface host {
+    enum log-level { debug, info, warn, error }
+    variant host-error { denied, unavailable, limit-exceeded }
+
+    /// A bounded, immutable snapshot of one explicitly selected note.
+    record note {
+        id: string,
+        path: string,
+        revision: string,
+        text: string,
+    }
+
+    log: func(level: log-level, message: string) -> result<_, host-error>;
+    read-note: func() -> result<note, host-error>;
+}
+
+interface compiled {
+    run: func(input: string) -> result<string, string>;
+}
+
+interface interpreter {
+    evaluate: func(source: string, input: string) -> result<string, string>;
+}
+
+world compiled-extension {
+    import host;
+    export compiled;
+}
+
+world interpreter-extension {
+    import host;
+    export interpreter;
+}

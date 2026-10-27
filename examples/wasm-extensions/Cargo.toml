@@ -1,0 +1,15 @@
+[workspace]
+members = ["compiled", "rhai", "fixture", "unauthorized"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.94"
+publish = false
+
+[workspace.dependencies]
+wit-bindgen = "=0.61.1"
+
+[profile.release]
+opt-level = "s"
+strip = true

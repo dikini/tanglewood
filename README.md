@@ -6,6 +6,11 @@ and [capabilities](docs/capabilities.md).
 The minimal MVP-2 editor/filter increment is described in [the user guide](docs/mvp-2.md)
 and tracked separately in [MVP-2 status](docs/mvp-2-status.md).
 
+Optional [Wasm extensions](docs/wasm-extensions.md) run compiled Rust components
+or Rhai scripts inside Wasm, with explicitly granted note reads and bounded
+execution. Build with `--features wasm-extensions`; the guide includes both
+examples and their guest build commands.
+
 ## Development
 
 Rust 1.94.0 is pinned for reproducible host builds. The lockfile records

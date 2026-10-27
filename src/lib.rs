@@ -65,3 +65,6 @@ pub(crate) mod research_import;
 
 pub mod research_desktop;
 pub mod research_reader;
+
+#[cfg(feature = "wasm-extensions")]
+pub mod wasm_extensions;
