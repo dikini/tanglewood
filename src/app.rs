@@ -131,9 +131,22 @@ struct ConversationAttachmentJob {
     context_generation: u64,
     receiver: std::sync::mpsc::Receiver<Result<crate::conversation::PromptAttachment, String>>,
 }
+#[cfg(feature = "wasm-extensions")]
+#[derive(Clone)]
+struct ResearchPluginContext {
+    authority: crate::research_authority::ResearchAuthority,
+    guard: crate::research_assets::AssetGuard,
+    acquisitions: HashMap<Uuid, crate::research_authority::ResearchAuthority>,
+}
 /// The application thread exclusively owns the ECS World.
 #[derive(Default)]
 pub struct App {
+    #[cfg(feature = "wasm-extensions")]
+    plugin_jobs: Option<crate::plugin_jobs::PluginJobs>,
+    #[cfg(feature = "wasm-extensions")]
+    plugin_permission_epoch: u64,
+    #[cfg(feature = "wasm-extensions")]
+    research_plugin_context: Option<ResearchPluginContext>,
     automation_write_preference: Option<bool>,
     automation_permission_dirty: bool,
     automation_permission_error: Option<String>,
@@ -142,6 +155,8 @@ pub struct App {
     research_requests: HashMap<Uuid, Uuid>,
     research_assets: Option<crate::research_assets::ResearchAssetWorker>,
     research_receipts: HashMap<Uuid, (Uuid, crate::research::ResearchArtifact)>,
+    #[cfg(feature = "wasm-extensions")]
+    research_receipt_authorities: HashMap<Uuid, (crate::research::ArtifactInput, Option<crate::research_authority::ResearchAuthority>)>,
     research_paper_receipts: HashMap<Uuid, PaperReceipt>,
     acquisition_armed: std::collections::HashSet<Uuid>,
     acquisition_cancelled: std::collections::HashSet<Uuid>,
@@ -868,6 +883,11 @@ impl App {
                                         .id();
                                     self.ids.insert(id, entity);
                                 }
+                                #[cfg(feature = "wasm-extensions")]
+                                if let Some(jobs) = &mut self.plugin_jobs {
+                                    jobs.vault_generation = jobs.vault_generation.wrapping_add(1);
+                                    jobs.revoke_guards(None, false);
+                                }
                                 self.replica = Some(join.replica);
                                 self.durable_history = Some(join.bundle.clone());
                                 if let Err(error) = self.lan_state.joined(
@@ -1460,6 +1480,8 @@ impl App {
     }
     /// Drain and submit a bounded amount of work without blocking the owner.
     pub fn tick(&mut self) {
+        #[cfg(feature = "wasm-extensions")]
+        self.tick_plugins();
         #[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
         self.tick_conversations();
         for _ in 0..32 {
@@ -1612,6 +1634,13 @@ impl App {
     /// Close storage only after all accepted changes are acknowledged. On error
     /// keep the application and dirty records alive for recovery or retry.
     pub fn shutdown(&mut self) -> Result<(), StoreError> {
+        #[cfg(feature = "wasm-extensions")]
+        if let Some(jobs) = &mut self.plugin_jobs {
+            jobs.revoke_guards(None, false);
+            for run in jobs.runs.values() {
+                if let Some(job) = &run.job { job.cancel(); }
+            }
+        }
         self.flush()?;
         #[cfg(feature = "lan")]
         self.lan_state.pause();
@@ -1638,6 +1667,8 @@ impl App {
             {
                 self.io_status.remove(&id);
                 self.research_requests.remove(&id);
+                #[cfg(feature = "wasm-extensions")]
+                if !self.research_receipts.contains_key(&id) { self.research_receipt_authorities.remove(&id); }
             }
         }
         let request_id = Uuid::new_v4();
@@ -1649,13 +1680,20 @@ impl App {
         command: Command,
         caller: Caller,
     ) -> Result<CommandResult, CommandError> {
+        self.dispatch_command(command, Some(caller))
+    }
+    // None is reserved for a manifest-authorized local plugin, not a Local caller.
+    // Only the owner broker enters this path after checking the run's live grant.
+    fn dispatch_command(
+        &mut self, command: Command, caller: Option<Caller>,
+    ) -> Result<CommandResult, CommandError> {
         if !command.descriptor().available {
             return Err(CommandError::Unavailable(command.descriptor().name.into()));
         }
-        if !command.descriptor().allowed(caller) {
+        if caller.is_some_and(|caller| !command.descriptor().allowed(caller)) {
             return Err(CommandError::Unauthorized);
         }
-        if caller != Caller::Local {
+        if caller.is_some_and(|caller| caller != Caller::Local) {
             if let Command::Research(research) = &command {
                 let target = match research {
                     crate::research::ResearchCommand::RetryAcquisition { id, job_id, .. } => {
@@ -1718,6 +1756,8 @@ impl App {
             return Err(CommandError::Busy);
         }
         match command {
+            #[cfg(feature = "wasm-extensions")]
+            Command::Plugin(command) => self.execute_plugin_command(command, caller.ok_or(CommandError::Unauthorized)?),
             Command::SetAutomationWriteEnabled { enabled } => {
                 if self
                     .io_pending
@@ -1731,6 +1771,9 @@ impl App {
                 } else {
                     Uuid::new_v4()
                 };
+                #[cfg(feature = "wasm-extensions")]
+                { self.plugin_permission_epoch = self.plugin_permission_epoch.wrapping_add(1);
+                  if let Some(jobs) = &mut self.plugin_jobs { jobs.revoke_guards(None, true); } }
                 self.automation_permission_error = None;
                 if self.store.is_some() {
                     // Disable legacy startup grants as soon as any preference is requested.
@@ -2133,6 +2176,7 @@ impl App {
                 paper: None,
             });
             workspace.acquisitions.push(crate::research::Acquisition {
+                authority: None,
                 id: Uuid::new_v4(),
                 source_id,
                 input: crate::research::ArtifactInput::LocalFile { path },
@@ -2263,13 +2307,29 @@ impl App {
                     self.acquisition_armed.insert(job.id);
                 }
             } else if self.acquisition_armed.remove(&job.id) {
-                let result = self.execute_research(R::SavePaper {
-                    id: workspace.id,
-                    expected: workspace.revision,
-                    source_id: job.source_id,
-                    input: job.input,
-                    ocr: job.ocr,
-                });
+                #[cfg(feature = "wasm-extensions")]
+                let preparation = match &job.authority {
+                    Some(saved) => self.plugin_resume_context(saved, workspace.id, &job.input).map(Some),
+                    None => Ok(None),
+                };
+                #[cfg(not(feature = "wasm-extensions"))]
+                let preparation: Result<(), CommandError> = if job.authority.is_some() { Err(CommandError::Unavailable("plugin-created acquisition requires wasm-extensions and its registry".into())) } else { Ok(()) };
+                let result = match preparation {
+                    Err(error) => Err(error),
+                    Ok(context) => {
+                        #[cfg(not(feature = "wasm-extensions"))]
+                        let _ = context;
+                        #[cfg(feature = "wasm-extensions")]
+                        let previous = std::mem::replace(&mut self.research_plugin_context, context);
+                        let result = self.execute_research(R::SavePaper {
+                            id: workspace.id, expected: workspace.revision,
+                            source_id: job.source_id, input: job.input, ocr: job.ocr,
+                        });
+                        #[cfg(feature = "wasm-extensions")]
+                        { self.research_plugin_context = previous; }
+                        result
+                    }
+                };
                 match result {
                     Ok(CommandResult::Accepted { request_id }) => {
                         self.acquisition_requests
@@ -2695,6 +2755,7 @@ impl App {
                         continue;
                     };
                     workspace.acquisitions.push(crate::research::Acquisition {
+                authority: None,
                         id: Uuid::new_v4(),
                         source_id,
                         input: crate::research::ArtifactInput::Url { url, archive: true },
@@ -2775,6 +2836,7 @@ impl App {
                     return Err(CommandError::Busy);
                 }
                 workspace.acquisitions.push(crate::research::Acquisition {
+                authority: None,
                     id: Uuid::new_v4(),
                     source_id,
                     input,
@@ -2895,6 +2957,8 @@ impl App {
                     return Err(CommandError::Unavailable("open a vault first".into()));
                 };
                 if let Err(error) = worker.try_submit(crate::research_assets::AssetJob {
+                        #[cfg(feature = "wasm-extensions")]
+                        guard: self.research_plugin_context.as_ref().map(|context| context.guard.clone()),
                     request_id,
                     input: crate::research::ArtifactInput::Generated { spec },
                     extract_text: false,
@@ -2965,12 +3029,16 @@ impl App {
                 if self.research_assets.is_none() {
                     return Err(CommandError::Unavailable("open a vault first".into()));
                 }
+                #[cfg(feature = "wasm-extensions")]
+                let retained_input = plugin_receipt_input(&input);
                 let request_id = self.accept_io()?;
                 let result = self
                     .research_assets
                     .as_ref()
                     .ok_or_else(|| CommandError::Unavailable("open a vault first".into()))?
                     .try_submit(crate::research_assets::AssetJob {
+                        #[cfg(feature = "wasm-extensions")]
+                        guard: self.research_plugin_context.as_ref().map(|context| context.guard.clone()),
                         request_id,
                         input,
                         extract_text: false,
@@ -2980,6 +3048,8 @@ impl App {
                     self.io_status.remove(&request_id);
                     return Err(CommandError::Unavailable(error));
                 }
+                #[cfg(feature = "wasm-extensions")]
+                self.research_receipt_authorities.insert(request_id, (retained_input, self.research_plugin_context.as_ref().map(|context| context.authority.clone())));
                 self.research_error = None;
                 self.io_pending.insert(
                     request_id,
@@ -3034,9 +3104,13 @@ impl App {
                     .ok_or_else(|| CommandError::Unavailable("open a vault first".into()))?;
                 // Reserve only after confirming a worker exists, undo if submission fails.
                 let _ = worker;
+                #[cfg(feature = "wasm-extensions")]
+                let retained_input = plugin_receipt_input(&input);
                 let request_id = self.accept_io()?;
                 if let Err(error) = self.research_assets.as_ref().unwrap().try_submit(
                     crate::research_assets::AssetJob {
+                        #[cfg(feature = "wasm-extensions")]
+                        guard: self.research_plugin_context.as_ref().map(|context| context.guard.clone()),
                         request_id,
                         input,
                         extract_text: true,
@@ -3046,6 +3120,8 @@ impl App {
                     self.io_status.remove(&request_id);
                     return Err(CommandError::Unavailable(error));
                 }
+                #[cfg(feature = "wasm-extensions")]
+                self.research_receipt_authorities.insert(request_id, (retained_input, self.research_plugin_context.as_ref().map(|context| context.authority.clone())));
                 self.research_error = None;
                 self.io_pending.insert(
                     request_id,
@@ -3206,6 +3282,17 @@ impl App {
                 return Err(CommandError::InvalidResearch(
                     "invalid workspace mutation".into(),
                 ));
+            }
+        }
+        #[cfg(feature = "wasm-extensions")]
+        if let Some(context) = &self.research_plugin_context {
+            let previous = self.research.get(&workspace.id);
+            for job in &mut workspace.acquisitions {
+                if let Some(authority) = context.acquisitions.get(&job.id) {
+                    job.authority = Some(authority.clone());
+                } else if !previous.is_some_and(|old| old.acquisitions.iter().any(|old| old.id == job.id)) {
+                    job.authority = Some(context.authority.clone());
+                }
             }
         }
         crate::research::validate(&workspace)?;
@@ -6257,4 +6344,924 @@ mod conversation_owner_tests {
         tick_until(&mut app,|a|a.conversation_clients.is_empty()); drop(app); let _=fs::remove_dir_all(root);
     }
 
+}
+
+#[cfg(feature = "wasm-extensions")]
+impl App {
+    /// Startup-only local setup. Remote requests select installed IDs, never paths.
+    pub fn configure_plugin_registry(
+        &mut self,
+        root: &Path,
+        ids: &[String],
+    ) -> Result<(), CommandError> {
+        let root =
+            std::path::absolute(root).map_err(|e| CommandError::Unavailable(e.to_string()))?;
+        let mut registry = crate::plugin_registry::PluginRegistry::open(&root)
+            .map_err(|e| CommandError::Unavailable(e.to_string()))?;
+        let canonical =
+            std::fs::canonicalize(&root).map_err(|e| CommandError::Unavailable(e.to_string()))?;
+        if let Some(vault) = &self.vault_directory {
+            let vault = std::fs::canonicalize(vault)
+                .map_err(|e| CommandError::Unavailable(e.to_string()))?;
+            if canonical.starts_with(&vault) || vault.starts_with(&canonical) {
+                return Err(CommandError::Unavailable(
+                    "plugin registry and vault must not overlap".into(),
+                ));
+            }
+        }
+        let descriptor = std::sync::Arc::new(
+            registry
+                .root_descriptor()
+                .map_err(|e| CommandError::Unavailable(e.to_string()))?,
+        );
+        if let Some(files) = &self.files {
+            files
+                .protect_plugin_registry(descriptor.clone())
+                .map_err(|e| CommandError::Unavailable(e.to_string()))?;
+        }
+        for id in ids {
+            registry
+                .reload(id)
+                .map_err(|e| CommandError::Unavailable(e.to_string()))?;
+        }
+        let mut jobs = crate::plugin_jobs::PluginJobs::default();
+        jobs.registry = Some(registry);
+        jobs.registry_root = Some(canonical);
+        jobs.registry_guard = Some(descriptor);
+        jobs.permission_epoch = self.plugin_permission_epoch;
+        self.plugin_jobs = Some(jobs);
+        Ok(())
+    }
+    /// Local registry changes invalidate active bindings; a failed reload revokes too.
+    pub fn reload_plugin(&mut self, id: &str) -> Result<(), CommandError> {
+        let jobs = self
+            .plugin_jobs
+            .as_mut()
+            .ok_or_else(|| CommandError::Unavailable("plugin registry is not configured".into()))?;
+        jobs.revoke_guards(Some(id), false);
+        let result = jobs
+            .registry
+            .as_mut()
+            .ok_or(CommandError::NotFound)?
+            .reload(id);
+        jobs.poll_jobs();
+        result
+            .map(|_| ())
+            .map_err(|e| CommandError::Unavailable(e.to_string()))
+    }
+    pub fn revoke_plugin(&mut self, id: &str) {
+        if let Some(jobs) = &mut self.plugin_jobs {
+            jobs.revoke_guards(Some(id), false);
+            if let Some(registry) = &mut jobs.registry {
+                registry.revoke(id);
+            }
+            jobs.poll_jobs();
+        }
+    }
+    fn execute_plugin_command(
+        &mut self,
+        command: crate::plugin_jobs::PluginCommand,
+        caller: Caller,
+    ) -> Result<CommandResult, CommandError> {
+        use crate::plugin_jobs::{PluginCommand as P, PluginResult as R};
+        let writes = self.automation_write_preference.unwrap_or(true);
+        let jobs = self.plugin_jobs.get_or_insert_with(Default::default);
+        jobs.permission_epoch = self.plugin_permission_epoch;
+        let result = match command {
+            P::List => R::Plugins(
+                jobs.registry
+                    .as_ref()
+                    .map(|registry| {
+                        registry
+                            .list()
+                            .into_iter()
+                            .filter(|(_, manifest)| {
+                                manifest
+                                    .invocation
+                                    .allows(crate::plugin_jobs::origin(caller), false)
+                                    || manifest
+                                        .invocation
+                                        .allows(crate::plugin_jobs::origin(caller), true)
+                            })
+                            .map(|(generation, manifest)| {
+                                jobs.info(
+                                    &manifest,
+                                    generation,
+                                    crate::plugin_jobs::origin(caller),
+                                    writes,
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            ),
+            P::Describe { id } => {
+                let registry = jobs.registry.as_ref().ok_or(CommandError::NotFound)?;
+                let (generation, manifest) = registry
+                    .list()
+                    .into_iter()
+                    .find(|(_, manifest)| manifest.id == id)
+                    .ok_or(CommandError::NotFound)?;
+                if !manifest
+                    .invocation
+                    .allows(crate::plugin_jobs::origin(caller), false)
+                    && !manifest
+                        .invocation
+                        .allows(crate::plugin_jobs::origin(caller), true)
+                {
+                    return Err(CommandError::Unauthorized);
+                }
+                R::Info(jobs.info(
+                    &manifest,
+                    generation,
+                    crate::plugin_jobs::origin(caller),
+                    writes,
+                ))
+            }
+            P::Run { id, input } => R::Started {
+                run_id: jobs.start(
+                    &id,
+                    crate::wasm_extensions::Invocation::Compiled { input },
+                    caller,
+                )?,
+            },
+            P::Evaluate { id, source, input } => R::Started {
+                run_id: jobs.start(
+                    &id,
+                    crate::wasm_extensions::Invocation::Interpreter { source, input },
+                    caller,
+                )?,
+            },
+            P::Status { run_id } => R::Status(jobs.authorized_run(run_id, caller)?.status.clone()),
+            P::Cancel { run_id } => {
+                if let Some(job) = &jobs.authorized_run(run_id, caller)?.job {
+                    job.cancel();
+                }
+                R::CancelRequested { run_id }
+            }
+        };
+        Ok(CommandResult::Plugin(result))
+    }
+    fn plugin_request_valid(
+        jobs: &crate::plugin_jobs::PluginJobs,
+        request: &crate::plugin_jobs::Request,
+    ) -> bool {
+        use std::sync::atomic::Ordering;
+        jobs.runs.get(&request.run_id).is_some_and(|run| {
+            jobs.current(run)
+                && run.job.is_some()
+                && (run.binding.origin == crate::plugin_permissions::Origin::Local
+                    || run.permission_epoch == jobs.permission_epoch)
+        }) && !request.context.cancelled.load(Ordering::Acquire)
+            && Instant::now() < request.context.deadline
+    }
+    fn plugin_origin_caller(origin: crate::plugin_permissions::Origin) -> Option<Caller> {
+        use crate::plugin_permissions::Origin;
+        match origin {
+            Origin::Local => None,
+            Origin::AutomationReadOnly => Some(Caller::AutomationReadOnly),
+            Origin::AutomationReadWrite => Some(Caller::AutomationReadWrite),
+        }
+    }
+    fn plugin_authorize(
+        &self,
+        binding: &crate::plugin_registry::PluginBinding,
+        command: &Command,
+    ) -> Result<crate::plugin_permissions::Decision, crate::wasm_commands::host::CommandError> {
+        crate::plugin_permissions::authorize(
+            &binding.manifest.permissions.rules,
+            command,
+            binding.origin,
+            self.automation_write_preference.unwrap_or(true),
+        )
+        .map_err(|error| match error {
+            crate::plugin_permissions::PolicyError::Unavailable => {
+                crate::wasm_commands::host::CommandError::Unavailable(
+                    "command feature is unavailable".into(),
+                )
+            }
+            _ => crate::wasm_commands::host::CommandError::Unauthorized,
+        })
+    }
+    fn plugin_dispatch(
+        &mut self,
+        jobs: &mut crate::plugin_jobs::PluginJobs,
+        binding: &crate::plugin_registry::PluginBinding,
+        command: Command,
+    ) -> Result<CommandResult, crate::wasm_commands::host::CommandError> {
+        use crate::{
+            plugin_permissions::Decision,
+            wasm_commands::{self, host},
+        };
+        let decision = self.plugin_authorize(binding, &command)?;
+        match decision {
+            Decision::Direct => self
+                .dispatch_command(command, Self::plugin_origin_caller(binding.origin))
+                .map_err(wasm_commands::encode_error),
+            Decision::Guarded(guard) => match &command {
+                Command::ImportMarkdown { .. } | Command::ExportMarkdown { .. } => {
+                    let protected_registry = jobs
+                        .registry_guard
+                        .clone()
+                        .ok_or(host::CommandError::Unauthorized)?;
+                    let result = self
+                        .dispatch_command(command, Self::plugin_origin_caller(binding.origin))
+                        .map_err(wasm_commands::encode_error)?;
+                    let CommandResult::Accepted { request_id } = &result else {
+                        return Err(host::CommandError::Unavailable(
+                            "file command did not produce a receipt".into(),
+                        ));
+                    };
+                    for job in &mut self.file_jobs {
+                        let replacement = match job {
+                            FileJob::Import {
+                                request_id: id,
+                                path,
+                            } if id == request_id => Some(FileJob::GuardedImport {
+                                request_id: *id,
+                                path: path.clone(),
+                                guard: guard.clone(),
+                                protected_registry: protected_registry.clone(),
+                            }),
+                            FileJob::ExplicitExport {
+                                request_id: id,
+                                note,
+                                path,
+                            } if id == request_id => Some(FileJob::GuardedExplicitExport {
+                                request_id: *id,
+                                note: note.clone(),
+                                path: path.clone(),
+                                guard: guard.clone(),
+                                protected_registry: protected_registry.clone(),
+                            }),
+                            _ => None,
+                        };
+                        if let Some(replacement) = replacement {
+                            *job = replacement;
+                            return Ok(result);
+                        }
+                    }
+                    Err(host::CommandError::Unavailable(
+                        "guarded file job is missing".into(),
+                    ))
+                }
+                Command::Research(_) => {
+                    self.plugin_dispatch_research(jobs, binding, command, guard)
+                }
+                _ => Err(host::CommandError::Unauthorized),
+            },
+            Decision::ResolveSavedInputs(guard) => {
+                self.plugin_dispatch_research(jobs, binding, command, guard)
+            }
+        }
+    }
+    fn plugin_asset_guard(
+        jobs: &mut crate::plugin_jobs::PluginJobs,
+        authority: &crate::research_authority::ResearchAuthority,
+    ) -> Result<crate::research_assets::AssetGuard, CommandError> {
+        use std::sync::{Arc, atomic::AtomicBool};
+        jobs.asset_guards
+            .retain(|(_, _, token)| token.strong_count() > 0);
+        if jobs.asset_guards.len() >= 256 {
+            return Err(CommandError::Busy);
+        }
+        let revoked = Arc::new(AtomicBool::new(false));
+        jobs.asset_guards.push((
+            authority.plugin_id.clone(),
+            authority.origin,
+            Arc::downgrade(&revoked),
+        ));
+        Ok(crate::research_assets::AssetGuard {
+            guards: authority.guards.clone(),
+            protected_registry: jobs
+                .registry_guard
+                .clone()
+                .ok_or(CommandError::Unauthorized)?,
+            revoked,
+        })
+    }
+    fn plugin_saved_authority(
+        &self,
+        jobs: &crate::plugin_jobs::PluginJobs,
+        saved: &crate::research_authority::ResearchAuthority,
+        workspace: Uuid,
+        input: &crate::research::ArtifactInput,
+    ) -> Result<crate::research_authority::ResearchAuthority, CommandError> {
+        use crate::plugin_permissions::{self as policy, Guard, Scope};
+        let registry = jobs.registry.as_ref().ok_or(CommandError::Unauthorized)?;
+        let source = registry
+            .list()
+            .iter()
+            .find(|(_, manifest)| manifest.id == saved.plugin_id)
+            .map(|(_, manifest)| manifest.kind == crate::plugin_manifest::Kind::Interpreter)
+            .ok_or(CommandError::Unauthorized)?;
+        let binding = registry
+            .bind(
+                &saved.plugin_id,
+                saved.origin,
+                source,
+                jobs.vault_id,
+                jobs.vault_generation,
+            )
+            .map_err(|_| CommandError::Unauthorized)?;
+        if binding.manifest.component_sha256 != saved.component_sha256
+            || saved.guards.is_empty()
+            || saved.guards.len() > 32
+        {
+            return Err(CommandError::Unauthorized);
+        }
+        let mut authority = saved.clone();
+        for original in &saved.guards {
+            original
+                .rule
+                .validate()
+                .map_err(|_| CommandError::Unauthorized)?;
+            let scoped_workspace = match &original.rule.workspaces {
+                Some(Scope::All) => true,
+                Some(Scope::Only(ids)) => ids.contains(&workspace),
+                None => false,
+            };
+            if !scoped_workspace
+                || !policy::action_origin_allowed(
+                    original.rule.action,
+                    original.origin,
+                    self.automation_write_preference.unwrap_or(true),
+                )
+                || !policy::action_origin_allowed(
+                    original.rule.action,
+                    saved.origin,
+                    self.automation_write_preference.unwrap_or(true),
+                )
+            {
+                return Err(CommandError::Unauthorized);
+            }
+            policy::authorize_saved_input(original, input)
+                .map_err(|_| CommandError::Unauthorized)?;
+            // Select a complete current rule; scopes from different rules cannot be combined.
+            let current = binding
+                .manifest
+                .permissions
+                .rules
+                .iter()
+                .find(|rule| {
+                    rule.action == original.rule.action
+                        && rule.validate().is_ok()
+                        && (match &rule.workspaces {
+                            Some(Scope::All) => true,
+                            Some(Scope::Only(ids)) => ids.contains(&workspace),
+                            None => false,
+                        })
+                        && policy::authorize_saved_input(
+                            &Guard {
+                                rule: (*rule).clone(),
+                                origin: saved.origin,
+                            },
+                            input,
+                        )
+                        .is_ok()
+                })
+                .ok_or(CommandError::Unauthorized)?;
+            if !authority
+                .guards
+                .iter()
+                .any(|guard| guard.origin == saved.origin && guard.rule == *current)
+            {
+                if authority.guards.len() >= 32 {
+                    return Err(CommandError::Unauthorized);
+                }
+                authority.guards.push(Guard {
+                    rule: current.clone(),
+                    origin: saved.origin,
+                });
+            }
+        }
+        Ok(authority)
+    }
+    fn plugin_prepare_research(
+        &mut self,
+        jobs: &mut crate::plugin_jobs::PluginJobs,
+        binding: &crate::plugin_registry::PluginBinding,
+        command: &Command,
+        guard: crate::plugin_permissions::Guard,
+    ) -> Result<ResearchPluginContext, crate::wasm_commands::host::CommandError> {
+        use crate::{
+            research::{ArtifactInput, ResearchCommand as R},
+            wasm_commands::{self, host},
+        };
+        let Command::Research(research) = command else {
+            return Err(host::CommandError::Unauthorized);
+        };
+        let authority = crate::research_authority::ResearchAuthority {
+            plugin_id: binding.id.clone(),
+            component_sha256: binding.manifest.component_sha256.clone(),
+            origin: binding.origin,
+            guards: vec![guard.clone()],
+        };
+        let mut acquisitions = HashMap::new();
+        match research {
+            R::AcquireSources { id, source_ids, .. } => {
+                let workspace = self.research.get(id).ok_or(host::CommandError::NotFound)?;
+                for source_id in source_ids {
+                    let source = workspace
+                        .sources
+                        .iter()
+                        .find(|source| source.id == *source_id)
+                        .ok_or(host::CommandError::NotFound)?;
+                    if let Some(url) = &source.metadata.url {
+                        crate::plugin_permissions::authorize_saved_input(
+                            &guard,
+                            &ArtifactInput::Url {
+                                url: url.clone(),
+                                archive: true,
+                            },
+                        )
+                        .map_err(|_| host::CommandError::Unauthorized)?;
+                    }
+                }
+            }
+            R::RetryAcquisition { id, .. } | R::RetryAcquisitions { id, .. } => {
+                let workspace = self.research.get(id).ok_or(host::CommandError::NotFound)?;
+                let ids = match research {
+                    R::RetryAcquisition { job_id, .. } => vec![*job_id],
+                    R::RetryAcquisitions { job_ids, .. } => job_ids.clone(),
+                    _ => unreachable!(),
+                };
+                for id in ids {
+                    let job = workspace
+                        .acquisitions
+                        .iter()
+                        .find(|job| job.id == id)
+                        .ok_or(host::CommandError::NotFound)?;
+                    crate::plugin_permissions::authorize_saved_input(&guard, &job.input)
+                        .map_err(|_| host::CommandError::Unauthorized)?;
+                    let mut job_authority = authority.clone();
+                    if let Some(saved) = &job.authority {
+                        if saved.plugin_id != binding.id
+                            || saved.component_sha256 != binding.manifest.component_sha256
+                        {
+                            return Err(host::CommandError::Unauthorized);
+                        }
+                        job_authority = self
+                            .plugin_saved_authority(jobs, saved, workspace.id, &job.input)
+                            .map_err(wasm_commands::encode_error)?;
+                        use crate::plugin_permissions::Origin;
+                        job_authority.origin =
+                            match (job_authority.origin, binding.origin) {
+                                (Origin::AutomationReadOnly, _)
+                                | (_, Origin::AutomationReadOnly) => Origin::AutomationReadOnly,
+                                (Origin::AutomationReadWrite, _)
+                                | (_, Origin::AutomationReadWrite) => Origin::AutomationReadWrite,
+                                _ => Origin::Local,
+                            };
+
+                        if !job_authority
+                            .guards
+                            .iter()
+                            .any(|old| old.rule == guard.rule && old.origin == guard.origin)
+                        {
+                            job_authority.guards.push(guard.clone());
+                        }
+                        if job_authority.guards.len() > 32 {
+                            return Err(host::CommandError::Unauthorized);
+                        }
+                    }
+                    acquisitions.insert(id, job_authority);
+                }
+            }
+            // A retained receipt does not repeat network/file access. It is registered
+            // only inside its original workspace after domain provenance checks.
+            R::RetryArtifact { id, receipt_id, .. } => {
+                let (workspace, _) = self
+                    .research_receipts
+                    .get(receipt_id)
+                    .ok_or(host::CommandError::NotFound)?;
+                if workspace != id {
+                    return Err(host::CommandError::Unauthorized);
+                }
+                if let Some((input, saved)) = self.research_receipt_authorities.get(receipt_id) {
+                    crate::plugin_permissions::authorize_saved_input(&guard, input)
+                        .map_err(|_| host::CommandError::Unauthorized)?;
+                    if let Some(saved) = saved {
+                        if saved.plugin_id != binding.id
+                            || saved.component_sha256 != binding.manifest.component_sha256
+                        {
+                            return Err(host::CommandError::Unauthorized);
+                        }
+                        self.plugin_saved_authority(jobs, saved, *id, input)
+                            .map_err(wasm_commands::encode_error)?;
+                    }
+                } else {
+                    return Err(host::CommandError::Unauthorized);
+                }
+            }
+            _ => {}
+        }
+        // New acquisitions carry this authority in the same persisted workspace.
+        let asset_guard =
+            Self::plugin_asset_guard(jobs, &authority).map_err(wasm_commands::encode_error)?;
+        Ok(ResearchPluginContext {
+            authority,
+            guard: asset_guard,
+            acquisitions,
+        })
+    }
+    fn plugin_dispatch_research(
+        &mut self,
+        jobs: &mut crate::plugin_jobs::PluginJobs,
+        binding: &crate::plugin_registry::PluginBinding,
+        command: Command,
+        _guard: crate::plugin_permissions::Guard,
+    ) -> Result<CommandResult, crate::wasm_commands::host::CommandError> {
+        use crate::{
+            plugin_permissions::{self as policy, Decision},
+            wasm_commands::{self, host},
+        };
+        let mut selected = None;
+        // Saved resources must match one complete rule, including when an earlier
+        // rule has the same workspace but a different filesystem root or origin.
+        for rule in &binding.manifest.permissions.rules {
+            let decision = policy::authorize(
+                std::slice::from_ref(rule),
+                &command,
+                binding.origin,
+                self.automation_write_preference.unwrap_or(true),
+            );
+            let Ok(Decision::Guarded(guard) | Decision::ResolveSavedInputs(guard)) = decision
+            else {
+                continue;
+            };
+            match self.plugin_prepare_research(jobs, binding, &command, guard) {
+                Ok(context) => {
+                    selected = Some(context);
+                    break;
+                }
+                Err(host::CommandError::Unauthorized) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        let previous = self
+            .research_plugin_context
+            .replace(selected.ok_or(host::CommandError::Unauthorized)?);
+        let result = self
+            .dispatch_command(command, Self::plugin_origin_caller(binding.origin))
+            .map_err(wasm_commands::encode_error);
+        self.research_plugin_context = previous;
+        result
+    }
+    fn plugin_resume_context(
+        &mut self,
+        saved: &crate::research_authority::ResearchAuthority,
+        workspace: Uuid,
+        input: &crate::research::ArtifactInput,
+    ) -> Result<ResearchPluginContext, CommandError> {
+        let mut jobs = self.plugin_jobs.take().ok_or(CommandError::Unauthorized)?;
+        let result = (|| {
+            let authority = self.plugin_saved_authority(&jobs, saved, workspace, input)?;
+            let guard = Self::plugin_asset_guard(&mut jobs, &authority)?;
+            Ok(ResearchPluginContext {
+                authority,
+                guard,
+                acquisitions: HashMap::new(),
+            })
+        })();
+        self.plugin_jobs = Some(jobs);
+        result
+    }
+    fn plugin_reply_result(
+        jobs: &mut crate::plugin_jobs::PluginJobs,
+        run_id: Uuid,
+        command: Command,
+        result: CommandResult,
+        completion: crate::wasm_commands::host::Completion,
+        maximum: usize,
+    ) -> Result<crate::wasm_extensions::BridgeReceipt, crate::wasm_commands::host::CommandError>
+    {
+        use crate::wasm_commands::{self, host};
+        if wasm_commands::result_fits(&result, maximum) {
+            return Ok(crate::wasm_extensions::BridgeReceipt {
+                completion,
+                value: result,
+            });
+        }
+        let run = jobs
+            .runs
+            .get_mut(&run_id)
+            .ok_or(host::CommandError::Expired)?;
+        if run.results.len() >= 4 {
+            return Err(host::CommandError::Busy);
+        }
+        let cursor = wasm_commands::QueryCursor::new(&command, &result);
+        let retained = if cursor.is_none() {
+            Some(wasm_commands::RetainedResult::new(
+                result,
+                crate::plugin_jobs::MAX_RETAINED_BYTES / 4,
+            )?)
+        } else {
+            None
+        };
+        let token = Uuid::new_v4().to_string();
+        run.results.insert(
+            token.clone(),
+            crate::plugin_jobs::SavedResult {
+                command,
+                cursor,
+                retained,
+            },
+        );
+        Err(host::CommandError::TooLarge(host::Oversized {
+            token,
+            completion,
+        }))
+    }
+    fn tick_plugins(&mut self) {
+        use crate::{
+            plugin_jobs::{Operation, PendingReceipt, Reply},
+            wasm_commands::{self, host},
+        };
+        let Some(mut jobs) = self.plugin_jobs.take() else {
+            return;
+        };
+        if jobs.permission_epoch != self.plugin_permission_epoch {
+            jobs.revoke_guards(None, true);
+        }
+        jobs.permission_epoch = self.plugin_permission_epoch;
+        jobs.poll_jobs();
+        let pending = std::mem::take(&mut jobs.pending);
+        for pending in pending {
+            if !Self::plugin_request_valid(&jobs, &pending.request) {
+                if let Some(index) = pending.effect_index {
+                    if let Some(receipt) = jobs
+                        .runs
+                        .get_mut(&pending.request.run_id)
+                        .and_then(|run| run.status.receipts.get_mut(index))
+                    {
+                        receipt.completion = "unknown".into();
+                        receipt.error = Some(
+                            "guest stopped after acceptance; inspect domain state before retry"
+                                .into(),
+                        );
+                    }
+                }
+                let _ = pending
+                    .request
+                    .reply
+                    .try_send(Reply::Receipt(Err(host::CommandError::Cancelled)));
+                continue;
+            }
+            match crate::command_receipts::confirm(self, &pending.result) {
+                crate::command_receipts::Confirmation::Pending => jobs.pending.push(pending),
+                crate::command_receipts::Confirmation::Unknown(error) => {
+                    if let Some(index) = pending.effect_index {
+                        if let Some(receipt) = jobs
+                            .runs
+                            .get_mut(&pending.request.run_id)
+                            .and_then(|run| run.status.receipts.get_mut(index))
+                        {
+                            receipt.completion = "unknown".into();
+                            receipt.error = Some(error.clone());
+                        }
+                    }
+                    let _ = pending
+                        .request
+                        .reply
+                        .try_send(Reply::Receipt(Err(host::CommandError::Unavailable(error))));
+                }
+                crate::command_receipts::Confirmation::Completed(result) => {
+                    let persisted = pending.command.waits_for_persistence();
+                    if let Some(index) = pending.effect_index {
+                        if let Some(receipt) = jobs
+                            .runs
+                            .get_mut(&pending.request.run_id)
+                            .and_then(|run| run.status.receipts.get_mut(index))
+                        {
+                            receipt.completion =
+                                if persisted { "persisted" } else { "completed" }.into();
+                        }
+                    }
+                    let reply = Self::plugin_reply_result(
+                        &mut jobs,
+                        pending.request.run_id,
+                        pending.command,
+                        result,
+                        if persisted {
+                            host::Completion::Persisted
+                        } else {
+                            host::Completion::Accepted
+                        },
+                        pending.request.context.max_result_bytes,
+                    );
+                    let _ = pending.request.reply.try_send(Reply::Receipt(reply));
+                }
+            }
+        }
+        for _ in 0..16 {
+            let Ok(request) = jobs.receive.try_recv() else {
+                break;
+            };
+            if !Self::plugin_request_valid(&jobs, &request) {
+                let error = match request.operation {
+                    Operation::Execute(_) => Reply::Receipt(Err(host::CommandError::Cancelled)),
+                    Operation::ReadResult { .. } => Reply::Node(Err(host::CommandError::Cancelled)),
+                    Operation::Capabilities => {
+                        Reply::Capabilities(Err(host::CommandError::Cancelled))
+                    }
+                };
+                let _ = request.reply.try_send(error);
+                continue;
+            }
+            let binding = jobs.runs[&request.run_id].binding.clone();
+            match &request.operation {
+                Operation::Capabilities => {
+                    let rules = crate::plugin_permissions::effective_rules(
+                        &binding.manifest.permissions.rules,
+                        binding.origin,
+                        self.automation_write_preference.unwrap_or(true),
+                    );
+                    let _ = request.reply.try_send(Reply::Capabilities(Ok(rules
+                        .into_iter()
+                        .map(plugin_wire_capability)
+                        .collect())));
+                }
+                Operation::ReadResult {
+                    token,
+                    path,
+                    offset,
+                    limit,
+                } => {
+                    let result = (|| {
+                        let saved = jobs
+                            .runs
+                            .get(&request.run_id)
+                            .and_then(|run| run.results.get(token))
+                            .ok_or(host::CommandError::Expired)?;
+                        self.plugin_authorize(&binding, &saved.command)?;
+                        if let Some(retained) = &saved.retained {
+                            return retained.read(path.clone(), *offset, *limit);
+                        }
+                        let cursor = saved.cursor.as_ref().ok_or(host::CommandError::Expired)?;
+                        let fresh = match &cursor.source {
+                            wasm_commands::CursorSource::Query(command) => self
+                                .dispatch_command(
+                                    command.clone(),
+                                    Self::plugin_origin_caller(binding.origin),
+                                )
+                                .map_err(wasm_commands::encode_error)?,
+                            wasm_commands::CursorSource::Note { id, .. } => CommandResult::Note(
+                                self.note(*id).map_err(wasm_commands::encode_error)?,
+                            ),
+                        };
+                        let fresh = cursor.verify(fresh)?;
+                        wasm_commands::project_result(&fresh, path, *offset, *limit)
+                    })();
+                    let _ = request.reply.try_send(Reply::Node(result));
+                }
+                Operation::Execute(command) => {
+                    let command = command.clone();
+                    if command.effect().records_effect()
+                        && jobs.runs[&request.run_id].downstream_jobs
+                            >= binding.manifest.limits.capped().max_downstream_jobs
+                    {
+                        let _ = request
+                            .reply
+                            .try_send(Reply::Receipt(Err(host::CommandError::Busy)));
+                        continue;
+                    }
+                    let result = self.plugin_dispatch(&mut jobs, &binding, command.clone());
+                    match result {
+                        Err(error) => {
+                            let _ = request.reply.try_send(Reply::Receipt(Err(error)));
+                        }
+                        Ok(result) => {
+                            let effect_index = if command.effect().records_effect() {
+                                let run =
+                                    jobs.runs.get_mut(&request.run_id).expect("validated run");
+                                run.downstream_jobs += 1;
+                                let index = run.status.receipts.len();
+                                let (note_id, revision, request_id) = match &result {
+                                    CommandResult::Note(note) => {
+                                        (Some(note.note.id.0), Some(note.note.revision.0), None)
+                                    }
+                                    CommandResult::Accepted { request_id } => {
+                                        (None, None, Some(*request_id))
+                                    }
+                                    _ => (None, None, None),
+                                };
+                                run.status.receipts.push(crate::plugin_jobs::EffectReceipt {
+                                    command: crate::plugin_permissions::action(&command)
+                                        .map(|action| action.name())
+                                        .unwrap_or("unknown")
+                                        .into(),
+                                    note_id,
+                                    revision,
+                                    request_id,
+                                    completion: "accepted".into(),
+                                    error: None,
+                                });
+                                Some(index)
+                            } else {
+                                None
+                            };
+                            if command.waits_for_completion()
+                                && self.store.is_some()
+                                && matches!(
+                                    result,
+                                    CommandResult::Note(_) | CommandResult::Accepted { .. }
+                                )
+                            {
+                                jobs.pending.push(PendingReceipt {
+                                    request,
+                                    command,
+                                    result,
+                                    effect_index,
+                                });
+                            } else {
+                                let reply = Self::plugin_reply_result(
+                                    &mut jobs,
+                                    request.run_id,
+                                    command,
+                                    result,
+                                    host::Completion::Accepted,
+                                    request.context.max_result_bytes,
+                                );
+                                let _ = request.reply.try_send(Reply::Receipt(reply));
+                            }
+                        }
+                    }
+                }
+            }
+            if jobs.permission_epoch != self.plugin_permission_epoch {
+                jobs.revoke_guards(None, true);
+            }
+            jobs.permission_epoch = self.plugin_permission_epoch;
+        }
+        self.plugin_jobs = Some(jobs);
+    }
+}
+
+#[cfg(feature = "wasm-extensions")]
+fn plugin_wire_capability(
+    rule: crate::plugin_permissions::Rule,
+) -> crate::wasm_commands::host::Capability {
+    use crate::{
+        plugin_permissions::{InputKind, Scope},
+        wasm_commands::host,
+    };
+    fn scope<T: std::fmt::Display>(scope: Option<Scope<T>>) -> Option<host::Scope> {
+        scope.map(|value| match value {
+            Scope::All => host::Scope::All,
+            Scope::Only(values) => {
+                host::Scope::Only(values.into_iter().map(|value| value.to_string()).collect())
+            }
+        })
+    }
+    host::Capability {
+        name: rule.action.name().into(),
+        notes: scope(rule.notes),
+        workspaces: scope(rule.workspaces),
+        note_paths: scope(rule.note_paths),
+        filesystem_roots: rule.filesystem_roots.map(|value| match value {
+            Scope::All => host::Scope::All,
+            Scope::Only(values) => host::Scope::Only(
+                values
+                    .into_iter()
+                    .map(|value| value.to_string_lossy().into_owned())
+                    .collect(),
+            ),
+        }),
+        url_origins: scope(rule.url_origins),
+        administrative_targets: scope(rule.administrative_targets),
+        input_kinds: rule.input_kinds.map(|values| {
+            values
+                .into_iter()
+                .map(|value| match value {
+                    InputKind::LocalFile => host::InputKind::LocalFile,
+                    InputKind::UrlArchive => host::InputKind::UrlArchive,
+                    InputKind::UrlReference => host::InputKind::UrlReference,
+                    InputKind::Generated => host::InputKind::Generated,
+                    InputKind::Markdown => host::InputKind::Markdown,
+                })
+                .collect()
+        }),
+        human: rule.human,
+    }
+}
+
+#[cfg(feature = "wasm-extensions")]
+fn plugin_receipt_input(input: &crate::research::ArtifactInput) -> crate::research::ArtifactInput {
+    use crate::research::ArtifactInput as I;
+    match input {
+        I::Generated { spec } => I::Generated {
+            spec: crate::research_desktop::OutputSpec {
+                source_urls: Default::default(),
+                title: String::new(),
+                kind: spec.kind.clone(),
+                cards: Vec::new(),
+            },
+        },
+        I::Markdown { .. } => I::Markdown {
+            markdown: String::new(),
+            url: None,
+        },
+        other => other.clone(),
+    }
 }

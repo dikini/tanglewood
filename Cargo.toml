@@ -6,7 +6,7 @@ default-run = "tanglewood"
 
 [features]
 default = []
-wasm-extensions = ["dep:wasmtime", "dep:wasmtime-wasi"]
+wasm-extensions = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:sha2", "dep:libc"]
 gui = ["documents", "dep:eframe", "dep:jni", "dep:egui_extras", "dep:image", "dep:syntect"]
 sync = ["dep:automerge"]
 lan = ["sync", "dep:quinn", "dep:rustls", "dep:rcgen", "dep:sha2", "dep:tokio"]

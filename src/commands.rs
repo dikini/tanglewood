@@ -39,6 +39,8 @@ pub enum ImportDestination {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub enum Command {
+    #[cfg(feature = "wasm-extensions")]
+    Plugin(crate::plugin_jobs::PluginCommand),
     Research(crate::research::ResearchCommand),
     GetCodexProject,
     SetAutomationWriteEnabled {
@@ -311,8 +313,47 @@ impl CommandDescriptor {
             && !(self.mutation && caller == Caller::AutomationReadOnly)
     }
 }
+/// Dispatch effect and completion are separate from caller authorization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandEffect {
+    Query,
+    Action,
+    Mutation,
+    Program,
+    Control,
+}
+/// A completed domain I/O receipt is not always a durable storage receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandCompletion {
+    Immediate,
+    Io,
+    Persistence,
+}
+impl CommandEffect {
+    pub fn records_effect(self) -> bool {
+        matches!(self, Self::Action | Self::Mutation)
+    }
+}
 impl Command {
     pub fn descriptor(&self) -> CommandDescriptor {
+        #[cfg(feature = "wasm-extensions")]
+        if let Self::Plugin(command) = self {
+            use crate::plugin_jobs::PluginCommand as P;
+            return CommandDescriptor {
+                name: match command {
+                    P::List => "plugin.list",
+                    P::Describe { .. } => "plugin.describe",
+                    P::Run { .. } => "plugin.run",
+                    P::Evaluate { .. } => "plugin.evaluate",
+                    P::Status { .. } => "plugin.status",
+                    P::Cancel { .. } => "plugin.cancel",
+                },
+                wire_variant: "Plugin",
+                available: true,
+                mutation: false,
+                local_only: false,
+            };
+        }
         if let Self::Research(command) = self {
             return CommandDescriptor {
                 mutation: command.is_mutation(),
@@ -340,6 +381,8 @@ impl Command {
             };
         }
         let index = match self {
+            #[cfg(feature = "wasm-extensions")]
+            Self::Plugin(_) => unreachable!("plugin descriptors returned above"),
             Self::Research(_) => 24,
             Self::SetAutomationWriteEnabled { .. } => 25,
             Self::ListenLan { .. } => 0,
@@ -371,13 +414,79 @@ impl Command {
         COMMANDS[index]
     }
     pub fn automation_variants(caller: Caller) -> Vec<(&'static str, &'static str)> {
-        COMMANDS
+        #[allow(unused_mut)]
+        let mut commands: Vec<_> = COMMANDS
             .iter()
             .filter(|descriptor| descriptor.allowed(caller) && !descriptor.local_only)
             .map(|descriptor| (descriptor.wire_variant, descriptor.name))
-            .collect()
+            .collect();
+        #[cfg(feature = "wasm-extensions")]
+        commands.extend([
+            ("Plugin", "plugin.list"),
+            ("Plugin", "plugin.describe"),
+            ("Plugin", "plugin.run"),
+            ("Plugin", "plugin.evaluate"),
+            ("Plugin", "plugin.status"),
+            ("Plugin", "plugin.cancel"),
+        ]);
+        commands
+    }
+    /// Program execution and run control never enter the non-mutating read tool.
+    pub fn is_query(&self) -> bool {
+        #[cfg(feature = "wasm-extensions")]
+        if let Self::Plugin(command) = self {
+            return command.is_query();
+        }
+        self.descriptor().allowed(Caller::AutomationReadOnly)
+    }
+    pub fn effect(&self) -> CommandEffect {
+        use CommandEffect as E;
+        match self {
+            #[cfg(feature = "wasm-extensions")]
+            Self::Plugin(command) => match command {
+                crate::plugin_jobs::PluginCommand::Run { .. }
+                | crate::plugin_jobs::PluginCommand::Evaluate { .. } => E::Program,
+                crate::plugin_jobs::PluginCommand::Cancel { .. } => E::Control,
+                _ => E::Query,
+            },
+            Self::ReadNote { .. }
+            | Self::SearchNotes { .. }
+            | Self::GetCodexProject
+            | Self::GetLanTicket
+            | Self::GetLanStatus => E::Query,
+            Self::ExportMarkdown { .. }
+            | Self::ListenLan { .. }
+            | Self::ConnectPeer { .. }
+            | Self::PauseLan
+            | Self::ResumeLan => E::Action,
+            Self::Research(command) if !command.is_mutation() => E::Query,
+            _ => E::Mutation,
+        }
+    }
+    pub fn completion(&self) -> CommandCompletion {
+        use CommandCompletion as C;
+        match self {
+            Self::ListenLan { .. }
+            | Self::ConnectPeer { .. }
+            | Self::PauseLan
+            | Self::ResumeLan => C::Immediate,
+            Self::ImportMarkdown { .. } | Self::RescanMirror => C::Io,
+            _ if self.effect().records_effect() => C::Persistence,
+            _ => C::Immediate,
+        }
+    }
+    /// Outer run admission and volatile controls reply immediately.
+    pub fn waits_for_completion(&self) -> bool {
+        self.completion() != CommandCompletion::Immediate
+    }
+    pub fn waits_for_persistence(&self) -> bool {
+        self.completion() == CommandCompletion::Persistence
     }
     pub fn is_mutation(&self) -> bool {
+        #[cfg(feature = "wasm-extensions")]
+        if matches!(self, Self::Plugin(_)) {
+            return false;
+        }
         if let Self::Research(command) = self {
             return command.is_mutation();
         }
@@ -389,11 +498,17 @@ impl Command {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum CommandResult {
+    #[cfg(feature = "wasm-extensions")]
+    Plugin(crate::plugin_jobs::PluginResult),
     Research(crate::research::ResearchResult),
     CodexProject(Option<CodexProjectBinding>),
-    LanTicket { ticket: String },
+    LanTicket {
+        ticket: String,
+    },
     LanStatus(LanStatus),
-    Accepted { request_id: uuid::Uuid },
+    Accepted {
+        request_id: uuid::Uuid,
+    },
     Note(NoteView),
     Notes(Vec<NoteView>),
 }
@@ -445,5 +560,54 @@ mod paper_policy_tests {
         let local: Command = serde_json::from_value(local).unwrap();
         assert!(local.descriptor().allowed(Caller::Local));
         assert!(!local.descriptor().allowed(Caller::AutomationReadWrite));
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+    #[test]
+    fn receipt_completion_distinguishes_volatile_io_and_durable_effects() {
+        for command in [
+            Command::PauseLan,
+            Command::ResumeLan,
+            Command::ConnectPeer {
+                fingerprint: "peer".into(),
+            },
+            Command::ListenLan {
+                bind: "127.0.0.1:0".into(),
+                advertised_ip: None,
+            },
+        ] {
+            assert!(command.effect().records_effect());
+            assert!(!command.waits_for_completion());
+            assert!(!command.waits_for_persistence());
+        }
+        for command in [
+            Command::RescanMirror,
+            Command::ImportMarkdown {
+                source_path: "/tmp/input.md".into(),
+                destination: ImportDestination::Create {
+                    path: "note.md".into(),
+                },
+            },
+        ] {
+            assert!(command.waits_for_completion());
+            assert!(!command.waits_for_persistence());
+        }
+        for command in [
+            Command::CreateNote {
+                path: "note.md".into(),
+                text: String::new(),
+            },
+            Command::SetMirrorEnabled { enabled: true },
+            Command::Research(crate::research::ResearchCommand::Create {
+                title: "research".into(),
+                question: String::new(),
+            }),
+        ] {
+            assert!(command.waits_for_completion());
+            assert!(command.waits_for_persistence());
+        }
     }
 }

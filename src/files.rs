@@ -59,6 +59,21 @@ pub enum FileJob {
     Rescan {
         request_id: Uuid,
     },
+    #[cfg(feature = "wasm-extensions")]
+    GuardedImport {
+        request_id: Uuid,
+        path: PathBuf,
+        guard: crate::plugin_permissions::Guard,
+        protected_registry: std::sync::Arc<fs::File>,
+    },
+    #[cfg(feature = "wasm-extensions")]
+    GuardedExplicitExport {
+        request_id: Uuid,
+        note: NoteRecord,
+        path: PathBuf,
+        guard: crate::plugin_permissions::Guard,
+        protected_registry: std::sync::Arc<fs::File>,
+    },
 }
 #[derive(Debug)]
 pub enum FileCompletion {
@@ -92,6 +107,10 @@ pub struct FileWorker {
     jobs: Option<SyncSender<FileJob>>,
     worker: Option<thread::JoinHandle<()>>,
     completions: Receiver<FileCompletion>,
+    #[cfg(feature = "wasm-extensions")]
+    protected_registry: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<fs::File>>>>,
+    #[cfg(feature = "wasm-extensions")]
+    vault_root: PathBuf,
 }
 impl FileWorker {
     pub fn open(root: &Path) -> Result<Self, FileError> {
@@ -102,10 +121,19 @@ impl FileWorker {
         let root = fs::canonicalize(root).map_err(io)?;
         let (jobs, receiver) = mpsc::sync_channel(16);
         let (results, completions) = mpsc::sync_channel(16);
+        #[cfg(feature = "wasm-extensions")]
+        let vault_root = root.clone();
+        #[cfg(feature = "wasm-extensions")]
+        let protected_registry =
+            std::sync::Arc::new(std::sync::Mutex::new(None::<std::sync::Arc<fs::File>>));
+        #[cfg(feature = "wasm-extensions")]
+        let worker_protection = protected_registry.clone();
         let worker = thread::Builder::new()
             .name("tanglewood-files".into())
             .spawn(move || {
                 while let Ok(job) = receiver.recv() {
+                    #[cfg(feature = "wasm-extensions")]
+                    let protection = worker_protection.lock();
                     let result = match job {
                         FileJob::RetainConflict { note, path } => {
                             let result = read(&root, &path)
@@ -116,11 +144,25 @@ impl FileWorker {
                                 result,
                             }
                         }
-                        FileJob::Export(job) => FileCompletion::Export {
-                            id: job.note.id,
-                            revision: job.note.revision,
-                            result: export(&root, &job),
-                        },
+                        FileJob::Export(job) => {
+                            #[cfg(feature = "wasm-extensions")]
+                            let result = match &protection {
+                                Ok(protection) => match protection.as_ref() {
+                                    Some(registry) => {
+                                        crate::plugin_io::mirror_export(&root, &job, registry)
+                                    }
+                                    None => export(&root, &job),
+                                },
+                                Err(_) => Err(io("plugin registry protection lock poisoned")),
+                            };
+                            #[cfg(not(feature = "wasm-extensions"))]
+                            let result = export(&root, &job);
+                            FileCompletion::Export {
+                                id: job.note.id,
+                                revision: job.note.revision,
+                                result,
+                            }
+                        }
                         FileJob::Import { request_id, path } => FileCompletion::Import {
                             request_id,
                             result: fs::read_to_string(path).map_err(io),
@@ -143,6 +185,29 @@ impl FileWorker {
                                 let mut note = note;
                                 note.path = relative.to_owned();
                                 note.trashed = false;
+                                #[cfg(feature = "wasm-extensions")]
+                                {
+                                    match &protection {
+                                        Ok(protection) => {
+                                            if let Some(registry) = protection.as_ref() {
+                                                if !valid_path(relative) {
+                                                    return Err(FileError::InvalidPath);
+                                                }
+                                                return crate::plugin_io::export(
+                                                    &root.join(relative),
+                                                    &note.text,
+                                                    &crate::plugin_permissions::Scope::All,
+                                                    registry,
+                                                );
+                                            }
+                                        }
+                                        Err(_) => {
+                                            return Err(io(
+                                                "plugin registry protection lock poisoned",
+                                            ));
+                                        }
+                                    }
+                                }
                                 export(
                                     &root,
                                     &ExportJob {
@@ -158,7 +223,85 @@ impl FileWorker {
                             request_id,
                             result: rescan(&root),
                         },
+                        #[cfg(feature = "wasm-extensions")]
+                        FileJob::GuardedImport {
+                            request_id,
+                            path,
+                            guard,
+                            protected_registry,
+                        } => {
+                            let result = (|| {
+                                if guard.rule.action
+                                    != crate::plugin_permissions::Action::MarkdownImport
+                                {
+                                    return Err(FileError::InvalidPath);
+                                }
+                                let configured = protection
+                                    .as_ref()
+                                    .map_err(|_| io("plugin registry protection lock poisoned"))?
+                                    .as_ref()
+                                    .ok_or_else(|| {
+                                        io("plugin registry protection is not configured")
+                                    })?;
+                                if !crate::plugin_io::same_directory(
+                                    configured,
+                                    &protected_registry,
+                                )? {
+                                    return Err(io("plugin registry protection changed"));
+                                }
+                                crate::plugin_io::read(&path, &guard, configured)
+                            })();
+                            FileCompletion::Import { request_id, result }
+                        }
+                        #[cfg(feature = "wasm-extensions")]
+                        FileJob::GuardedExplicitExport {
+                            request_id,
+                            note,
+                            path,
+                            guard,
+                            protected_registry,
+                        } => {
+                            let result = (|| {
+                                if guard.rule.action
+                                    != crate::plugin_permissions::Action::MarkdownExport
+                                    || !guard.rule.notes.as_ref().is_some_and(|scope| match scope {
+                                        crate::plugin_permissions::Scope::All => true,
+                                        crate::plugin_permissions::Scope::Only(ids) => {
+                                            ids.contains(&note.id.0)
+                                        }
+                                    })
+                                {
+                                    return Err(FileError::InvalidPath);
+                                }
+                                let configured = protection
+                                    .as_ref()
+                                    .map_err(|_| io("plugin registry protection lock poisoned"))?
+                                    .as_ref()
+                                    .ok_or_else(|| {
+                                        io("plugin registry protection is not configured")
+                                    })?;
+                                if !crate::plugin_io::same_directory(
+                                    configured,
+                                    &protected_registry,
+                                )? {
+                                    return Err(io("plugin registry protection changed"));
+                                }
+                                if path
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .is_none_or(|n| !valid_path(n))
+                                {
+                                    return Err(FileError::InvalidPath);
+                                }
+                                crate::plugin_io::guarded_export(
+                                    &path, &note.text, &guard, configured,
+                                )
+                            })();
+                            FileCompletion::ExplicitExport { request_id, result }
+                        }
                     };
+                    #[cfg(feature = "wasm-extensions")]
+                    drop(protection);
                     if results.send(result).is_err() {
                         break;
                     }
@@ -169,7 +312,28 @@ impl FileWorker {
             jobs: Some(jobs),
             completions,
             worker: Some(worker),
+            #[cfg(feature = "wasm-extensions")]
+            protected_registry,
+            #[cfg(feature = "wasm-extensions")]
+            vault_root,
         })
+    }
+    /// Install protection before enabling the registry or guest file commands.
+    #[cfg(feature = "wasm-extensions")]
+    pub fn protect_plugin_registry(
+        &self,
+        registry: std::sync::Arc<fs::File>,
+    ) -> Result<(), FileError> {
+        let vault = fs::File::open(&self.vault_root).map_err(io)?;
+        if crate::plugin_io::overlaps(&vault, &registry)? {
+            return Err(io("plugin registry and vault directories overlap"));
+        }
+        let mut protection = self
+            .protected_registry
+            .try_lock()
+            .map_err(|_| io("file worker is busy or registry protection is unavailable"))?;
+        *protection = Some(registry);
+        Ok(())
     }
     pub fn try_submit(&self, job: FileJob) -> Result<(), TrySendError<FileJob>> {
         match &self.jobs {
@@ -467,5 +631,133 @@ mod tests {
             ));
         }
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(all(test, feature = "wasm-extensions", target_os = "linux"))]
+mod plugin_tests {
+    use super::*;
+    use crate::plugin_permissions::{Action, Guard, Origin, Rule, Scope};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("tanglewood-protected-worker-{}", Uuid::new_v4()));
+            for child in ["vault", "registry/plugin", "allowed"] {
+                fs::create_dir_all(root.join(child)).unwrap();
+            }
+            Self(root)
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    fn completion(worker: &FileWorker) -> FileCompletion {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(result) = worker.try_recv() {
+                return result;
+            }
+            assert!(Instant::now() < deadline, "file worker timed out");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    #[test]
+    fn worker_enforces_guard_and_blocks_local_registry_export() {
+        let root = Fixture::new();
+        let protected = Arc::new(fs::File::open(root.0.join("registry")).unwrap());
+        let worker = FileWorker::open(&root.0.join("vault")).unwrap();
+        worker.protect_plugin_registry(protected.clone()).unwrap();
+        let allowed = root.0.join("allowed");
+        fs::write(allowed.join("input.md"), "input").unwrap();
+        let guard = Guard {
+            origin: Origin::Local,
+            rule: Rule {
+                action: Action::MarkdownImport,
+                notes: Some(Scope::All),
+                workspaces: None,
+                note_paths: None,
+                filesystem_roots: Some(Scope::Only(vec![allowed.clone()])),
+                url_origins: None,
+                administrative_targets: None,
+                input_kinds: None,
+                human: None,
+            },
+        };
+        worker
+            .try_submit(FileJob::GuardedImport {
+                request_id: Uuid::new_v4(),
+                path: allowed.join("input.md"),
+                guard,
+                protected_registry: protected.clone(),
+            })
+            .unwrap();
+        assert!(
+            matches!(completion(&worker), FileCompletion::Import { result: Ok(text), .. } if text == "input")
+        );
+        let granted_id = NoteId(Uuid::new_v4());
+        let another = NoteRecord {
+            id: NoteId(Uuid::new_v4()),
+            path: "other.md".into(),
+            text: "other note".into(),
+            revision: Revision(Uuid::new_v4()),
+            trashed: false,
+        };
+        let export_guard = Guard {
+            origin: Origin::Local,
+            rule: Rule {
+                action: Action::MarkdownExport,
+                notes: Some(Scope::Only(vec![granted_id.0])),
+                workspaces: None,
+                note_paths: None,
+                filesystem_roots: Some(Scope::Only(vec![allowed.clone()])),
+                url_origins: None,
+                administrative_targets: None,
+                input_kinds: None,
+                human: None,
+            },
+        };
+        worker
+            .try_submit(FileJob::GuardedExplicitExport {
+                request_id: Uuid::new_v4(),
+                note: another,
+                path: allowed.join("other.md"),
+                guard: export_guard,
+                protected_registry: protected.clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            completion(&worker),
+            FileCompletion::ExplicitExport { result: Err(_), .. }
+        ));
+        assert!(!allowed.join("other.md").exists());
+        let manifest = root.0.join("registry/plugin/policy.md");
+        fs::write(&manifest, "trusted policy").unwrap();
+        let note = NoteRecord {
+            id: NoteId(Uuid::new_v4()),
+            path: "policy.md".into(),
+            text: "attack".into(),
+            revision: Revision(Uuid::new_v4()),
+            trashed: false,
+        };
+        worker
+            .try_submit(FileJob::ExplicitExport {
+                request_id: Uuid::new_v4(),
+                note,
+                path: manifest.clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            completion(&worker),
+            FileCompletion::ExplicitExport { result: Err(_), .. }
+        ));
+        assert_eq!(fs::read_to_string(manifest).unwrap(), "trusted policy");
+        let overlap = FileWorker::open(&root.0.join("registry/plugin")).unwrap();
+        assert!(overlap.protect_plugin_registry(protected).is_err());
     }
 }

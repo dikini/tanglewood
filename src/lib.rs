@@ -68,3 +68,20 @@ pub mod research_reader;
 
 #[cfg(feature = "wasm-extensions")]
 pub mod wasm_extensions;
+
+pub mod plugin_permissions;
+pub mod research_authority;
+#[cfg(feature = "wasm-extensions")]
+pub mod plugin_manifest;
+#[cfg(feature = "wasm-extensions")]
+pub mod plugin_registry;
+#[cfg(feature = "wasm-extensions")]
+pub mod wasm_commands;
+
+#[cfg(feature = "wasm-extensions")]
+pub mod plugin_jobs;
+#[cfg(any(feature = "wasm-extensions", feature = "mcp"))]
+pub(crate) mod command_receipts;
+
+#[cfg(feature = "wasm-extensions")]
+pub mod plugin_io;

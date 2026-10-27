@@ -27,7 +27,90 @@ pub struct AssetJob {
     pub input: ArtifactInput,
     pub extract_text: bool,
     pub ocr: bool,
+    /// Trusted owner context; never supplied by a guest.
+    #[cfg(feature = "wasm-extensions")]
+    pub guard: Option<AssetGuard>,
 }
+
+/// Every complete guard must independently authorize each source and redirect.
+/// `revoked` is owner-controlled and independent of the guest lifetime.
+#[cfg(feature = "wasm-extensions")]
+#[derive(Clone, Debug)]
+pub struct AssetGuard {
+    pub guards: Vec<crate::plugin_permissions::Guard>,
+    pub protected_registry: Arc<File>,
+    pub revoked: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "wasm-extensions")]
+type GuardRef<'a> = Option<&'a AssetGuard>;
+#[cfg(not(feature = "wasm-extensions"))]
+type GuardRef<'a> = Option<&'a ()>;
+
+#[cfg(feature = "wasm-extensions")]
+impl AssetGuard {
+    fn check(&self, input: &ArtifactInput) -> Result<(), String> {
+        if self.revoked.load(Ordering::Acquire) || self.guards.is_empty() {
+            return Err("artifact authority revoked or missing".into());
+        }
+        for guard in &self.guards {
+            crate::plugin_permissions::authorize_saved_input(guard, input)
+                .map_err(|_| "artifact source denied by authority".to_owned())?;
+        }
+        Ok(())
+    }
+
+    fn open_local(&self, path: &Path) -> Result<File, String> {
+        self.check(&ArtifactInput::LocalFile {
+            path: path.to_string_lossy().into_owned(),
+        })?;
+        let mut pinned: Option<File> = None;
+        for guard in &self.guards {
+            let file = crate::plugin_io::open_read(path, guard, &self.protected_registry)
+                .map_err(|error| format!("artifact source denied: {error}"))?;
+            if let Some(first) = &pinned {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    let old = first.metadata().map_err(|e| e.to_string())?;
+                    let new = file.metadata().map_err(|e| e.to_string())?;
+                    if (old.dev(), old.ino()) != (new.dev(), new.ino()) {
+                        return Err("artifact source changed during authorization".into());
+                    }
+                }
+                #[cfg(not(unix))]
+                return Err("guarded artifact reads unavailable on this platform".into());
+            } else {
+                pinned = Some(file);
+            }
+        }
+        self.check(&ArtifactInput::LocalFile {
+            path: path.to_string_lossy().into_owned(),
+        })?;
+        pinned.ok_or_else(|| "artifact authority missing".into())
+    }
+}
+
+fn guard_active(guard: GuardRef<'_>) -> Result<(), String> {
+    #[cfg(feature = "wasm-extensions")]
+    if guard.is_some_and(|guard| guard.revoked.load(Ordering::Acquire) || guard.guards.is_empty()) {
+        return Err("artifact authority revoked or missing".into());
+    }
+    #[cfg(not(feature = "wasm-extensions"))]
+    let _ = guard;
+    Ok(())
+}
+
+fn guard_input(guard: GuardRef<'_>, input: &ArtifactInput) -> Result<(), String> {
+    #[cfg(feature = "wasm-extensions")]
+    if let Some(guard) = guard {
+        guard.check(input)?;
+    }
+    #[cfg(not(feature = "wasm-extensions"))]
+    let _ = (guard, input);
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct RetainedAsset {
     pub kind: ArtifactKind,
@@ -68,7 +151,48 @@ impl ResearchAssetWorker {
                     if stop.load(Ordering::Relaxed) {
                         break;
                     }
-                    let result = retain(&vault, job.input, job.extract_text, job.ocr, &cancel);
+                    #[cfg(feature = "wasm-extensions")]
+                    let guard = job.guard.as_ref();
+                    #[cfg(not(feature = "wasm-extensions"))]
+                    let guard: GuardRef<'_> = None;
+                    #[cfg(feature = "wasm-extensions")]
+                    let monitor = guard.map(|guard| {
+                        let revoked = guard.revoked.clone();
+                        let cancel = cancel.clone();
+                        let (stop, receive) = mpsc::sync_channel::<()>(1);
+                        let thread = thread::Builder::new()
+                            .name("research-authority".into())
+                            .spawn(move || {
+                                loop {
+                                    if revoked.load(Ordering::Acquire) {
+                                        cancel.store(true, Ordering::Release);
+                                        break;
+                                    }
+                                    if !matches!(
+                                        receive.recv_timeout(Duration::from_millis(10)),
+                                        Err(mpsc::RecvTimeoutError::Timeout)
+                                    ) {
+                                        break;
+                                    }
+                                }
+                            });
+                        (stop, thread)
+                    });
+                    #[cfg(feature = "wasm-extensions")]
+                    let monitor_failed =
+                        monitor.as_ref().is_some_and(|(_, thread)| thread.is_err());
+                    #[cfg(not(feature = "wasm-extensions"))]
+                    let monitor_failed = false;
+                    let result = if monitor_failed {
+                        Err("could not monitor artifact authority".into())
+                    } else {
+                        retain_guarded(&vault, job.input, job.extract_text, job.ocr, &cancel, guard)
+                    };
+                    #[cfg(feature = "wasm-extensions")]
+                    if let Some((stop, Ok(thread))) = monitor {
+                        let _ = stop.send(());
+                        let _ = thread.join();
+                    }
                     if send
                         .try_send(AssetCompletion {
                             request_id: job.request_id,
@@ -279,6 +403,7 @@ fn publish(
         .map_err(|e| format!("sync artifact directory: {e}"))?;
     Ok(format!("research-assets/{name}"))
 }
+#[cfg(test)]
 fn retain(
     vault: &Path,
     input: ArtifactInput,
@@ -286,8 +411,20 @@ fn retain(
     ocr: bool,
     cancel: &AtomicBool,
 ) -> Result<RetainedAsset, String> {
+    retain_guarded(vault, input, extract_text, ocr, cancel, None)
+}
+
+fn retain_guarded(
+    vault: &Path,
+    input: ArtifactInput,
+    extract_text: bool,
+    ocr: bool,
+    cancel: &AtomicBool,
+    guard: GuardRef<'_>,
+) -> Result<RetainedAsset, String> {
     check_cancel(cancel)?;
     validate_input(&input)?;
+    guard_input(guard, &input)?;
     if ocr && !extract_text {
         return Err("OCR requires source text extraction".into());
     }
@@ -353,6 +490,15 @@ fn retain(
                 use std::os::unix::fs::OpenOptionsExt;
                 options.custom_flags(0x800);
             }
+            #[cfg(feature = "wasm-extensions")]
+            let mut source = if let Some(guard) = guard {
+                guard.open_local(Path::new(&path))?
+            } else {
+                options
+                    .open(&path)
+                    .map_err(|e| format!("read original artifact: {e}"))?
+            };
+            #[cfg(not(feature = "wasm-extensions"))]
             let mut source = options
                 .open(&path)
                 .map_err(|e| format!("read original artifact: {e}"))?;
@@ -413,53 +559,18 @@ fn retain(
         ArtifactInput::Url { url, archive: true } => {
             let html = scratch.0.join("html");
             let provenance = scratch.0.join("provenance");
-            let html_file = create(&html)?;
-            let provenance_file = create(&provenance)?;
             let fetch_url = if extract_text {
                 resolve_pdf_url(&url, "").unwrap_or_else(|| url.clone())
             } else {
                 url.clone()
             };
-            let mut curl = Command::new("/usr/bin/curl");
-            curl.args([
-                "--disable",
-                "--silent",
-                "--show-error",
-                "--fail",
-                "--location",
-                "--max-redirs",
-                "5",
-                "--max-time",
-                "20",
-                "--connect-timeout",
-                "10",
-                "--proto",
-                "=http,https",
-                "--proto-redir",
-                "=http,https",
-                "--max-filesize",
-                "33554432",
-                "--write-out",
-                "%{stderr}%{url_effective}",
-                "--url",
-                &fetch_url,
-            ]);
-            curl.stdin(Stdio::null())
-                .stdout(html_file)
-                .stderr(provenance_file);
-            run(
-                &mut curl,
-                &[(&html, MAX_ASSET_BYTES), (&provenance, 65536)],
-                cancel,
-            )?;
-            let mut final_url = fs::read_to_string(&provenance).map_err(|e| e.to_string())?;
-            validate_url(&final_url)?;
+            let mut final_url = download_url(&fetch_url, &html, &provenance, cancel, guard)?;
             if extract_text {
                 if require_pdf(&html).is_err() {
                     let landing =
                         fs::read_to_string(&html).map_err(|_| "landing page is not UTF-8 HTML")?;
                     let pdf_url = resolve_pdf_url(&final_url, &landing).ok_or("No accessible PDF link found in this landing page; provide a direct PDF URL")?;
-                    final_url = download_pdf(&pdf_url, &html, &provenance, cancel)?;
+                    final_url = download_url(&pdf_url, &html, &provenance, cancel, guard)?;
                 }
                 require_pdf(&html)?;
                 fs::rename(&html, &output).map_err(|e| e.to_string())?;
@@ -524,6 +635,7 @@ fn retain(
     }
     // Keep bytes in scratch until extraction and cancellation checks finish. An ordinary
     // extraction error still publishes the original; a cancelled job publishes nothing.
+    guard_active(guard)?;
     result.managed_path = Some(publish(&assets, &output, extension, cancel)?);
     Ok(result)
 }
@@ -960,6 +1072,8 @@ mod tests {
                     request_id: Uuid::new_v4(),
                     extract_text: false,
                     ocr: false,
+                    #[cfg(feature = "wasm-extensions")]
+                    guard: None,
                     input: ArtifactInput::Url {
                         url: "https://example.org".into(),
                         archive: false,
@@ -973,6 +1087,8 @@ mod tests {
                     request_id: Uuid::new_v4(),
                     extract_text: false,
                     ocr: false,
+                    #[cfg(feature = "wasm-extensions")]
+                    guard: None,
                     input: ArtifactInput::Url {
                         url: "https://example.org".into(),
                         archive: false
@@ -1063,44 +1179,374 @@ fn html_attribute(tag: &str, key: &str) -> Option<String> {
     }
     None
 }
-fn download_pdf(
-    url: &str,
-    path: &Path,
+/// Follow redirects ourselves so every destination is authorized before curl
+/// sends a request. The same check also covers discovered PDF URLs.
+fn download_url(
+    start_url: &str,
+    output: &Path,
     provenance: &Path,
     cancel: &AtomicBool,
+    guard: GuardRef<'_>,
 ) -> Result<String, String> {
-    let mut command = Command::new("/usr/bin/curl");
-    command
-        .args([
-            "--disable",
-            "--silent",
-            "--show-error",
-            "--fail",
-            "--location",
-            "--max-redirs",
-            "5",
-            "--max-time",
-            "20",
-            "--proto",
-            "=http,https",
-            "--proto-redir",
-            "=http,https",
-            "--max-filesize",
-            "33554432",
-            "--write-out",
-            "%{stderr}%{url_effective}",
-            "--url",
-            url,
-        ])
-        .stdin(Stdio::null())
-        .stdout(File::create(path).map_err(|e| e.to_string())?)
-        .stderr(File::create(provenance).map_err(|e| e.to_string())?);
-    run(
-        &mut command,
-        &[(path, MAX_ASSET_BYTES), (provenance, 65536)],
-        cancel,
-    )?;
-    let final_url = fs::read_to_string(provenance).map_err(|e| e.to_string())?;
-    validate_url(&final_url)?;
-    Ok(final_url)
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut current = start_url.to_owned();
+    for redirects in 0..=5 {
+        check_cancel(cancel)?;
+        validate_url(&current)?;
+        guard_input(
+            guard,
+            &ArtifactInput::Url {
+                url: current.clone(),
+                archive: true,
+            },
+        )?;
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or("archive tool timed out")?;
+        let timeout = format!("{:.3}", remaining.as_secs_f64().max(0.001));
+        let mut command = Command::new("/usr/bin/curl");
+        command
+            .args([
+                "--disable",
+                "--silent",
+                "--show-error",
+                "--fail",
+                "--max-time",
+                &timeout,
+                "--connect-timeout",
+                "10",
+                "--proto",
+                "=http,https",
+                "--max-filesize",
+                "33554432",
+                "--write-out",
+                "%{stderr}%{http_code}\\n%{redirect_url}",
+                "--url",
+                &current,
+            ])
+            .stdin(Stdio::null())
+            .stdout(File::create(output).map_err(|e| e.to_string())?)
+            .stderr(File::create(provenance).map_err(|e| e.to_string())?);
+        run(
+            &mut command,
+            &[(output, MAX_ASSET_BYTES), (provenance, 65536)],
+            cancel,
+        )?;
+        let status_and_redirect = fs::read_to_string(provenance).map_err(|e| e.to_string())?;
+        let (status, location) = status_and_redirect
+            .split_once('\n')
+            .ok_or("invalid HTTP status")?;
+        let status: u16 = status.parse().map_err(|_| "invalid HTTP status")?;
+        if (200..300).contains(&status) {
+            return Ok(current);
+        }
+        if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+            return Err(format!("unexpected HTTP status {status}"));
+        }
+        if redirects == 5 {
+            return Err("too many HTTP redirects".into());
+        }
+        if location.is_empty() || location.chars().any(char::is_control) {
+            return Err("invalid redirect location".into());
+        }
+        current = url::Url::parse(&current)
+            .map_err(|_| "invalid redirect base")?
+            .join(location)
+            .map_err(|_| "invalid redirect target")?
+            .to_string();
+    }
+    Err("too many HTTP redirects".into())
+}
+
+#[cfg(all(test, feature = "wasm-extensions", target_os = "linux"))]
+mod guarded_tests {
+    use super::*;
+    use crate::plugin_permissions::{Action, Guard, Origin, Rule, Scope};
+    use std::net::TcpListener;
+
+    struct Temp(PathBuf);
+    impl Temp {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("tanglewood-guarded-assets-{}", Uuid::new_v4()));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    fn accept_bounded(listener: &TcpListener) -> Option<std::net::TcpStream> {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => return Some(stream),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(5))
+                }
+                _ => return None,
+            }
+        }
+    }
+    fn rule(action: Action) -> Rule {
+        Rule {
+            action,
+            notes: None,
+            workspaces: Some(Scope::All),
+            note_paths: None,
+            filesystem_roots: None,
+            url_origins: None,
+            administrative_targets: None,
+            input_kinds: None,
+            human: None,
+        }
+    }
+    fn context(root: &Temp, rule: Rule) -> AssetGuard {
+        let registry = root.0.join("registry");
+        fs::create_dir_all(&registry).unwrap();
+        AssetGuard {
+            guards: vec![Guard {
+                rule,
+                origin: Origin::Local,
+            }],
+            protected_registry: Arc::new(File::open(registry).unwrap()),
+            revoked: Arc::new(AtomicBool::new(false)),
+        }
+    }
+    #[test]
+    fn guarded_file_descriptor_survives_path_replacement() {
+        let root = Temp::new();
+        let allowed = root.0.join("allowed");
+        fs::create_dir(&allowed).unwrap();
+        let path = allowed.join("paper.txt");
+        fs::write(&path, "authorized").unwrap();
+        let mut rule = rule(Action::ResearchSavePaper);
+        rule.filesystem_roots = Some(Scope::Only(vec![allowed]));
+        let guard = context(&root, rule);
+        let mut file = guard.open_local(&path).unwrap();
+        fs::rename(&path, path.with_extension("old")).unwrap();
+        fs::write(&path, "replacement").unwrap();
+        let mut text = String::new();
+        file.read_to_string(&mut text).unwrap();
+        assert_eq!(text, "authorized");
+    }
+    #[test]
+    fn all_file_guards_must_allow_the_same_source() {
+        let root = Temp::new();
+        let allowed = root.0.join("allowed");
+        let other = root.0.join("other");
+        fs::create_dir(&allowed).unwrap();
+        fs::create_dir(&other).unwrap();
+        let path = allowed.join("paper.txt");
+        fs::write(&path, "source").unwrap();
+        let mut first = rule(Action::ResearchSavePaper);
+        first.filesystem_roots = Some(Scope::Only(vec![allowed]));
+        let mut second = rule(Action::ResearchRetryAcquisition);
+        second.filesystem_roots = Some(Scope::Only(vec![other]));
+        let mut guard = context(&root, first);
+        guard.guards.push(Guard {
+            rule: second,
+            origin: Origin::Local,
+        });
+        assert!(guard.open_local(&path).is_err());
+    }
+    #[test]
+    fn revocation_cancels_an_active_download() {
+        let root = Temp::new();
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.local_addr().unwrap());
+        let (started, receiving) = mpsc::sync_channel(1);
+        let (finish, stopped) = mpsc::sync_channel::<()>(1);
+        let responder = thread::spawn(move || {
+            let Some(mut stream) = accept_bounded(&server) else {
+                return;
+            };
+            let mut request = [0; 2048];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: 1024\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            started.send(()).unwrap();
+            let _ = stopped.recv_timeout(Duration::from_secs(5));
+        });
+        let mut rule = rule(Action::ResearchSavePaper);
+        rule.url_origins = Some(Scope::Only(vec![base.clone()]));
+        let guard = context(&root, rule);
+        let revoked = guard.revoked.clone();
+        let worker = ResearchAssetWorker::open(&root.0).unwrap();
+        worker
+            .try_submit(AssetJob {
+                request_id: Uuid::new_v4(),
+                input: ArtifactInput::Url {
+                    url: format!("{base}/paper.pdf"),
+                    archive: true,
+                },
+                extract_text: true,
+                ocr: false,
+                guard: Some(guard),
+            })
+            .unwrap();
+        receiving
+            .recv_timeout(Duration::from_secs(5))
+            .expect("download started");
+        revoked.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let completion = loop {
+            if let Some(completion) = worker.try_recv() {
+                break completion;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "revoked download did not stop promptly"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        finish.send(()).unwrap();
+        responder.join().unwrap();
+        assert!(completion.result.is_err());
+    }
+    #[test]
+    fn same_origin_redirect_is_followed_and_retained() {
+        let root = Temp::new();
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.local_addr().unwrap());
+        let responder = thread::spawn(move || {
+            for index in 0..2 {
+                let mut stream = accept_bounded(&server).expect("authorized request");
+                let mut request = [0; 2048];
+                let size = stream.read(&mut request).unwrap();
+                if index == 0 {
+                    write!(stream, "HTTP/1.1 302 Found\r\nLocation: /paper.pdf\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                } else {
+                    assert!(
+                        String::from_utf8_lossy(&request[..size]).starts_with("GET /paper.pdf ")
+                    );
+                    let body = "%PDF-1.4\n";
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .unwrap();
+                }
+            }
+        });
+        let mut rule = rule(Action::ResearchSavePaper);
+        rule.url_origins = Some(Scope::Only(vec![base.clone()]));
+        let guard = context(&root, rule);
+        let retained = retain_guarded(
+            &root.0,
+            ArtifactInput::Url {
+                url: format!("{base}/start"),
+                archive: true,
+            },
+            true,
+            false,
+            &AtomicBool::new(false),
+            Some(&guard),
+        )
+        .expect("redirect remains within grant");
+        responder.join().unwrap();
+        assert_eq!(
+            retained.final_url.as_deref(),
+            Some(format!("{base}/paper.pdf").as_str())
+        );
+        assert!(retained.managed_path.is_some());
+    }
+    #[test]
+    fn landing_pdf_origin_is_checked_before_download() {
+        let root = Temp::new();
+        let allowed = TcpListener::bind("127.0.0.1:0").unwrap();
+        let denied = TcpListener::bind("127.0.0.1:0").unwrap();
+        denied.set_nonblocking(true).unwrap();
+        let allowed_url = format!("http://{}", allowed.local_addr().unwrap());
+        let denied_url = format!("http://{}/paper.pdf", denied.local_addr().unwrap());
+        let responder = thread::spawn(move || {
+            let Some(mut stream) = accept_bounded(&allowed) else {
+                return false;
+            };
+            let mut request = [0; 2048];
+            let _ = stream.read(&mut request);
+            let body = format!("<meta name='citation_pdf_url' content='{denied_url}'>");
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            true
+        });
+        let mut rule = rule(Action::ResearchSavePaper);
+        rule.url_origins = Some(Scope::Only(vec![allowed_url.clone()]));
+        let guard = context(&root, rule);
+        let result = retain_guarded(
+            &root.0,
+            ArtifactInput::Url {
+                url: format!("{allowed_url}/landing"),
+                archive: true,
+            },
+            true,
+            false,
+            &AtomicBool::new(false),
+            Some(&guard),
+        );
+        assert!(
+            responder.join().unwrap(),
+            "allowed origin was not contacted: {result:?}"
+        );
+        assert!(matches!(result, Err(message) if message.contains("denied by authority")));
+        assert!(
+            matches!(denied.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    }
+    #[test]
+    fn redirect_to_disallowed_origin_is_rejected_before_contact() {
+        let root = Temp::new();
+        let allowed = TcpListener::bind("127.0.0.1:0").unwrap();
+        let denied = TcpListener::bind("127.0.0.1:0").unwrap();
+        denied.set_nonblocking(true).unwrap();
+        let allowed_url = format!("http://{}", allowed.local_addr().unwrap());
+        let denied_url = format!("http://{}/stolen", denied.local_addr().unwrap());
+        let responder = thread::spawn(move || {
+            let Some(mut stream) = accept_bounded(&allowed) else {
+                return false;
+            };
+            let mut request = [0; 2048];
+            let _ = stream.read(&mut request);
+            write!(stream, "HTTP/1.1 302 Found\r\nLocation: {denied_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            true
+        });
+        let mut rule = rule(Action::ResearchSavePaper);
+        rule.url_origins = Some(Scope::Only(vec![allowed_url.clone()]));
+        let guard = context(&root, rule);
+        let result = retain_guarded(
+            &root.0,
+            ArtifactInput::Url {
+                url: format!("{allowed_url}/paper"),
+                archive: true,
+            },
+            true,
+            false,
+            &AtomicBool::new(false),
+            Some(&guard),
+        );
+        assert!(
+            responder.join().unwrap(),
+            "allowed origin was not contacted: {result:?}"
+        );
+        assert!(matches!(result, Err(message) if message.contains("denied by authority")));
+        assert!(
+            matches!(denied.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    }
 }

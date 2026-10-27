@@ -1,5 +1,5 @@
 [workspace]
-members = ["compiled", "rhai", "fixture", "unauthorized"]
+members = ["compiled", "rhai", "fixture", "unauthorized", "compiled-v2", "rhai-v2"]
 resolver = "2"
 
 [workspace.package]

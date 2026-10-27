@@ -178,47 +178,14 @@ impl OwnerSocket {
         app.tick();
         let mut retained = Vec::new();
         for waiting in self.waiting.drain(..) {
-            let outcome = match &waiting.result {
-                CommandResult::Note(accepted) => match app.note(accepted.note.id) {
-                    Ok(current) if current.save.persisted == Some(accepted.note.revision) => {
-                        // Confirm the requested snapshot, even if a newer edit is now dirty.
-                        let mut confirmed = accepted.clone();
-                        confirmed.save.persisted = Some(accepted.note.revision);
-                        confirmed.save.error = None;
-                        Some(Outcome::Result(CommandResult::Note(confirmed)))
-                    }
-                    Ok(current) if current.save.error.is_some() => {
-                        Some(Outcome::UnknownOutcome(format!(
-                            "accepted but storage failed: {}",
-                            current.save.error.unwrap_or_default()
-                        )))
-                    }
-                    Ok(current) if current.note.revision != accepted.note.revision => {
-                        Some(Outcome::UnknownOutcome(
-                            "accepted revision was superseded before confirmation; re-read state"
-                                .into(),
-                        ))
-                    }
-                    Err(_) => Some(Outcome::UnknownOutcome(
-                        "accepted note no longer available".into(),
-                    )),
-                    _ => None,
-                },
-                CommandResult::Accepted { request_id } => match app.io_status(*request_id) {
-                    Some(crate::app::IoStatus::Completed) => {
-                        Some(Outcome::Result(waiting.result.clone()))
-                    }
-                    Some(crate::app::IoStatus::Failed(error)) => Some(Outcome::UnknownOutcome(
-                        format!("accepted but storage failed: {error}; inspect state before retry"),
-                    )),
-                    Some(crate::app::IoStatus::Conflict(id)) => Some(Outcome::UnknownOutcome(
-                        format!("accepted request has conflict {id}; inspect state before retry"),
-                    )),
-                    Some(crate::app::IoStatus::Pending) | None => None,
-                },
-                _ => Some(Outcome::UnknownOutcome(
-                    "unsupported mutation acknowledgement".into(),
-                )),
+            let outcome = match crate::command_receipts::confirm(app, &waiting.result) {
+                crate::command_receipts::Confirmation::Pending => None,
+                crate::command_receipts::Confirmation::Completed(result) => {
+                    Some(Outcome::Result(result))
+                }
+                crate::command_receipts::Confirmation::Unknown(error) => {
+                    Some(Outcome::UnknownOutcome(error))
+                }
             };
             if let Some(outcome) = outcome {
                 reply(&waiting.pending, outcome);
@@ -276,7 +243,7 @@ impl OwnerSocket {
                 reply(&pending, Outcome::Error(CommandError::Unauthorized));
                 continue;
             }
-            let mutation = command.is_mutation();
+            let mutation = command.waits_for_completion();
             match app.execute(command, policy.caller()) {
                 Ok(result) if mutation => self.waiting.push(Waiting { pending, result }),
                 Ok(result) => reply(&pending, Outcome::Result(result)),
@@ -650,7 +617,7 @@ impl McpBridge {
         self.request(None).await
     }
     async fn read(&self, command: Command) -> io::Result<ResponseEnvelope> {
-        if !command.descriptor().allowed(Caller::AutomationReadOnly) {
+        if !command.is_query() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "read only accepts authorized non-mutating commands",
@@ -700,6 +667,33 @@ fn execute_schema(policy: AccessPolicy) -> serde_json::Map<String, serde_json::V
             .as_object()
             .unwrap()
             .clone();
+    }
+    #[cfg(feature = "wasm-extensions")]
+    if policy == AccessPolicy::ReadOnly {
+        if let Some(variants) = schema
+            .pointer_mut("/$defs/PluginCommand/oneOf")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            variants.retain(|variant| {
+                variant.get("const").and_then(serde_json::Value::as_str) == Some("List")
+                    || variant
+                        .get("enum")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|v| v.iter().any(|v| v.as_str() == Some("List")))
+                    || variant
+                        .get("properties")
+                        .and_then(serde_json::Value::as_object)
+                        .is_some_and(|v| {
+                            v.keys()
+                                .any(|v| matches!(v.as_str(), "Describe" | "Status"))
+                        })
+            });
+        } else {
+            return serde_json::json!({"type":"object","not":{}})
+                .as_object()
+                .unwrap()
+                .clone();
+        }
     }
     schema.as_object().expect("schema root is object").clone()
 }
@@ -1336,5 +1330,40 @@ mod tests {
         assert_eq!(reopened.note(created.note.id).unwrap().note.text, "newer");
         reopened.shutdown().unwrap();
         fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[cfg(all(test, feature = "wasm-extensions"))]
+mod plugin_schema_tests {
+    use super::*;
+    #[test]
+    fn read_discovery_excludes_plugin_execution_and_cancellation() {
+        let read = serde_json::Value::Object(execute_schema(AccessPolicy::ReadOnly));
+        let variants = read
+            .pointer("/$defs/PluginCommand/oneOf")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        let rendered = serde_json::to_string(variants).unwrap();
+        assert!(
+            rendered.contains("List")
+                && rendered.contains("Describe")
+                && rendered.contains("Status"),
+            "{read}"
+        );
+        assert!(
+            !rendered.contains("Evaluate")
+                && !rendered.contains("Run")
+                && !rendered.contains("Cancel"),
+            "{read}"
+        );
+        let execute = serde_json::Value::Object(execute_schema(AccessPolicy::ReadWrite));
+        assert!(
+            execute
+                .pointer("/$defs/PluginCommand/oneOf")
+                .unwrap()
+                .to_string()
+                .contains("Evaluate")
+        );
     }
 }

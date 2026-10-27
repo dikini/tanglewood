@@ -220,3 +220,37 @@ baseline vault-lock failure are recorded in the evidence. Debug cold Rhai
 compilation takes about 50 seconds here and is outside the execution deadline.
 No Android or GUI-runtime claim; GUI controls, document-filter wiring and other
 interpreters remain outside this goal.
+
+## Manifest-authorized Wasm commands and scripts (2026-10-28)
+
+User authorized implementation and selected manifest ∩ caller rights, retaining
+the vault agent-write gate. Scope: every existing shared Command/ResearchCommand;
+conversation/lifecycle method promotion and optional delegation are outside this
+selected increment. v0.1 compatibility remains.
+
+| Task | Owner / owned paths | State | Evidence / next action |
+| --- | --- | --- | --- |
+| WP1 policy/manifest registry | Terra 6.1 max; plugin_permissions/manifest/registry | delivered | Reviewed scoped authority, digest-bound registry and guarded filesystem operations; focused checks passed |
+| WP2 typed WIT/guests | Terra 6.1 max; wit/v2, wasm_commands, v2 guests | delivered | All 62 existing actions round-trip; real compiled/Rhai CLI workflows passed; v1 preserved |
+| WP3 owner jobs/adapters | PM + Terra 6.1 max; app/commands/runtime/MCP/CLI/research | delivered | Real owner/MCP scripts, guarded research, separate completion/persistence and retained effect receipts verified |
+| WP4 independent review | Sol 6.1 max; frozen completed increments | READY | Resource bounds and receipt-label findings resolved; no remaining material findings |
+| WP5 final verification | PM/integrator | passed | Real guests, CLI, owner/MCP, large paging, persisted retry authority, guarded HTTP/files and scoped checks passed |
+
+Validation for this increment:
+
+- `RUSTC_WRAPPER= cargo test --locked --offline --features wasm-extensions,mcp --lib plugin_ -- --test-threads=1`: 15 policy, registry, guarded filesystem and MCP-schema tests passed, including sparse-file bounds.
+- The same feature set with `--lib research_assets::guarded_tests`: 6 real file/loopback HTTP tests passed (per-hop redirect/PDF checks and cancellation); local-only test servers required sandbox network permission.
+- `wasm_command_contract`: 7 passed, including parity for all 62 existing actions and UTF-8/revision-safe paging. `wasm_runtime_v2`: 2 passed for typed callbacks, manifest quotas and cancellation/deadlines.
+- `wasm_plugin_commands`: 3 passed for real Rhai owner dispatch, read-only and write-enabled MCP invocation, write disable, local administrative grants, denied agent escalation, partial-effect receipts, registry revocation and paging a 10 MiB note.
+- `wasm_research_commands`: 1 passed for atomic persisted acquisition authority, current/original grant intersection, multiple retry rules and a native retry after restart without the registry.
+- Existing v1 `wasm_extensions`: 2 passed; v1 `wasm_cli`: 1 passed. New `wasm_plugin_cli`: 2 feature-enabled scenarios passed (compiled/Rhai/partial failure), plus 1 no-feature error-path test.
+- `--lib completion_tests`: 1 passed; volatile controls remain accepted-only, import/rescan wait for I/O without claiming persistence, and storage mutations require acknowledgement.
+- Research-authority serialization/defaults/hidden guest projection passed with Wasm, and persistence/defaults passed without Wasm. Guest Rhai typed serialization checks passed.
+- `RUSTC_WRAPPER= cargo check --locked --offline --features wasm-extensions,mcp,lan` passed. Scoped rustfmt and diff checks passed; existing dead-code warnings remain.
+
+Runtime evidence is Linux headless with local test servers. No GUI or Android
+execution, physical LAN exchange, or external-service network claim is made by
+these checks. Secure registry/guarded filesystem operations require Linux;
+other targets fail explicitly where those facilities are unavailable. The
+protected file worker bounds Markdown imports/existing-target comparisons at
+8 MiB and preserves larger existing files with a recoverable error.

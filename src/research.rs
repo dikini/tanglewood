@@ -191,6 +191,9 @@ pub struct Acquisition {
     pub ocr: bool,
     pub status: AcquisitionStatus,
     pub error: Option<String>,
+    /// Original authority remains attached across restarts and retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<crate::research_authority::ResearchAuthority>,
 }
 impl PartialEq for Acquisition {
     fn eq(&self, other: &Self) -> bool {

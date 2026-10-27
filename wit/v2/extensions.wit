@@ -1,0 +1,669 @@
+package tanglewood:extensions@0.2.0;
+
+/// All calls pass through the application command and authorization path.
+interface host {
+    /// UUIDs use their canonical textual form; revision tokens are opaque equality values.
+    type uuid = string;
+    type revision = string;
+    record source-url { id: uuid, url: string }
+    record codex-project-binding {
+        project-id: option<string>,
+        name: string,
+        creation-key: string,
+    }
+    record text-edit {
+        start: u64,
+        end: u64,
+        replacement: string,
+    }
+    record note-record {
+        id: uuid,
+        path: string,
+        text: string,
+        revision: revision,
+        trashed: bool,
+    }
+    record save-state {
+        accepted: revision,
+        persisted: option<revision>,
+        %error: option<string>,
+    }
+    record note-view {
+        note: note-record,
+        save: save-state,
+    }
+    record lan-peer-status {
+        fingerprint: string,
+        connected: bool,
+        session: option<u64>,
+        last-receipt: option<uuid>,
+    }
+    record lan-status {
+        listening: bool,
+        paused: bool,
+        prepared: bool,
+        joining: bool,
+        vault-id: option<uuid>,
+        ticket: option<string>,
+        peers: list<lan-peer-status>,
+        pending-messages: u64,
+        %error: option<string>,
+        accepted-generation: u64,
+        persisted-generation: u64,
+    }
+    record source-metadata {
+        author: option<string>,
+        date: option<string>,
+        url: option<string>,
+        origin-label: option<string>,
+    }
+    record source-page {
+        number: option<u32>,
+        text: string,
+    }
+    record source-assessment {
+        relevance: string,
+        quality: string,
+        limitations: string,
+    }
+    record imported-source {
+        title: string,
+        kind: source-kind,
+        metadata: source-metadata,
+        pages: list<source-page>,
+    }
+    record paper-content {
+        artifact-id: uuid,
+        extraction-error: option<string>,
+        ocr: bool,
+    }
+    record research-source {
+        id: uuid,
+        title: string,
+        kind: source-kind,
+        origin: source-origin,
+        metadata: source-metadata,
+        pages: list<source-page>,
+        paper: option<paper-content>,
+        selected: bool,
+        human-assessment: option<source-assessment>,
+        agent-assessment: option<source-assessment>,
+    }
+    record research-brief {
+        purpose: string,
+        scope: string,
+        assumptions: string,
+        open-questions: string,
+    }
+    record thread-ref {
+        provider: string,
+        project-id: option<string>,
+        thread-id: string,
+        title: string,
+    }
+    record research-round {
+        id: uuid,
+        captured-at: u64,
+        question: string,
+        summary: string,
+        open-questions: string,
+        discussion: string,
+        thread: option<thread-ref>,
+        turn-id: option<string>,
+        artifact-ids: list<uuid>,
+    }
+    record acquisition {
+        id: uuid,
+        source-id: uuid,
+        input: artifact-input,
+        ocr: bool,
+        status: acquisition-status,
+        %error: option<string>,
+    }
+    record assessment-event {
+        source-id: uuid,
+        human: bool,
+        assessment: source-assessment,
+    }
+    record research-artifact {
+        id: uuid,
+        title: string,
+        kind: artifact-kind,
+        url: option<string>,
+        final-url: option<string>,
+        managed-path: option<string>,
+        markdown: option<string>,
+        captured-at: u64,
+        thread: option<thread-ref>,
+        round-id: option<uuid>,
+        role: artifact-role,
+        source-ids: list<uuid>,
+    }
+    record research-workspace {
+        id: uuid,
+        revision: revision,
+        title: string,
+        question: string,
+        sources: list<research-source>,
+        research-notes: list<uuid>,
+        brief: research-brief,
+        threads: list<thread-ref>,
+        rounds: list<research-round>,
+        artifacts: list<research-artifact>,
+        acquisitions: list<acquisition>,
+        assessment-history: list<assessment-event>,
+    }
+    record reference-candidate {
+        title: string,
+        url: string,
+        author: option<string>,
+        date: option<string>,
+    }
+    record output-card {
+        heading: string,
+        body: string,
+        citations: list<string>,
+    }
+    record output-spec {
+        source-urls: list<source-url>,
+        title: string,
+        kind: output-kind,
+        cards: list<output-card>,
+    }
+    record passage {
+        source-id: uuid,
+        page: option<u32>,
+        text: string,
+        citation: string,
+        score: u64,
+    }
+    record research-index {
+        id: uuid,
+        revision: revision,
+        title: string,
+        round-ids: list<uuid>,
+        artifact-ids: list<uuid>,
+        source-ids: list<uuid>,
+    }
+    record source-excerpt {
+        source-id: uuid,
+        title: string,
+        paper: option<paper-content>,
+        page: u64,
+        number: option<u32>,
+        offset: u64,
+        text: string,
+        total-bytes: u64,
+        next-offset: option<u64>,
+        next-page: option<u64>,
+    }
+    record artifact-excerpt {
+        artifact: research-artifact,
+        markdown: option<string>,
+        offset: u64,
+        next-offset: option<u64>,
+        total-bytes: u64,
+    }
+    variant source-kind {
+        note,
+        text,
+        pdf,
+        web,
+        image,
+        video,
+        observation,
+    }
+    variant artifact-kind {
+        file,
+        pdf,
+        image,
+        web,
+        markdown,
+    }
+    variant artifact-role {
+        unclassified,
+        input,
+        output,
+    }
+    variant acquisition-status {
+        queued,
+        running,
+        ready,
+        failed,
+        cancelled,
+    }
+    variant context-mode {
+        continue,
+        report,
+    }
+    variant source-scope {
+        existing-only,
+        external-gathering,
+    }
+    variant output-kind {
+        slides,
+        infographic,
+        mind-map,
+    }
+    record source-origin-note-snapshot {
+        id: uuid,
+        revision: revision,
+    }
+    variant source-origin {
+        note-snapshot(source-origin-note-snapshot),
+        imported,
+    }
+    record artifact-input-local-file {
+        path: string,
+    }
+    record artifact-input-url {
+        url: string,
+        archive: bool,
+    }
+    record artifact-input-generated {
+        spec: output-spec,
+    }
+    record artifact-input-markdown {
+        markdown: string,
+        url: option<string>,
+    }
+    variant artifact-input {
+        local-file(artifact-input-local-file),
+        url(artifact-input-url),
+        generated(artifact-input-generated),
+        markdown(artifact-input-markdown),
+    }
+    record import-destination-create {
+        path: string,
+    }
+    record import-destination-replace {
+        id: uuid,
+        expected: revision,
+    }
+    variant import-destination {
+        create(import-destination-create),
+        replace(import-destination-replace),
+    }
+    record research-command-import-sources {
+        id: uuid,
+        expected: revision,
+        paths: list<string>,
+    }
+    record research-command-acquire-sources {
+        id: uuid,
+        expected: revision,
+        source-ids: list<uuid>,
+    }
+    record research-command-retry-acquisitions {
+        id: uuid,
+        expected: revision,
+        job-ids: list<uuid>,
+    }
+    record research-command-collect-references {
+        id: uuid,
+        expected: revision,
+        candidates: list<reference-candidate>,
+        thread: option<thread-ref>,
+        turn-id: option<string>,
+    }
+    record research-command-import-source {
+        id: uuid,
+        expected: revision,
+        path: string,
+    }
+    record research-command-acquire-source {
+        id: uuid,
+        expected: revision,
+        source-id: uuid,
+        input: artifact-input,
+        ocr: bool,
+    }
+    record research-command-retry-acquisition {
+        id: uuid,
+        expected: revision,
+        job-id: uuid,
+    }
+    record research-command-cancel-acquisition {
+        id: uuid,
+        expected: revision,
+        job-id: uuid,
+    }
+    record research-command-create-output {
+        id: uuid,
+        expected: revision,
+        spec: output-spec,
+    }
+    record research-command-set-artifact-role {
+        id: uuid,
+        expected: revision,
+        artifact-id: uuid,
+        role: artifact-role,
+    }
+    record research-command-find-passages {
+        id: uuid,
+        query: string,
+        limit: u64,
+    }
+    record research-command-evidence-gaps {
+        id: uuid,
+    }
+    record research-command-create {
+        title: string,
+        question: string,
+    }
+    record research-command-read {
+        id: uuid,
+    }
+    record research-command-read-index {
+        id: uuid,
+    }
+    record research-command-read-round {
+        id: uuid,
+        round-id: uuid,
+    }
+    record research-command-read-source {
+        id: uuid,
+        source-id: uuid,
+        page: u64,
+        offset: u64,
+        limit: u64,
+    }
+    record research-command-save-paper {
+        id: uuid,
+        expected: revision,
+        source-id: uuid,
+        input: artifact-input,
+        ocr: bool,
+    }
+    record research-command-read-artifact {
+        id: uuid,
+        artifact-id: uuid,
+        offset: u64,
+        limit: u64,
+    }
+    record research-command-update {
+        id: uuid,
+        expected: revision,
+        title: string,
+        question: string,
+    }
+    record research-command-add-note {
+        id: uuid,
+        expected: revision,
+        note-id: uuid,
+    }
+    record research-command-add-imported {
+        id: uuid,
+        expected: revision,
+        source: imported-source,
+    }
+    record research-command-remove-source {
+        id: uuid,
+        expected: revision,
+        source-id: uuid,
+    }
+    record research-command-select-source {
+        id: uuid,
+        expected: revision,
+        source-id: uuid,
+        selected: bool,
+    }
+    record research-command-assess-source {
+        id: uuid,
+        expected: revision,
+        source-id: uuid,
+        human: bool,
+        assessment: source-assessment,
+    }
+    record research-command-link-note {
+        id: uuid,
+        expected: revision,
+        note-id: uuid,
+    }
+    record research-command-build-prompt {
+        id: uuid,
+    }
+    record research-command-set-brief {
+        id: uuid,
+        expected: revision,
+        brief: research-brief,
+    }
+    record research-command-associate-thread {
+        id: uuid,
+        expected: revision,
+        thread: thread-ref,
+    }
+    record research-command-remove-thread {
+        id: uuid,
+        expected: revision,
+        thread: thread-ref,
+    }
+    record research-command-add-round {
+        id: uuid,
+        expected: revision,
+        round: research-round,
+    }
+    record research-command-collect-artifact {
+        id: uuid,
+        expected: revision,
+        title: string,
+        input: artifact-input,
+        thread: option<thread-ref>,
+        round-id: option<uuid>,
+    }
+    record research-command-retry-artifact {
+        id: uuid,
+        expected: revision,
+        receipt-id: uuid,
+    }
+    record research-command-build-report {
+        id: uuid,
+    }
+    record research-command-build-context {
+        id: uuid,
+        mode: context-mode,
+        scope: source-scope,
+    }
+    record research-command-discover {
+        id: uuid,
+    }
+    variant research-command {
+        import-sources(research-command-import-sources),
+        acquire-sources(research-command-acquire-sources),
+        retry-acquisitions(research-command-retry-acquisitions),
+        collect-references(research-command-collect-references),
+        import-source(research-command-import-source),
+        acquire-source(research-command-acquire-source),
+        retry-acquisition(research-command-retry-acquisition),
+        cancel-acquisition(research-command-cancel-acquisition),
+        create-output(research-command-create-output),
+        set-artifact-role(research-command-set-artifact-role),
+        find-passages(research-command-find-passages),
+        evidence-gaps(research-command-evidence-gaps),
+        create(research-command-create),
+        %list,
+        read(research-command-read),
+        read-index(research-command-read-index),
+        read-round(research-command-read-round),
+        read-source(research-command-read-source),
+        save-paper(research-command-save-paper),
+        read-artifact(research-command-read-artifact),
+        update(research-command-update),
+        add-note(research-command-add-note),
+        add-imported(research-command-add-imported),
+        remove-source(research-command-remove-source),
+        select-source(research-command-select-source),
+        assess-source(research-command-assess-source),
+        link-note(research-command-link-note),
+        build-prompt(research-command-build-prompt),
+        set-brief(research-command-set-brief),
+        associate-thread(research-command-associate-thread),
+        remove-thread(research-command-remove-thread),
+        add-round(research-command-add-round),
+        collect-artifact(research-command-collect-artifact),
+        retry-artifact(research-command-retry-artifact),
+        build-report(research-command-build-report),
+        build-context(research-command-build-context),
+        discover(research-command-discover),
+    }
+    record command-set-automation-write-enabled {
+        enabled: bool,
+    }
+    record command-set-codex-project {
+        expected: option<codex-project-binding>,
+        project: codex-project-binding,
+    }
+    record command-listen-lan {
+        bind: string,
+        advertised-ip: option<string>,
+    }
+    record command-prepare-join {
+        ticket: string,
+    }
+    record command-confirm-peer {
+        ticket: string,
+    }
+    record command-unpair-peer {
+        fingerprint: string,
+    }
+    record command-connect-peer {
+        fingerprint: string,
+    }
+    record command-set-mirror-enabled {
+        enabled: bool,
+    }
+    record command-import-markdown {
+        source-path: string,
+        destination: import-destination,
+    }
+    record command-export-markdown {
+        id: uuid,
+        path: string,
+    }
+    record command-create-note {
+        path: string,
+        text: string,
+    }
+    record command-read-note {
+        id: uuid,
+    }
+    record command-edit-note {
+        id: uuid,
+        expected: revision,
+        edits: list<text-edit>,
+    }
+    record command-rename-note {
+        id: uuid,
+        expected: revision,
+        path: string,
+    }
+    record command-trash-note {
+        id: uuid,
+        expected: revision,
+    }
+    record command-restore-note {
+        id: uuid,
+        expected: revision,
+    }
+    record command-search-notes {
+        query: string,
+        include-trash: bool,
+    }
+    variant command {
+        research(research-command),
+        get-codex-project,
+        set-automation-write-enabled(command-set-automation-write-enabled),
+        set-codex-project(command-set-codex-project),
+        listen-lan(command-listen-lan),
+        get-lan-ticket,
+        prepare-join(command-prepare-join),
+        cancel-join,
+        confirm-peer(command-confirm-peer),
+        unpair-peer(command-unpair-peer),
+        connect-peer(command-connect-peer),
+        get-lan-status,
+        pause-lan,
+        resume-lan,
+        enable-sync,
+        set-mirror-enabled(command-set-mirror-enabled),
+        import-markdown(command-import-markdown),
+        export-markdown(command-export-markdown),
+        rescan-mirror,
+        create-note(command-create-note),
+        read-note(command-read-note),
+        edit-note(command-edit-note),
+        rename-note(command-rename-note),
+        trash-note(command-trash-note),
+        restore-note(command-restore-note),
+        search-notes(command-search-notes),
+    }
+    variant research-result {
+        passages(list<passage>),
+        suggestions(list<string>),
+        workspace(research-workspace),
+        workspaces(list<research-workspace>),
+        prompt(string),
+        report(string),
+        index(research-index),
+        round(research-round),
+        artifact(artifact-excerpt),
+        source(source-excerpt),
+    }
+    record command-result-lan-ticket {
+        ticket: string,
+    }
+    record command-result-accepted {
+        request-id: uuid,
+    }
+    variant command-result {
+        research(research-result),
+        codex-project(option<codex-project-binding>),
+        lan-ticket(command-result-lan-ticket),
+        lan-status(lan-status),
+        accepted(command-result-accepted),
+        note(note-view),
+        notes(list<note-view>),
+    }
+    enum completion { accepted, pending, persisted }
+    record receipt { completion: completion, value: command-result }
+    /// A token is bound to the invoking run and expires with it.
+    /// A completed dispatch with a paged result; completion still describes its effect.
+    record oversized { token: uuid, completion: completion }
+    variant command-error { invalid-argument(string), invalid-research(string), codex-project-changed, invalid-codex-project(string), unauthorized, busy, not-found, stale-revision(revision), invalid-path, path-collision, invalid-edits, trashed, unavailable(string), too-large(oversized), result-changed, expired, cancelled, timeout }
+    variant path-element { field(string), index(u64) }
+    record text-part { text: string, total-bytes: u64, next-offset: option<u64> }
+    record field-part { names: list<string>, total-fields: u64, next-offset: option<u64> }
+    /// Each request reads one typed node; text is returned on UTF-8 boundaries.
+    variant result-node { null, boolean(bool), unsigned(u64), signed(s64), float(f64), text(text-part), list-length(u64), fields(field-part) }
+    enum log-level { debug, info, warn, error }
+    variant log-error { denied, unavailable, limit-exceeded }
+    variant scope { all, only(list<string>) }
+    enum input-kind { local-file, url-archive, url-reference, generated, markdown }
+    /// One complete rule. Different rules do not combine their scopes.
+    record capability {
+        name: string,
+        notes: option<scope>,
+        workspaces: option<scope>,
+        note-paths: option<scope>,
+        filesystem-roots: option<scope>,
+        url-origins: option<scope>,
+        administrative-targets: option<scope>,
+        input-kinds: option<list<input-kind>>,
+        human: option<bool>,
+    }
+    /// Current effective rules, checked again at dispatch.
+    capabilities: func() -> list<capability>;
+    log: func(level: log-level, message: string) -> result<_, log-error>;
+    execute: func(command: command) -> result<receipt, command-error>;
+    /// Traverse the result using native variant names and snake_case record fields.
+    /// For example, a note body is Field("Note"), Field("note"), Field("text").
+    /// `offset` is a UTF-8 byte offset for text and a field index for records;
+    /// follow `next-offset` to continue. The limit is 1..=32768 bytes.
+    /// If the source changes between requests, result-changed replaces the page.
+    read-result: func(token: uuid, path: list<path-element>, offset: u64, limit: u32) -> result<result-node, command-error>;
+}
+
+interface compiled { run: func(input: string) -> result<string, string>; }
+interface interpreter { evaluate: func(source: string, input: string) -> result<string, string>; }
+world compiled-extension { import host; export compiled; }
+world interpreter-extension { import host; export interpreter; }

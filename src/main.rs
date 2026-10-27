@@ -12,6 +12,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut vault = None;
     let mut headless = false;
     let mut wasm = WasmOptions::default();
+    let mut plugins = PluginOptions::default();
     let mut startup = Vec::new();
     let mut mcp_path = None;
     let mut mcp_write = false;
@@ -49,6 +50,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 wasm.note = Some(tanglewood::notes::NoteId(uuid::Uuid::parse_str(
                     &args.next().ok_or("--wasm-note needs a note UUID")?,
                 )?));
+            }
+            "--plugin-registry" => {
+                plugins.registry = Some(PathBuf::from(
+                    args.next().ok_or("--plugin-registry needs a directory")?,
+                ));
+            }
+            "--plugin" => plugins.ids.push(args.next().ok_or("--plugin needs an ID")?),
+            "--plugin-run" | "--plugin-evaluate" => {
+                let id = args.next().ok_or("plugin invocation needs an ID")?;
+                let invocation = if arg == "--plugin-run" {
+                    PluginInvocation::Run(id)
+                } else {
+                    PluginInvocation::Evaluate(id)
+                };
+                if plugins.invocation.replace(invocation).is_some() {
+                    return Err("choose exactly one plugin invocation".into());
+                }
             }
             "--mcp-socket" => {
                 mcp_path = Some(PathBuf::from(
@@ -175,15 +193,57 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!(
                     "Wasm (--features wasm-extensions, --headless): --wasm-component PATH [--wasm-script SOURCE.rhai] [--wasm-input STRING] [--wasm-note NOTE_UUID]. Grants logging and read-only access to the selected note; interpreter mode is selected by --wasm-script."
                 );
+                println!(
+                    "Registered plugins (--features wasm-extensions): --plugin-registry ABSOLUTE_DIRECTORY [--plugin ID ...] [--plugin-run ID | --plugin-evaluate ID --wasm-script SOURCE.rhai] [--wasm-input STRING]. Plugin invocation requires --headless; registered IDs are also available to the GUI and MCP server."
+                );
                 return Ok(());
             }
             _ => return Err(format!("unknown argument: {arg}").into()),
         }
     }
-    if wasm.component.is_none()
-        && (wasm.script.is_some() || wasm.input.is_some() || wasm.note.is_some())
+    if (plugins.registry.is_some() || !plugins.ids.is_empty() || plugins.invocation.is_some())
+        && !cfg!(feature = "wasm-extensions")
     {
-        return Err("Wasm options require --wasm-component".into());
+        return Err("registered plugins require --features wasm-extensions".into());
+    }
+    if plugins.registry.is_none() && (!plugins.ids.is_empty() || plugins.invocation.is_some()) {
+        return Err("registered plugins require --plugin-registry".into());
+    }
+    if plugins.ids.iter().any(String::is_empty)
+        || plugins
+            .invocation
+            .as_ref()
+            .is_some_and(|invocation| invocation.id().is_empty())
+    {
+        return Err("plugin IDs must not be empty".into());
+    }
+    if plugins
+        .registry
+        .as_ref()
+        .is_some_and(|root| !root.is_absolute())
+    {
+        return Err("--plugin-registry requires an absolute directory".into());
+    }
+    if plugins.invocation.is_some() && wasm.component.is_some() {
+        return Err("choose --wasm-component or a registered plugin invocation".into());
+    }
+    if wasm.component.is_none() && wasm.note.is_some() {
+        return Err("--wasm-note requires --wasm-component".into());
+    }
+    match &plugins.invocation {
+        Some(PluginInvocation::Run(_)) if wasm.script.is_some() => {
+            return Err("--plugin-run does not accept --wasm-script".into());
+        }
+        Some(PluginInvocation::Evaluate(_)) if wasm.script.is_none() => {
+            return Err("--plugin-evaluate requires --wasm-script".into());
+        }
+        Some(_) if !headless => return Err("plugin invocation requires --headless".into()),
+        None if wasm.component.is_none() && (wasm.script.is_some() || wasm.input.is_some()) => {
+            return Err(
+                "Wasm options require --wasm-component or a registered plugin invocation".into(),
+            );
+        }
+        _ => {}
     }
     if wasm.component.is_some() {
         if !cfg!(feature = "wasm-extensions") {
@@ -280,6 +340,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let mut app = tanglewood::App::open(&vault)?;
+    #[cfg(feature = "wasm-extensions")]
+    if let Some(root) = &plugins.registry {
+        if let Some(invocation) = &plugins.invocation {
+            let id = invocation.id();
+            if !plugins.ids.iter().any(|registered| registered == id) {
+                plugins.ids.push(id.to_owned());
+            }
+        }
+        app.configure_plugin_registry(root, &plugins.ids)?;
+    }
     #[cfg(feature = "lan")]
     let _lan_runtime = {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -322,6 +392,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             app.flush()?;
         }
+    }
+    #[cfg(feature = "wasm-extensions")]
+    if let Some(invocation) = plugins.invocation {
+        let result = run_registered_plugin(&mut app, invocation, wasm);
+        // Accepted effects may need flushing even when the guest fails.
+        app.flush_files()?;
+        app.shutdown()?;
+        return result;
     }
     #[cfg(feature = "wasm-extensions")]
     if wasm.component.is_some() {
@@ -415,12 +493,101 @@ struct WasmOptions {
     note: Option<tanglewood::notes::NoteId>,
 }
 
+#[derive(Default)]
+struct PluginOptions {
+    registry: Option<PathBuf>,
+    ids: Vec<String>,
+    invocation: Option<PluginInvocation>,
+}
+
+enum PluginInvocation {
+    Run(String),
+    Evaluate(String),
+}
+impl PluginInvocation {
+    fn id(&self) -> &str {
+        match self {
+            Self::Run(id) | Self::Evaluate(id) => id,
+        }
+    }
+}
+
+#[cfg(feature = "wasm-extensions")]
+fn read_wasm_script(path: PathBuf) -> Result<String, Box<dyn std::error::Error>> {
+    use std::io::Read;
+    const MAX_SCRIPT_BYTES: u64 = 1024 * 1024;
+    let mut source = String::new();
+    std::fs::File::open(path)?
+        .take(MAX_SCRIPT_BYTES + 1)
+        .read_to_string(&mut source)?;
+    if source.len() as u64 > MAX_SCRIPT_BYTES {
+        return Err("Wasm script exceeds 1 MiB".into());
+    }
+    Ok(source)
+}
+
+#[cfg(feature = "wasm-extensions")]
+fn run_registered_plugin(
+    app: &mut tanglewood::App,
+    invocation: PluginInvocation,
+    options: WasmOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use tanglewood::commands::{Caller, Command, CommandResult};
+    use tanglewood::plugin_jobs::{PluginCommand, PluginResult, RunPhase};
+
+    let input = options.input.unwrap_or_default();
+    let command = match invocation {
+        PluginInvocation::Run(id) => PluginCommand::Run { id, input },
+        PluginInvocation::Evaluate(id) => PluginCommand::Evaluate {
+            id,
+            source: read_wasm_script(options.script.ok_or("missing script")?)?,
+            input,
+        },
+    };
+    let CommandResult::Plugin(PluginResult::Started { run_id }) =
+        app.execute(Command::Plugin(command), Caller::Local)?
+    else {
+        return Err("unexpected plugin start result".into());
+    };
+    eprintln!("Plugin run: {run_id}");
+    loop {
+        app.tick();
+        let CommandResult::Plugin(PluginResult::Status(status)) = app.execute(
+            Command::Plugin(PluginCommand::Status { run_id }),
+            Caller::Local,
+        )?
+        else {
+            return Err("unexpected plugin status result".into());
+        };
+        if matches!(status.phase, RunPhase::Running) {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            continue;
+        }
+        for diagnostic in &status.diagnostics {
+            eprintln!("Plugin: {diagnostic}");
+        }
+        for receipt in &status.receipts {
+            eprintln!("Plugin effect: {}", serde_json::to_string(receipt)?);
+        }
+        return match status.phase {
+            RunPhase::Completed => {
+                println!("{}", status.output.unwrap_or_default());
+                Ok(())
+            }
+            RunPhase::Failed | RunPhase::Cancelled => Err(status
+                .error
+                .unwrap_or_else(|| "plugin did not complete".into())
+                .into()),
+            RunPhase::Running => unreachable!(),
+        };
+    }
+}
+
 #[cfg(feature = "wasm-extensions")]
 fn run_wasm_extension(
     app: &mut tanglewood::App,
     options: WasmOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use std::io::Read;
     use tanglewood::commands::{Caller, Command, CommandResult};
     use tanglewood::wasm_extensions::{Capabilities, Invocation, NoteSnapshot, Runtime};
 
@@ -443,15 +610,7 @@ fn run_wasm_extension(
     let input = options.input.unwrap_or_default();
     let invocation = match options.script {
         Some(path) => {
-            // Bound source reading before allocating; the runtime also validates its input.
-            const MAX_SCRIPT_BYTES: u64 = 1024 * 1024;
-            let mut source = String::new();
-            std::fs::File::open(path)?
-                .take(MAX_SCRIPT_BYTES + 1)
-                .read_to_string(&mut source)?;
-            if source.len() as u64 > MAX_SCRIPT_BYTES {
-                return Err("Wasm script exceeds 1 MiB".into());
-            }
+            let source = read_wasm_script(path)?;
             Invocation::Interpreter { source, input }
         }
         None => Invocation::Compiled { input },
