@@ -80,21 +80,20 @@ app; it never opens a second vault writer. Enable it with `--features gui,mcp`,
 `--mcp-socket /private/directory/owner.sock`, and optionally `--mcp-write`.
 Default MCP policy is read-only. Enable agent updates per vault in Settings → Connections
 or Conversation actions → Vault updates; changes apply without reconnecting.
-The Linux Codex adapter and conversation panel are implemented. Build both
-binaries with `cargo build --bins --features gui,codex`, then add `--codex`
-to an editor launch with `--mcp-socket`. Use `--mcp-write` as a headless/legacy fallback when note mutation
-is intended. The Codex activity icon switches the left pane to the vault's project
-and threads. Its header offers connect/disconnect and new-thread icons; the project
-menu offers rename. Thread status indicators have tooltips; thread context menus offer rename/archive/remove.
-The rounded composer includes model and reasoning-effort selection from Codex’s catalog. Connection is lazy,
-with explicit one-action approvals.
-See [Codex setup](docs/codex.md) and [actual live evidence](docs/codex-live-evidence.md).
+The Linux conversation surface supports Codex and Kimi. Build both binaries with
+`cargo build --bins --features gui,codex,kimi`, then add `--codex` and/or `--kimi`
+to an editor launch with `--mcp-socket`. The composer has one searchable model
+picker across enabled providers, with supported reasoning choices beside it.
+Choosing a model prepares its conversation without sending a message. Connections
+provides discovery status, refresh and disconnect controls.
 
-The same conversation surface also supports Kimi Code CLI over ACP. Build with
-`--features gui,kimi`, use `--kimi` with the owner socket, and choose models,
-thinking and modes from the connected session. Kimi retains its own process
-privileges and its approvals are separate from vault update permission. Multiple
-MCP clients can use the owner concurrently. See [Kimi setup](docs/kimi.md).
+A different provider starts a separate conversation after confirmation when the
+source has history. Its prompt and explicit attachment snapshots are copied; the
+source and its work remain available. Chats continue to receive updates while
+Notes, Research or another chat is visible. Tanglewood holds local drafts and
+observed state; the agents remain authoritative for execution. A disconnected
+client does not establish that remote work has stopped. See [Codex setup](docs/codex.md)
+and [Kimi setup](docs/kimi.md) for configuration and current protocol limits.
 The optional `sync` feature provides explicit authoritative CRDT migration:
 
 ```sh

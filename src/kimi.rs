@@ -429,8 +429,12 @@ impl Replay {
         if self.overflow {
             return;
         }
-        self.bytes = self.bytes.saturating_add(text.len());
+        let id = id.filter(|id| valid_id(id));
         let same = self.last_role.as_deref() == Some(role) && self.last_id.as_deref() == id;
+        self.bytes = self
+            .bytes
+            .saturating_add(text.len())
+            .saturating_add(if same { 0 } else { id.map_or(0, str::len) });
         if self.bytes > HISTORY_LIMIT || (!same && self.messages.len() >= ITEM_LIMIT) {
             self.overflow = true;
             return;
@@ -443,6 +447,8 @@ impl Replay {
             self.messages.push(HistoryMessage {
                 role: role.into(),
                 text: text.into(),
+                message_id: id.map(|id| format!("message:{id}")),
+                turn_id: None,
             });
             self.last_role = Some(role.into());
             self.last_id = id.map(str::to_owned);
@@ -1041,21 +1047,39 @@ impl Protocol {
                     PendingKind::Load { session } => session,
                     _ => unreachable!(),
                 };
-                if self.replay.overflow {
-                    self.opening = None;
-                    self.replay = Replay::default();
-                    writes.push(self.request(
-                        PendingKind::Close,
-                        "session/close",
-                        json!({"sessionId":target}),
-                    )?);
-                    events.push(KimiEvent::OpenFailed{session:Some(target),error:"Kimi history exceeds the display limit; the prior conversation and draft were retained".into()});
-                    return Ok((writes, events));
-                }
-                let opts = options(&result["configOptions"])?;
+                // Retain the owned identity before parsing any later fields so a
+                // malformed response cannot strand a session we just created.
                 if newly_created {
                     self.created.insert(target.clone());
                 }
+                let parsed = if self.replay.overflow {
+                    Err("Kimi history exceeds the display limit; the prior conversation and draft were retained".to_owned())
+                } else {
+                    options(&result["configOptions"])
+                };
+                let opts = match parsed {
+                    Ok(opts) => opts,
+                    Err(error) => {
+                        self.opening = None;
+                        self.replay = Replay::default();
+                        writes.push(self.request(
+                            if newly_created {
+                                PendingKind::CloseForDelete {
+                                    session: target.clone(),
+                                }
+                            } else {
+                                PendingKind::Close
+                            },
+                            "session/close",
+                            json!({"sessionId":target}),
+                        )?);
+                        events.push(KimiEvent::OpenFailed {
+                            session: Some(target),
+                            error,
+                        });
+                        return Ok((writes, events));
+                    }
+                };
                 self.known.insert(target.clone());
                 let old = self.session.replace(target.clone());
                 self.opening = None;
@@ -1435,6 +1459,31 @@ mod tests {
         json!(choices)
     }
     #[test]
+    fn failed_new_config_keeps_owned_id_for_acknowledged_cleanup() {
+        let mut p = setup();
+        let init = p.initialize().unwrap();
+        p.frame(response(&init, json!({"protocolVersion":1,"agentInfo":{"name":"Kimi Code CLI","version":"2.2.0"},"agentCapabilities":{"loadSession":true,"sessionCapabilities":{"list":{}}}}))).unwrap();
+        let (new, _) = p.command(KimiRequest::NewSession).unwrap();
+        let (writes, events) = p
+            .frame(response(
+                &new[0],
+                json!({"sessionId":"owned-helper","configOptions":"invalid"}),
+            ))
+            .unwrap();
+        assert!(
+            matches!(&events[0], KimiEvent::OpenFailed { session: Some(id), .. } if id == "owned-helper")
+        );
+        assert_eq!(writes[0]["method"], "session/close");
+        let (writes, _) = p.frame(response(&writes[0], json!({}))).unwrap();
+        assert_eq!(writes[0]["method"], "session/delete");
+        let (_, events) = p.frame(response(&writes[0], json!({}))).unwrap();
+        assert!(matches!(&events[0], KimiEvent::Deleted { session } if session == "owned-helper"));
+        assert!(
+            p.command(KimiRequest::DeleteCreatedSession("foreign".into()))
+                .is_err()
+        );
+    }
+    #[test]
     fn lifecycle_replay_config_permission_and_stale_updates() {
         let mut p = setup();
         let init = p.initialize().unwrap();
@@ -1449,7 +1498,9 @@ mod tests {
                 .is_err()
         );
         let (load, _) = p.command(KimiRequest::LoadSession("old".into())).unwrap();
-        p.frame(json!({"method":"session/update","params":{"sessionId":"old","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"past"}}}})).unwrap();
+        p.frame(json!({"method":"session/update","params":{"sessionId":"old","update":{"sessionUpdate":"user_message_chunk","messageId":"first","content":{"type":"text","text":"past"}}}})).unwrap();
+        p.frame(json!({"method":"session/update","params":{"sessionId":"old","update":{"sessionUpdate":"user_message_chunk","messageId":"first","content":{"type":"text","text":" chunk"}}}})).unwrap();
+        p.frame(json!({"method":"session/update","params":{"sessionId":"old","update":{"sessionUpdate":"user_message_chunk","messageId":"second","content":{"type":"text","text":"past"}}}})).unwrap();
         p.frame(json!({"method":"session/update","params":{"sessionId":"foreign","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"wrong"}}}})).unwrap();
         let (_, events) = p
             .frame(response(
@@ -1458,7 +1509,7 @@ mod tests {
             ))
             .unwrap();
         assert!(
-            matches!(&events[0],KimiEvent::Opened{history,..} if history.len()==1 && history[0].text=="past")
+            matches!(&events[0],KimiEvent::Opened{history,..} if history.len()==2 && history[0].text=="past chunk" && history[0].message_id.as_deref()==Some("message:first") && history[1].text=="past" && history[1].message_id.as_deref()==Some("message:second"))
         );
         assert_eq!(p.options[1].groups[0].name.as_deref(), Some("Group"));
         let (set, _) = p

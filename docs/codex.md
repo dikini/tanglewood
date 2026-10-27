@@ -7,87 +7,43 @@ The protocol reference is the CLI-generated schema recorded in
 [official app-server documentation](https://learn.chatgpt.com/docs/app-server).
 A different CLI version fails visibly instead of silently changing protocol.
 
-The worker owns a single `codex app-server` child and its stdio JSONL pipes.
-It waits for the initialize response, sends initialized, then starts or resumes
-the vault's project. Thread creation/resume is explicit, and the adapter waits
-for the thread response before accepting a prompt. Opening a thread does not submit a turn. An explicitly activated persisted
-goal may allow the server to continue work; pause or clear it to stop goal pursuit. The model is the user's configured CLI default; the app
-does not silently choose a model or change global settings.
+Each connected conversation uses its own app-server client. Tanglewood owns
+local drafts, vault resources and partial observations in its existing ECS World;
+Codex remains authoritative for execution and server history. A conversation
+record can exist without a local client. Navigation never stops or disconnects
+an agent, and the app observes attached clients while Notes, Research or another
+chat is selected. Up to eight local conversation handles may be attached; the
+limit does not describe the number of remote agents working elsewhere. A lost
+connection makes the last observation stale and does not establish that work ended.
 
 ## Owner and UI integration
 
-`TanglewoodUi::with_codex(config)` attaches the lazy panel configuration;
-`CodexAdapter::spawn(CodexConfig, wake)` starts a dedicated worker after Connect. Configuration
-supplies the executable, an absolute existing working directory, the absolute
-`tanglewood-mcp` executable, the running App's socket, and an optional resume
-thread ID. Use a separate working directory, not the writable note vault. The
-App keeps exclusive ECS/vault ownership; the adapter holds no App handle.
+The composer offers one searchable list grouped by enabled Codex and Kimi
+configurations, plus the reasoning values supported by the confirmed model.
+Discovery is queued automatically when conversations open, with at most one
+separate metadata helper at a time. Codex discovery uses initialize and
+`model/list` only; it does not create a project or thread. Connections shows
+catalog status separately from active client counts and offers refresh, retry,
+stop and explicit disconnect controls. Choosing a model prepares the applicable
+connection and thread and never sends a prompt by itself. Codex model/effort
+choices apply to the next explicit turn without changing global CLI settings.
 
-The UI sends bounded `CodexRequest`s with `try_send` and drains `CodexEvent`s via
-`try_recv`. A wake callback requests a repaint when events or disconnection arrive.
-The Codex activity icon replaces the Notes sidebar with the vault's project and
-its paginated thread list. Connect/disconnect and new-thread icon buttons sit in
-the sidebar header, with tooltips and normal keyboard focus. The project menu
-provides rename and refresh. Selecting a thread loads bounded conversation
-history into the main area without starting a model turn. Notes selection,
-source drafts and reading position survive switching back.
+The vault's Codex project binding stores a stable creation idempotency key and
+requires a durable acknowledgement before opening its threads. Listed project
+threads can be opened and their available history loaded without starting a turn.
+External-origin results are visible only where the provider list/history APIs
+expose them; live observation of an externally running session is not guaranteed.
+The conversation list offers refresh and pagination. Codex thread menus offer
+rename, archive and remove, with confirmation for the latter operations and
+checks that protect local drafts and known active work.
 
-The vault stores its project ID, display name and a stable creation idempotency
-key in the existing SQLite owner. Creation intent is saved before connecting;
-returned identity and renames receive durable acknowledgements. A missing
-server project reports an error rather than silently creating a replacement.
-The binding is vault metadata; conversation history remains with Codex. It is
-not a cross-machine transcript synchronization feature.
-
-Each thread has a right-click menu and keyboard-focusable ellipsis button:
-Rename opens a title field; Archive hides the conversation from the active list;
-Remove permanently deletes it. Confirmation explains that archive/delete also
-affect spawned child threads. These use the real Codex APIs and update the UI
-only after acknowledgement. Server errors retain the conversation. An archived
-browser/restore action is outside this small follow-up; restore through Codex.
-
-Archive/remove are disabled while local conversation drafts or known active
-conversations could be affected. If another client removes a conversation,
-nonempty local prompts remain in visibly marked recovery rows, including drafts
-whose thread was outside the current page. Select a recovery row to copy/clear
-its source text; sending stays disabled. Removal retires active turn/approval
-state rather than leaving the UI busy. Ordinary rows remain capped at 256;
-recovery rows are additionally bounded by the 256-entry draft cache.
-
-The rounded composer has a compact model/reasoning popup along its bottom edge.
-It reads the current CLI's paginated `model/list` catalog (50/page, 128 total),
-shows model descriptions and only that model's advertised effort choices, with
-a discrete slider and default-effort reset. Choosing another model resets effort
-to a supported default. Start/resume shows the thread's effective model/effort.
-Choices are sent with the next explicit `turn/start` and then follow Codex's
-thread settings; nothing changes global CLI configuration or runs a model turn
-merely by opening/selecting a menu. Reconnect reloads the catalog. Until the user
-chooses an override, the adapter preserves CLI/thread defaults.
-
-Thread rows show small shape/colour indicators: blue ring/dot for working,
-amber filled/outlined diamonds for approval/input, a hollow circle for idle,
-a red cross for error, a dash for unloaded, and a question mark for unknown.
-Tooltips and accessibility labels explain the state. On connection or explicit
-refresh, `thread/list` supplies a snapshot; `thread/status/changed` then updates
-known threads over the existing stdio JSONL stream. No periodic polling or SSE
-connection is used. Loaded/subscribed threads can push runtime changes;
-unloaded/disconnected threads are never assumed idle.
-
-Send is disabled until Ready and while a turn is active. The panel offers
-Interrupt, explicit one-action approvals, disconnect and reconnect/resume.
-Clearing displayed messages does not erase server context. The display and
-cached prompts share a 2 MiB budget, with at most 256 messages/threads in the UI.
-Thread-list pages contain at most 50 entries; history pages contain 20 turns.
-An unsent draft belongs to its conversation until a successful switch. A new
-thread with an unsent prompt must be sent or cleared before selecting another
-thread, because Codex does not persist empty threads for later recovery.
-
-Start/resume responses must confirm the requested read-only sandbox, network
-restriction, on-request approval policy, user reviewer and canonical working
-directory before Ready. Only IDs returned for the vault's project may resume;
-the returned project association is also checked. Foreign status notifications
-are ignored. Worker request/event queues, known thread IDs, pending approvals,
-transcript history and outgoing data remain bounded.
+Choosing a different provider from a chat with history asks before starting a
+new chat. It copies only the exact prompt and explicit attachment snapshots;
+existing source and destination drafts, history, skills, goal and permissions
+remain with their own records. Work already running in the source continues.
+Stop and approval actions target the selected chat. Unconfirmed input remains
+available after rejection or uncertain transport loss; inspect the agent session
+before retrying an uncertain submission.
 
 ## Build and launch
 
@@ -108,8 +64,8 @@ subdirectory created below the vault directory. `--codex-resume THREAD_ID`
 selects an existing thread within the vault's project, then requires the same
 confirmed policy on resume.
 The MCP bridge executable is resolved next to the running Tanglewood binary.
-Open the Codex pane, use its header link icon to connect, choose or create a
-thread, then send a prompt explicitly. The optional
+Open the conversation pane, choose a model in the composer, then send a prompt
+explicitly after preparation completes. The optional
 `codex_smoke --live` example is a PM-owned live acceptance harness and can invoke
 paid model turns; building it does not run it.
 
@@ -284,8 +240,8 @@ are preserved unless changes are requested. No configurable profile registry is
 introduced in this pass.
 
 Access permits explicitly enabling network access for subsequent messages in the
-selected conversation. Opening another conversation resets access and approvals;
-Work/Plan default to network off, Research to on. The approval picker offers:
+selected conversation. Access choices and pending approvals remain scoped to
+their own conversation; Work/Plan default to network off, Research to on. The approval picker offers:
 
 | Mode | Approval policy / reviewer | Command sandbox |
 | --- | --- | --- |

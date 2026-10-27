@@ -320,6 +320,12 @@ struct QueuedEvent {
     bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartupPurpose {
+    Conversation,
+    Catalog,
+}
+
 pub struct CodexAdapter {
     requests: SyncSender<CodexRequest>,
     events: Receiver<QueuedEvent>,
@@ -332,6 +338,20 @@ impl CodexAdapter {
     /// Initializes the connection/project; legacy callers also create or resume a thread.
     /// Never starts a model turn.
     pub fn spawn(config: CodexConfig, wake: impl Fn() + Send + Sync + 'static) -> io::Result<Self> {
+        Self::spawn_for(config, wake, StartupPurpose::Conversation)
+    }
+    /// Discover models without reading/creating a project or opening a thread.
+    pub fn spawn_catalog(
+        config: CodexConfig,
+        wake: impl Fn() + Send + Sync + 'static,
+    ) -> io::Result<Self> {
+        Self::spawn_for(config, wake, StartupPurpose::Catalog)
+    }
+    fn spawn_for(
+        config: CodexConfig,
+        wake: impl Fn() + Send + Sync + 'static,
+        purpose: StartupPurpose,
+    ) -> io::Result<Self> {
         if config
             .project
             .as_ref()
@@ -366,7 +386,7 @@ impl CodexAdapter {
         let worker = thread::Builder::new()
             .name("tanglewood-codex".into())
             .spawn(move || {
-                if let Err(error) = run_worker(config, receive, &sink, &worker_stop) {
+                if let Err(error) = run_worker(config, receive, &sink, &worker_stop, purpose) {
                     sink.fail(format!("Codex disconnected: {error}"));
                 }
             })?;
@@ -548,7 +568,13 @@ impl EventSink {
                 thread.len()
                     + messages
                         .iter()
-                        .map(|m| m.role.len() + m.text.len() + 64)
+                        .map(|m| {
+                            m.role.len()
+                                + m.text.len()
+                                + m.message_id.as_ref().map_or(0, String::len)
+                                + m.turn_id.as_ref().map_or(0, String::len)
+                                + 64
+                        })
                         .sum::<usize>()
                     + next_cursor.as_ref().map_or(0, String::len)
                     + 64
@@ -663,6 +689,7 @@ struct Approval {
     decisions: Vec<ApprovalDecision>,
 }
 struct Protocol {
+    purpose: StartupPurpose,
     next_id: u64,
     pending: HashMap<u64, Pending>,
     approvals: HashMap<String, Approval>,
@@ -685,7 +712,11 @@ struct Protocol {
 }
 impl Protocol {
     fn new(config: &CodexConfig) -> Self {
+        Self::with_purpose(config, StartupPurpose::Conversation)
+    }
+    fn with_purpose(config: &CodexConfig, purpose: StartupPurpose) -> Self {
         Self {
+            purpose,
             project: config.project.clone(),
             project_ready: false,
             known_threads: Default::default(),
@@ -779,6 +810,14 @@ impl Protocol {
         self.request(RequestKind::Initialize, "initialize", json!({"clientInfo":{"name":"tanglewood","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}}))
     }
     fn command(&mut self, request: CodexRequest) -> Result<Vec<Value>, String> {
+        if self.purpose == StartupPurpose::Catalog
+            && !matches!(
+                request,
+                CodexRequest::ListModels { .. } | CodexRequest::Disconnect
+            )
+        {
+            return Err("catalog connections only support model listing".into());
+        }
         validate_context_request(&request)?;
         if self.pending.len() >= 14 {
             return Err("Codex has too many pending RPC requests".into());
@@ -1682,7 +1721,13 @@ impl Protocol {
                 }
                 RequestKind::Initialize => {
                     writes.push(json!({"method":"initialized","params":{}}));
-                    if let Some(project) = self.project.clone() {
+                    if self.purpose == StartupPurpose::Catalog {
+                        writes.push(self.request(
+                            RequestKind::Models { reset: true },
+                            "model/list",
+                            json!({"cursor": null, "limit":50, "includeHidden":false}),
+                        ));
+                    } else if let Some(project) = self.project.clone() {
                         let (method, params) = if let Some(id) = project.project_id {
                             ("project/read", json!({"projectId":id}))
                         } else {
@@ -1773,6 +1818,18 @@ impl Protocol {
                     let mut messages = Vec::new();
                     for turn in data.iter().rev() {
                         for item in turn["items"].as_array().into_iter().flatten() {
+                            let valid_id = |value: &Value| {
+                                value
+                                    .as_str()
+                                    .filter(|id| {
+                                        !id.is_empty()
+                                            && id.len() <= THREAD_ID_LIMIT
+                                            && !id.chars().any(char::is_control)
+                                    })
+                                    .map(str::to_owned)
+                            };
+                            let turn_id = valid_id(&turn["id"]);
+                            let message_id = valid_id(&item["id"]);
                             if events.len() < 128 {
                                 context_item(&thread, item, &mut events);
                             }
@@ -1780,6 +1837,8 @@ impl Protocol {
                                 Some("agentMessage") => messages.push(HistoryMessage {
                                     role: "Codex".into(),
                                     text: field(item, "text")?,
+                                    message_id,
+                                    turn_id,
                                 }),
                                 Some("userMessage") => {
                                     let text = item["content"]
@@ -1793,6 +1852,8 @@ impl Protocol {
                                     messages.push(HistoryMessage {
                                         role: "You".into(),
                                         text,
+                                        message_id,
+                                        turn_id,
                                     });
                                 }
                                 _ => {}
@@ -2422,6 +2483,7 @@ fn run_worker(
     requests: Receiver<CodexRequest>,
     sink: &EventSink,
     stop: &AtomicBool,
+    purpose: StartupPurpose,
 ) -> Result<(), String> {
     sink.emit(CodexEvent::Connecting)?;
     config.cwd = std::fs::canonicalize(&config.cwd)
@@ -2431,7 +2493,7 @@ fn run_worker(
     }
     verify_version(&config, stop)?;
     let mut process = Process::spawn(&config)?;
-    let mut protocol = Protocol::new(&config);
+    let mut protocol = Protocol::with_purpose(&config, purpose);
     process.enqueue(protocol.initialize())?;
     while !stop.load(Ordering::Acquire) {
         for _ in 0..16 {
@@ -2494,6 +2556,29 @@ fn run_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn catalog_initialization_lists_models_without_project_or_thread() {
+        let config = CodexConfig {
+            executable: "codex".into(),
+            cwd: "/tmp".into(),
+            mcp_bridge: "/tmp/bridge".into(),
+            socket: "/tmp/app.sock".into(),
+            resume_thread: Some("existing".into()),
+            project: None,
+        };
+        let mut protocol = Protocol::with_purpose(&config, StartupPurpose::Catalog);
+        protocol.initialize();
+        let (writes, _) = protocol.frame(json!({"id": 1, "result": {}})).unwrap();
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[0]["method"], "initialized");
+        assert_eq!(writes[1]["method"], "model/list");
+        assert!(
+            protocol
+                .command(CodexRequest::SendPrompt("must not send".into()))
+                .is_err()
+        );
+        assert!(protocol.command(CodexRequest::CreateThread).is_err());
+    }
     #[test]
     fn child_plan_tool_and_explicit_approval_modes_have_real_fields() {
         let args = child_server_args("mcp_servers={}");
@@ -3362,9 +3447,9 @@ mod tests {
             .command(CodexRequest::LoadHistory { cursor: None })
             .unwrap();
         assert_eq!(history[0]["method"], "thread/turns/list");
-        let (_,events)=p.frame(json!({"id":5,"result":{"data":[{"items":[{"type":"userMessage","content":[{"type":"text","text":"hello"}]},{"type":"agentMessage","text":"reply"}]}],"nextCursor":null}})).unwrap();
+        let (_,events)=p.frame(json!({"id":5,"result":{"data":[{"id":"turn-a","items":[{"id":"user-a","type":"userMessage","content":[{"type":"text","text":"hello"}]},{"id":"agent-a","type":"agentMessage","text":"reply"}]}],"nextCursor":null}})).unwrap();
         assert!(
-            matches!(&events[0],CodexEvent::History {messages,..} if messages.len()==2 && messages[0].text=="hello")
+            matches!(&events[0],CodexEvent::History {messages,..} if messages.len()==2 && messages[0].text=="hello" && messages[0].message_id.as_deref()==Some("user-a") && messages[0].turn_id.as_deref()==Some("turn-a") && messages[1].message_id.as_deref()==Some("agent-a"))
         );
         let rename = p
             .command(CodexRequest::RenameProject("Renamed".into()))

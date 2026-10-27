@@ -176,3 +176,26 @@ is included.
 | KA3 adapter and shared GUI | kimi_develop (GPT-6.1 Terra max) | done | Final combined bins build; Kimi-only check; focused ACP/provider/MCP regressions pass |
 | KA4 review/develop loop | same developer + reviewer | READY, cycle 3/4 | Seven concrete findings resolved; same Sol 6.1 xhigh reviewer approved frozen output |
 | KA5 native/live integration evidence | root | done with limits | Kimi2.2 stream/MCP durable edit/restart/cancel pass; native model/provider/draft reconnect/compact overlay/editor pass; live permissions/rejection not observed; docs/kimi-live-evidence.md |
+
+
+## Unified model selection and provider connections (2026-10-27)
+
+User-approved taste critique: one composer model picker, provider grouping,
+model-specific reasoning, automatic preparation and centralized connections.
+Codex/Kimi own execution; Tanglewood is a client owning vault resources and
+partial observed conversation records. Shell visibility only selects a projection;
+hidden conversations continue observation, and disconnected/unknown is not idle.
+The user additionally requires ECS-backed conversation state alongside notes,
+using the existing App World; UI domain-state ownership is a bug.
+Model roles explicitly requested: Sol 6.1 xhigh designer and independent reviewer;
+GPT-6.1 Terra max developer. Isolated branch `codex/model-picker`, from main
+`b495042`. The user subsequently authorized a local commit, squash merge onto
+main and worktree/branch cleanup. No remote publication is included.
+
+| Task | Owner | State | Evidence / next |
+| --- | --- | --- | --- |
+| UM1 UX/state contracts and bounded plan | model_flow_design (Sol 6.1 xhigh) | done | ECS amendment independently READY; prior reviewed UX unchanged |
+| UM2 independent design/code review | model_flow_review (Sol 6.1 xhigh) | done | Final READY round 4/4; catalog, recovery/coordination/UX and ordered replay findings resolved |
+| UM3 implementation and focused validation | model_flow_develop (GPT-6.1 Terra max) | done | ECS records and App-owned clients; bounded background polling; focused regressions and feature builds pass |
+| UM3a pure model/Connections widgets | model_picker_widgets (GPT-6.1 Terra max) | done | Pure renderer frozen, rustfmt passed; ownership handed to primary for integration, no standalone Cargo |
+| UM4 native acceptance and evidence | root | done with limits | Native fixture concurrent/targeted/reconnect/compact pass; real installed catalogs/search and normal close pass; docs/model-picker-evidence.md |

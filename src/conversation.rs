@@ -42,7 +42,7 @@ pub struct PlanStep {
     pub status: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PromptAttachment {
     pub name: String,
     pub text: String,
@@ -70,6 +70,9 @@ pub struct ThreadSummary {
 pub struct HistoryMessage {
     pub role: String,
     pub text: String,
+    /// Provider-supplied identity only; absent IDs are never invented.
+    pub message_id: Option<String>,
+    pub turn_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -138,7 +141,7 @@ pub struct GoalInfo {
     pub time_used_seconds: u64,
     pub token_budget: Option<u64>,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SkillInfo {
     pub name: String,
     pub path: String,
@@ -154,6 +157,7 @@ pub struct ConnectionInfo {
 
 /// Provider-specific commands retain their native semantics.
 #[cfg(any(feature = "codex", feature = "kimi"))]
+#[derive(Clone, Debug)]
 pub enum Request {
     #[cfg(feature = "codex")]
     Codex(crate::codex::CodexRequest),

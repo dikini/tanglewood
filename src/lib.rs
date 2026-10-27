@@ -29,6 +29,12 @@ pub mod sync;
 #[cfg(all(target_os = "linux", feature = "conversation"))]
 pub mod conversation;
 
+#[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
+pub(crate) mod conversation_runtime;
+
+#[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
+pub(crate) mod model_catalog;
+
 #[cfg(all(target_os = "linux", feature = "codex"))]
 pub mod codex;
 

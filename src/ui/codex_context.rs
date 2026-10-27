@@ -1,35 +1,15 @@
 //! View-local Codex context. Source snapshots are explicit inputs, never vault paths.
 use super::theme;
-use crate::conversation::{
-    ConnectionInfo, ContextFile, GoalInfo, PlanStep, PromptAttachment, SkillInfo,
-};
+use crate::conversation::{ContextFile, PromptAttachment};
+use crate::conversation_runtime::ContextData;
+#[cfg(test)]
+use crate::conversation::SkillInfo;
 use crate::{app::App, notes::NoteId};
 use eframe::egui;
-use std::{collections::HashMap, io::Read, path::PathBuf, sync::mpsc};
+use std::{io::Read, path::PathBuf, sync::mpsc};
 
 const INPUT_LIMIT: usize = 256 * 1024;
 const PREVIEW_LIMIT: usize = 8 * 1024 * 1024;
-#[derive(Clone, Default)]
-pub(super) struct DraftContext {
-    pub attachments: Vec<PromptAttachment>,
-    pub skills: Vec<SkillInfo>,
-}
-impl DraftContext {
-    pub fn bytes(&self) -> usize {
-        self.attachments
-            .iter()
-            .map(|a| a.name.len() + a.text.len())
-            .sum::<usize>()
-            + self
-                .skills
-                .iter()
-                .map(|s| s.name.len() + s.path.len() + s.description.len())
-                .sum::<usize>()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.attachments.is_empty() && self.skills.is_empty()
-    }
-}
 pub(super) enum Action {
     Refresh,
     SetGoal(String),
@@ -55,23 +35,13 @@ struct LoadedFile {
 #[derive(Default)]
 pub(super) struct ContextUi {
     pub open: bool,
-    pub goal: Option<GoalInfo>,
-    pub goal_loaded: bool,
-    pub plan: Vec<PlanStep>,
-    pub plan_text: Option<String>,
-    pub files: Vec<ContextFile>,
-    pub skills: Vec<SkillInfo>,
-    pub connections: Vec<ConnectionInfo>,
-    pub capabilities_loaded: bool,
-    pub draft: DraftContext,
-    cached: HashMap<String, DraftContext>,
     tab: usize,
     goal_dialog: Option<String>,
     file_dialog: Option<String>,
     job: Option<mpsc::Receiver<LoadedFile>>,
     preview: Option<(String, PreviewPayload)>,
-    generation: u64,
     job_attach: bool,
+    pending_attachment: Option<PathBuf>,
     preview_generation: u64,
     error: Option<String>,
 }
@@ -140,14 +110,14 @@ fn file_card(ui: &mut egui::Ui, file: &ContextFile, enabled: bool) -> bool {
 
 impl ContextUi {
     fn file_cards(
-        &mut self,
+        &mut self, data: &mut ContextData,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         cwd: &std::path::Path,
         limit: usize,
     ) {
         let mut open = None;
-        for file in self.files.iter().take(limit) {
+        for file in data.files.iter().take(limit) {
             ui.push_id(&file.path, |ui| {
                 if file_card(ui, file, !self.loading()) {
                     open = Some(file.path.clone());
@@ -158,7 +128,7 @@ impl ContextUi {
             let path = PathBuf::from(path);
             self.open = true;
             self.tab = 2;
-            self.load(
+            self.load(data,
                 if path.is_absolute() {
                     path
                 } else {
@@ -170,21 +140,21 @@ impl ContextUi {
         }
     }
     pub fn transcript_files(
-        &mut self,
+        &mut self, data: &mut ContextData,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         cwd: &std::path::Path,
     ) {
-        if self.files.is_empty() {
+        if data.files.is_empty() {
             return;
         }
         ui.add_space(8.0);
         ui.strong("Files and artifacts");
         ui.weak("Reported in this conversation");
-        self.file_cards(ui, ctx, cwd, 3);
-        if self.files.len() > 3
+        self.file_cards(data, ui, ctx, cwd, 3);
+        if data.files.len() > 3
             && ui
-                .button(format!("View all {} files", self.files.len()))
+                .button(format!("View all {} files", data.files.len()))
                 .clicked()
         {
             self.open = true;
@@ -194,8 +164,8 @@ impl ContextUi {
     pub fn open_goal_dialog(&mut self, prefill: String) {
         self.goal_dialog = Some(prefill.chars().take(4000).collect());
     }
-    pub fn goal_banner(&mut self, ui: &mut egui::Ui, enabled: bool) -> Option<Action> {
-        let goal = self.goal.as_ref()?;
+    pub fn goal_banner(&mut self, data: &mut ContextData, ui: &mut egui::Ui, enabled: bool) -> Option<Action> {
+        let goal = data.goal.as_ref()?;
         let mut action = None;
         let mut expand = false;
         egui::Frame::new()
@@ -263,84 +233,17 @@ impl ContextUi {
         ui.add_space(4.0);
         action
     }
-    pub fn has_draft(&self) -> bool {
-        !self.draft.is_empty() || (self.loading() && self.job_attach)
-    }
-    pub fn cached_draft(&self, id: &str) -> bool {
-        self.cached.get(id).is_some_and(|d| !d.is_empty())
-    }
-    pub fn any_drafts(&self) -> bool {
-        self.has_draft() || self.cached.values().any(|d| !d.is_empty())
-    }
-    pub fn bytes(&self) -> usize {
-        self.draft.bytes() + self.cached.values().map(DraftContext::bytes).sum::<usize>()
-    }
     pub fn loading(&self) -> bool {
         self.job.is_some()
     }
-    pub fn switch(&mut self, old: &str, new: &str, carry: bool) {
-        self.generation = self.generation.wrapping_add(1);
-        if !carry {
-            let draft = std::mem::take(&mut self.draft);
-            if !draft.is_empty() {
-                self.cached.insert(old.into(), draft);
-            } else {
-                self.cached.remove(old);
-            }
-            self.draft = self.cached.remove(new).unwrap_or_default();
-        }
-        self.goal = None;
-        self.goal_loaded = false;
-        self.plan.clear();
-        self.plan_text = None;
-        self.files.clear();
+    pub fn switch(&mut self, data: &mut ContextData, old: &str, new: &str, carry: bool) {
+        data.switch(old, new, carry);
         self.preview = None;
     }
-    pub fn retire(&mut self, id: &str, current: bool) {
-        if !self.cached_draft(id) {
-            self.cached.remove(id);
-        }
-        if current {
-            if self.loading() && !self.job_attach {
-                self.generation = self.generation.wrapping_add(1);
-            }
-            self.goal = None;
-            self.goal_loaded = false;
-            self.plan.clear();
-            self.plan_text = None;
-            self.files.clear();
-        }
+    pub fn retire(&mut self, data: &mut ContextData, id: &str, current: bool) {
+        data.retire(id, current, self.loading() && !self.job_attach);
     }
-    pub fn merge_files(&mut self, files: Vec<ContextFile>) {
-        for file in files {
-            if let Some(old) = self.files.iter_mut().find(|f| f.path == file.path) {
-                *old = file;
-            } else if self.files.len() < 128 {
-                self.files.push(file);
-            }
-        }
-    }
-    pub fn total_input_bytes(&self) -> usize {
-        self.draft
-            .attachments
-            .iter()
-            .map(|a| a.name.len() + a.text.len() + 64)
-            .sum::<usize>()
-            + self
-                .draft
-                .skills
-                .iter()
-                .map(|s| s.name.len() + s.path.len() + s.description.len() + 64)
-                .sum::<usize>()
-    }
-    pub fn skills_valid(&self) -> bool {
-        self.draft.skills.iter().all(|selected| {
-            self.skills
-                .iter()
-                .any(|s| s.enabled && s.path == selected.path && s.name == selected.name)
-        })
-    }
-    fn attach(&mut self, attachment: PromptAttachment) {
+    fn attach(&mut self, data: &mut ContextData, attachment: PromptAttachment) {
         if attachment.name.len() > 256 || attachment.name.chars().any(char::is_control) {
             self.error = Some(
                 "Attachment name exceeds the supported length or contains control characters."
@@ -348,9 +251,8 @@ impl ContextUi {
             );
             return;
         }
-        if self.draft.attachments.len() >= 8
-            || self
-                .draft
+        if data.draft.attachments.len() >= 8
+            || data.draft
                 .attachments
                 .iter()
                 .map(|a| a.text.len() + a.name.len())
@@ -362,16 +264,23 @@ impl ContextUi {
             self.error=Some("Attachment limit: eight text snapshots, 256 KiB total. Existing attachments retained.".into());
             return;
         }
-        self.draft.attachments.push(attachment);
+        data.draft.attachments.push(attachment);
     }
-    fn load(&mut self, path: PathBuf, attach: bool, ctx: &egui::Context) {
+    pub fn take_attachment_request(&mut self) -> Option<PathBuf> { self.pending_attachment.take() }
+    fn load(&mut self, data: &mut ContextData, path: PathBuf, attach: bool, ctx: &egui::Context) {
+        if attach {
+            if !data.file_job_pending && self.pending_attachment.is_none() { self.pending_attachment=Some(path); }
+            return;
+        }
         if self.loading() {
             return;
         }
         let (tx, rx) = mpsc::sync_channel(1);
         self.job = Some(rx);
+        data.file_job_pending = true;
         self.job_attach = attach;
-        let generation = self.generation;
+        data.attachment_pending = attach;
+        let generation = data.generation;
         let wake = ctx.clone();
         std::thread::spawn(move || {
             let result = (|| {
@@ -434,15 +343,17 @@ impl ContextUi {
             wake.request_repaint();
         });
     }
-    pub fn poll(&mut self, ctx: &egui::Context) {
+    pub fn poll(&mut self, data: &mut ContextData, ctx: &egui::Context) {
         let Some(job) = &self.job else {
             return;
         };
         match job.try_recv() {
             Ok(file) => {
                 self.job = None;
+                data.file_job_pending = false;
                 self.job_attach = false;
-                if file.generation != self.generation {
+                data.attachment_pending = false;
+                if file.generation != data.generation {
                     self.error=Some("File operation canceled because the conversation changed. Select the file again to attach or preview it.".into());
                     return;
                 }
@@ -455,7 +366,7 @@ impl ContextUi {
                             .chars()
                             .take(256)
                             .collect();
-                        self.attach(PromptAttachment { name, text });
+                        self.attach(data, PromptAttachment { name, text });
                     }
                     Ok(payload) => {
                         self.preview_generation = self.preview_generation.wrapping_add(1);
@@ -476,13 +387,16 @@ impl ContextUi {
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.job = None;
+                data.file_job_pending = false;
+                self.job_attach = false;
+                data.attachment_pending = false;
                 self.error = Some("File reader stopped; existing inputs retained.".into());
             }
             Err(mpsc::TryRecvError::Empty) => {}
         }
     }
     pub fn composer(
-        &mut self,
+        &mut self, data: &mut ContextData,
         ui: &mut egui::Ui,
         app: &App,
         selected: Option<NoteId>,
@@ -502,7 +416,7 @@ impl ContextUi {
                 .clicked()
             {
                 if let Some(note) = selected.and_then(|id| app.note(id).ok()) {
-                    self.attach(PromptAttachment {
+                    self.attach(data, PromptAttachment {
                         name: note.note.path.clone(),
                         text: format!(
                             "Note source snapshot; revision {}\n\n{}",
@@ -523,7 +437,7 @@ impl ContextUi {
                             .take(128)
                         {
                             if ui.button(&note.note.path).clicked() {
-                                self.attach(PromptAttachment {
+                                self.attach(data, PromptAttachment {
                                     name: note.note.path,
                                     text: format!(
                                         "Note source snapshot; revision {}\n\n{}",
@@ -542,14 +456,14 @@ impl ContextUi {
             if !kimi {
             ui.separator();
             ui.menu_button("Skills / plugins", |ui| {
-                if self.skills.is_empty() {
+                if data.skills.is_empty() {
                     ui.weak("No available skills reported.");
                 }
                 egui::ScrollArea::vertical()
                     .max_height(280.0)
                     .show(ui, |ui| {
-                        for skill in &self.skills {
-                            let selected = self.draft.skills.iter().any(|s| s.path == skill.path);
+                        for skill in &data.skills {
+                            let selected = data.draft.skills.iter().any(|s| s.path == skill.path);
                             if ui
                                 .add_enabled(
                                     skill.enabled,
@@ -559,9 +473,9 @@ impl ContextUi {
                                 .clicked()
                             {
                                 if selected {
-                                    self.draft.skills.retain(|s| s.path != skill.path);
-                                } else if self.draft.skills.len() < 8 {
-                                    self.draft.skills.push(skill.clone());
+                                    data.draft.skills.retain(|s| s.path != skill.path);
+                                } else if data.draft.skills.len() < 8 {
+                                    data.draft.skills.push(skill.clone());
                                 }
                                 ui.close();
                             }
@@ -570,7 +484,7 @@ impl ContextUi {
             });
             if ui.button("Set goal…").clicked() {
                 self.goal_dialog = Some(
-                    self.goal
+                    data.goal
                         .as_ref()
                         .map(|g| g.objective.clone())
                         .unwrap_or_default(),
@@ -590,14 +504,14 @@ impl ContextUi {
         });
         action
     }
-    pub fn chips(&mut self, ui: &mut egui::Ui) {
-        if self.draft.is_empty() {
+    pub fn chips(&mut self, data: &mut ContextData, ui: &mut egui::Ui) {
+        if data.draft.is_empty() {
             return;
         }
         let mut remove_attachment = None;
         let mut remove_skill = None;
         ui.horizontal_wrapped(|ui| {
-            for (index, attachment) in self.draft.attachments.iter().enumerate() {
+            for (index, attachment) in data.draft.attachments.iter().enumerate() {
                 let remove = ui
                     .add(
                         egui::Button::new(format!("{}  ×", attachment.name))
@@ -622,7 +536,7 @@ impl ContextUi {
                     remove_attachment = Some(index);
                 }
             }
-            for (index, skill) in self.draft.skills.iter().enumerate() {
+            for (index, skill) in data.draft.skills.iter().enumerate() {
                 let remove = ui
                     .add(
                         egui::Button::new(format!("${}  ×", skill.name))
@@ -643,14 +557,14 @@ impl ContextUi {
             }
         });
         if let Some(index) = remove_attachment {
-            self.draft.attachments.remove(index);
+            data.draft.attachments.remove(index);
         }
         if let Some(index) = remove_skill {
-            self.draft.skills.remove(index);
+            data.draft.skills.remove(index);
         }
     }
     pub fn panel(
-        &mut self,
+        &mut self, data: &mut ContextData,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         cwd: &std::path::Path,
@@ -666,10 +580,10 @@ impl ContextUi {
             });
             ui.add_space(12.0);
             ui.strong("Plan");
-            if self.plan.is_empty() {
+            if data.plan.is_empty() {
                 ui.weak("No plan reported yet.");
             }
-            for step in &self.plan {
+            for step in &data.plan {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(match step.status.as_str() {
                         "completed" => "✓",
@@ -701,32 +615,32 @@ impl ContextUi {
         ui.add_space(12.0);
         egui::ScrollArea::vertical().show(ui,|ui| {match self.tab {
             0=>{
-                if let Some(goal)=&self.goal {ui.label(&goal.objective);ui.weak(&goal.status);ui.weak(format!("{} tokens used{}",goal.tokens_used,goal.token_budget.map(|b|format!(" / {b}")).unwrap_or_default()));}
-                else {ui.weak(if self.goal_loaded {"No goal set."} else {"Goal not loaded."});}
-                if ui.add_enabled(ready,egui::Button::new("Set goal…")).clicked() {self.goal_dialog=Some(self.goal.as_ref().map(|g|g.objective.clone()).unwrap_or_default());}
-                if self.goal.is_some() {ui.horizontal(|ui| {if ui.add_enabled(ready,egui::Button::new("Pause")).clicked() {action=Some(Action::PauseGoal);}if ui.add_enabled(ready,egui::Button::new("Clear goal")).clicked() {action=Some(Action::ClearGoal);}});}
+                if let Some(goal)=&data.goal {ui.label(&goal.objective);ui.weak(&goal.status);ui.weak(format!("{} tokens used{}",goal.tokens_used,goal.token_budget.map(|b|format!(" / {b}")).unwrap_or_default()));}
+                else {ui.weak(if data.goal_loaded {"No goal set."} else {"Goal not loaded."});}
+                if ui.add_enabled(ready,egui::Button::new("Set goal…")).clicked() {self.goal_dialog=Some(data.goal.as_ref().map(|g|g.objective.clone()).unwrap_or_default());}
+                if data.goal.is_some() {ui.horizontal(|ui| {if ui.add_enabled(ready,egui::Button::new("Pause")).clicked() {action=Some(Action::PauseGoal);}if ui.add_enabled(ready,egui::Button::new("Clear goal")).clicked() {action=Some(Action::ClearGoal);}});}
             }
             1=>{
-                if let Some(text)=&self.plan_text {ui.add(egui::Label::new(text).selectable(true).wrap());}
-                if self.plan.is_empty() && self.plan_text.is_none() {ui.weak("No plan reported by Codex yet.");}
-                for step in &self.plan {ui.horizontal_wrapped(|ui| {ui.label(match step.status.as_str() {"completed"=>"✓","inProgress"=>"●",_=>"○"});ui.label(&step.text);});}
+                if let Some(text)=&data.plan_text {ui.add(egui::Label::new(text).selectable(true).wrap());}
+                if data.plan.is_empty() && data.plan_text.is_none() {ui.weak("No plan reported by Codex yet.");}
+                for step in &data.plan {ui.horizontal_wrapped(|ui| {ui.label(match step.status.as_str() {"completed"=>"✓","inProgress"=>"●",_=>"○"});ui.label(&step.text);});}
             }
             2=>{
-                if self.files.is_empty() {ui.weak("No files or images reported in loaded history.");}
-                self.file_cards(ui, ctx, cwd, usize::MAX);
+                if data.files.is_empty() {ui.weak("No files or images reported in loaded history.");}
+                self.file_cards(data, ui, ctx, cwd, usize::MAX);
                 if let Some((name,payload))=&mut self.preview {ui.separator();ui.weak(name.as_str());match payload {PreviewPayload::Text(text)=>{ui.add(egui::TextEdit::multiline(text).interactive(false).desired_width(f32::INFINITY));},PreviewPayload::Image(texture)=>{ui.add(egui::Image::new((texture.id(),texture.size_vec2())).max_width(ui.available_width()));}}}
             }
             _=>{
                 ui.weak("Available capabilities from this Codex connection");
-                if !self.capabilities_loaded {ui.weak("Capabilities not loaded.");}
-                for connection in &self.connections {ui.label(&connection.name);ui.weak(format!("{} · {} tools",match connection.auth_status.as_str() {"unsupported"=>"No OAuth","oAuth"=>"OAuth","bearerToken"=>"Token auth","notLoggedIn"=>"Sign-in needed",_=>"Auth unknown"},connection.tools));}
-                ui.separator();ui.strong("Skills");for skill in &self.skills {ui.label(&skill.name).on_hover_text(&skill.description);}
+                if !data.capabilities_loaded {ui.weak("Capabilities not loaded.");}
+                for connection in &data.connections {ui.label(&connection.name);ui.weak(format!("{} · {} tools",match connection.auth_status.as_str() {"unsupported"=>"No OAuth","oAuth"=>"OAuth","bearerToken"=>"Token auth","notLoggedIn"=>"Sign-in needed",_=>"Auth unknown"},connection.tools));}
+                ui.separator();ui.strong("Skills");for skill in &data.skills {ui.label(&skill.name).on_hover_text(&skill.description);}
                 ui.add_space(8.0);ui.weak("Plugin installation and account connections are managed in Codex. This panel reports available skills and MCP connections.");
             }
         }});
         action
     }
-    pub fn dialogs(&mut self, ctx: &egui::Context, enabled: bool) -> Option<Action> {
+    pub fn dialogs(&mut self, data: &mut ContextData, ctx: &egui::Context, enabled: bool) -> Option<Action> {
         let mut action = None;
         if let Some(mut text) = self.goal_dialog.take() {
             let mut close = false;
@@ -758,7 +672,7 @@ impl ContextUi {
                         )
                         .clicked()
                     {
-                        self.load(PathBuf::from(path.trim()), true, ctx);
+                        self.load(data, PathBuf::from(path.trim()), true, ctx);
                         close = true;
                     }
                 });
@@ -787,28 +701,29 @@ mod tests {
     #[test]
     fn snapshots_and_skills_keep_thread_ownership_without_mutating_source() {
         let mut ui = ContextUi::default();
+        let mut data = ContextData::default();
         let text = "---\ntitle: Original\n---\n\nα `code`\n";
-        ui.attach(PromptAttachment {
+        ui.attach(&mut data, PromptAttachment {
             name: "Lesson.md".into(),
             text: text.into(),
         });
-        ui.switch("A", "B", false);
-        assert!(!ui.has_draft());
-        assert!(ui.cached_draft("A"));
-        ui.attach(PromptAttachment {
+        ui.switch(&mut data, "A", "B", false);
+        assert!(!data.has_draft());
+        assert!(data.cached_draft("A"));
+        ui.attach(&mut data, PromptAttachment {
             name: "B.md".into(),
             text: "Other".into(),
         });
-        ui.switch("B", "A", false);
-        assert_eq!(ui.draft.attachments[0].text, text);
-        ui.retire("B", false);
-        assert!(ui.cached_draft("B"));
-        let before = ui.draft.attachments.len();
-        ui.attach(PromptAttachment {
+        ui.switch(&mut data, "B", "A", false);
+        assert_eq!(data.draft.attachments[0].text, text);
+        ui.retire(&mut data, "B", false);
+        assert!(data.cached_draft("B"));
+        let before = data.draft.attachments.len();
+        ui.attach(&mut data, PromptAttachment {
             name: "Large.md".into(),
             text: "x".repeat(INPUT_LIMIT),
         });
-        assert_eq!(ui.draft.attachments.len(), before);
+        assert_eq!(data.draft.attachments.len(), before);
         assert!(ui.error.is_some());
         let skill = SkillInfo {
             name: "test".into(),
@@ -816,38 +731,32 @@ mod tests {
             description: "Test".into(),
             enabled: true,
         };
-        ui.draft.skills.push(skill.clone());
-        assert!(!ui.skills_valid());
-        ui.skills.push(skill);
-        assert!(ui.skills_valid());
+        data.draft.skills.push(skill.clone());
+        assert!(!data.skills_valid());
+        data.skills.push(skill);
+        assert!(data.skills_valid());
     }
     #[test]
-    fn background_file_reader_loads_exact_text_and_rejects_oversize() {
+    fn attachment_requests_are_targeted_and_preview_stays_view_local() {
         let root =
             std::env::temp_dir().join(format!("tanglewood-context-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
         let path = root.join("source.md");
         std::fs::write(&path, "# Exact\n\n尾\n").unwrap();
         let mut ui = ContextUi::default();
+        let mut data = ContextData::default();
         let ctx = egui::Context::default();
-        ui.load(path.clone(), true, &ctx);
-        assert!(ui.has_draft());
-        ui.retire("A", true); // External removal keeps the in-flight snapshot owned/recoverable.
-        let wait = |ui: &mut ContextUi| {
+        ui.load(&mut data, path.clone(), true, &ctx);
+        assert_eq!(ui.take_attachment_request(),Some(path.clone()));
+        assert!(!data.has_draft()); // The application owner performs the attachment job.
+        let wait = |ui: &mut ContextUi, data: &mut ContextData| {
             let end = std::time::Instant::now() + std::time::Duration::from_secs(2);
             while ui.loading() && std::time::Instant::now() < end {
-                ui.poll(&ctx);
+                ui.poll(data, &ctx);
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
             assert!(!ui.loading());
         };
-        wait(&mut ui);
-        assert_eq!(ui.draft.attachments[0].text, "# Exact\n\n尾\n");
-        std::fs::write(&path, vec![b'x'; INPUT_LIMIT + 1]).unwrap();
-        ui.load(path, true, &ctx);
-        wait(&mut ui);
-        assert_eq!(ui.draft.attachments.len(), 1);
-        assert!(ui.error.as_deref().unwrap().contains("exceeds"));
         let png = root.join("result.png");
         let mut bytes = Vec::new();
         {
@@ -858,21 +767,19 @@ mod tests {
             writer.write_image_data(&[255u8; 16]).unwrap();
         }
         std::fs::write(&png, bytes).unwrap();
-        ui.load(png, false, &ctx);
-        wait(&mut ui);
+        ui.load(&mut data, png, false, &ctx);
+        wait(&mut ui, &mut data);
         assert!(matches!(ui.preview, Some((_, PreviewPayload::Image(_)))));
         let svg = root.join("external.svg");
         std::fs::write(&svg, "<svg><image href='file:///never-read'/></svg>").unwrap();
-        ui.load(svg, false, &ctx);
-        wait(&mut ui);
+        ui.load(&mut data, svg, false, &ctx);
+        wait(&mut ui, &mut data);
         assert!(
             matches!(&ui.preview,Some((_,PreviewPayload::Text(text))) if text.contains("never-read"))
         );
-        ui.load(root.join("source.md"), true, &ctx);
-        ui.switch("A", "B", false);
-        wait(&mut ui);
-        assert!(!ui.has_draft());
-        assert!(ui.error.as_deref().unwrap().contains("canceled"));
+        ui.load(&mut data, root.join("source.md"), true, &ctx);
+        assert_eq!(ui.take_attachment_request(),Some(root.join("source.md")));
+        assert!(!data.has_draft());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

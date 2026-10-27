@@ -125,6 +125,12 @@ impl PaperReceipt {
         Ok(())
     }
 }
+#[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
+struct ConversationAttachmentJob {
+    id: Uuid,
+    context_generation: u64,
+    receiver: std::sync::mpsc::Receiver<Result<crate::conversation::PromptAttachment, String>>,
+}
 /// The application thread exclusively owns the ECS World.
 #[derive(Default)]
 pub struct App {
@@ -166,6 +172,22 @@ pub struct App {
     history_error: Option<String>,
     #[cfg(feature = "sync")]
     sync_conflicts: HashMap<NoteId, crate::sync::MergeConflicts>,
+    #[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
+    conversation_entities: HashMap<Uuid, Entity>,
+    #[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
+    conversation_remotes: HashMap<crate::conversation::ConversationKey, Uuid>,
+    #[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
+    conversation_clients: HashMap<Uuid, crate::conversation_runtime::ClientConnection>,
+    #[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
+    conversation_round_robin: VecDeque<Uuid>,
+    #[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
+    conversation_attachments: HashMap<Uuid, ConversationAttachmentJob>,
+    #[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
+    conversation_catalog: crate::model_catalog::ModelCatalog,
+    #[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
+    conversation_configs: HashMap<crate::model_catalog::ProviderKey, crate::model_catalog::ProviderConfig>,
+    #[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
+    conversation_wake: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     world: World,
     ids: HashMap<NoteId, Entity>,
     // Join file work before the following store releases the vault lock.
@@ -1438,6 +1460,8 @@ impl App {
     }
     /// Drain and submit a bounded amount of work without blocking the owner.
     pub fn tick(&mut self) {
+        #[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
+        self.tick_conversations();
         for _ in 0..32 {
             let ack = self.store.as_ref().and_then(Store::try_recv);
             let Some(ack) = ack else {
@@ -5201,4 +5225,1036 @@ mod tests {
             matches!(app.execute(Command::SearchNotes { query: "🦀".into(), include_trash: false }, Caller::Local).unwrap(), CommandResult::Notes(v) if v.len() == 1)
         );
     }
+}
+
+
+#[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
+impl App {
+    const CONVERSATION_HANDLE_LIMIT: usize = 8;
+    const CONVERSATION_EVENT_LIMIT: usize = 64;
+
+    /// Register the observation in the existing World. Indices contain identities only.
+    pub(crate) fn insert_conversation(&mut self, record: crate::conversation_runtime::ConversationRecord) -> Result<Uuid, String> {
+        let id = record.chat_id;
+        if self.conversation_entities.contains_key(&id) { return Err("Conversation identity already exists.".into()); }
+        if let Some(session) = &record.thread {
+            let key = crate::conversation::ConversationKey { backend: record.provider.backend, workspace: record.provider.workspace.clone(), session: session.clone() };
+            if self.conversation_remotes.contains_key(&key) { return Err("This provider conversation is already open.".into()); }
+            self.conversation_remotes.insert(key, id);
+        }
+        let entity = self.world.spawn(record).id();
+        self.conversation_entities.insert(id, entity);
+        Ok(id)
+    }
+    pub(crate) fn conversation(&self, id: Uuid) -> Option<&crate::conversation_runtime::ConversationRecord> {
+        self.conversation_entities.get(&id).and_then(|entity| self.world.get(*entity))
+    }
+    pub(crate) fn conversation_ids(&self) -> impl Iterator<Item = Uuid> + '_ { self.conversation_entities.keys().copied() }
+    pub(crate) fn conversation_for_remote(&self, key: &crate::conversation::ConversationKey) -> Option<Uuid> { self.conversation_remotes.get(key).copied() }
+    pub(crate) fn catalog(&self) -> &crate::model_catalog::ModelCatalog { &self.conversation_catalog }
+    pub(crate) fn catalog_mut(&mut self) -> &mut crate::model_catalog::ModelCatalog { &mut self.conversation_catalog }
+    pub(crate) fn register_conversation_provider(&mut self, config: crate::model_catalog::ProviderConfig) {
+        let key=config.key();
+        self.conversation_catalog.enable(config.clone());
+        self.conversation_configs.insert(key,config);
+    }
+    pub(crate) fn active_conversation_counts(&self) -> Vec<(crate::model_catalog::ProviderKey,usize)> {
+        let mut counts: HashMap<crate::model_catalog::ProviderKey,usize>=HashMap::new();
+        for id in self.conversation_clients.keys() {
+            if let Some(record)=self.conversation(*id) { *counts.entry(record.provider.clone()).or_default()+=1; }
+        }
+        counts.into_iter().collect()
+    }
+    pub(crate) fn set_conversation_waker(&mut self, wake: impl Fn() + Send + Sync + 'static) {
+        let wake = std::sync::Arc::new(wake);
+        let catalog_wake = wake.clone();
+        self.conversation_catalog.set_waker(move || catalog_wake());
+        self.conversation_wake = Some(wake);
+    }
+    /// The caller spawns an adapter for this record only. At capacity no existing client is evicted.
+    pub(crate) fn attach_conversation_client(&mut self, id: Uuid, adapter: crate::conversation::Adapter) -> Result<u64, String> {
+        use crate::conversation::{Adapter, Backend};
+        if self.conversation_clients.contains_key(&id) { return Err("This conversation already has a connection.".into()); }
+        if self.conversation_clients.len() >= Self::CONVERSATION_HANDLE_LIMIT { return Err("All eight conversation connections are in use. Disconnect one conversation and retry.".into()); }
+        let entity = *self.conversation_entities.get(&id).ok_or("Conversation no longer exists.")?;
+        let backend = match &adapter {
+            #[cfg(feature = "codex")] Adapter::Codex(_) => Backend::Codex,
+            #[cfg(feature = "kimi")] Adapter::Kimi(_) => Backend::Kimi,
+        };
+        let mut record = self.world.get_mut::<crate::conversation_runtime::ConversationRecord>(entity).ok_or("Conversation no longer exists.")?;
+        if record.provider.backend != backend { return Err("Connection belongs to a different provider.".into()); }
+        let generation = record.client_generation.checked_add(1).ok_or("Connection generation exhausted.")?;
+        record.prepare_connection();
+        record.client_generation = generation;
+        record.client_attached = true;
+        record.observation = if record.thread.is_some() {
+            crate::conversation_runtime::Freshness::Unconfirmed
+        } else {
+            crate::conversation_runtime::Freshness::NeverObserved
+        };
+        record.disconnecting = false;
+        record.status = "Connecting…".into();
+        record.error = None;
+        drop(record);
+        self.conversation_clients.insert(id, crate::conversation_runtime::ClientConnection { generation, adapter });
+        self.conversation_round_robin.push_back(id);
+        Ok(generation)
+    }
+    /// Accept only the current connection generation. Remote identities are unique across provider and workspace.
+    pub(crate) fn route_conversation_event(&mut self, id: Uuid, generation: u64, event: crate::conversation::Event) {
+        use crate::conversation::{ConversationKey, Event};
+        let Some(&entity) = self.conversation_entities.get(&id) else { return; };
+        let Some(record) = self.world.get::<crate::conversation_runtime::ConversationRecord>(entity) else { return; };
+        if !record.client_attached || record.client_generation != generation { return; }
+        let preparation_failed = match &event {
+            #[cfg(feature = "codex")] Event::Codex(crate::codex::CodexEvent::Disconnected(_) | crate::codex::CodexEvent::Error(_)) => true,
+            #[cfg(feature = "kimi")] Event::Kimi(crate::kimi::KimiEvent::OpenFailed {..} | crate::kimi::KimiEvent::OptionFailed {..} | crate::kimi::KimiEvent::Disconnected(_) | crate::kimi::KimiEvent::Error(_)) => true,
+            _ => false,
+        };
+        let settled_option = match &event {
+            #[cfg(feature = "kimi")] Event::Kimi(crate::kimi::KimiEvent::Options { settled, .. }) => *settled,
+            _ => false,
+        };
+        let announced = match &event {
+            #[cfg(feature = "codex")] Event::Codex(crate::codex::CodexEvent::Ready { thread }) => Some(thread),
+            #[cfg(feature = "kimi")] Event::Kimi(crate::kimi::KimiEvent::Opened { session, .. }) => Some(session),
+            _ => None,
+        };
+        if let Some(session) = announced {
+            let key = ConversationKey { backend: record.provider.backend, workspace: record.provider.workspace.clone(), session: session.clone() };
+            if self.conversation_remotes.get(&key).is_some_and(|owner| *owner != id) {
+                if let Some(mut record) = self.world.get_mut::<crate::conversation_runtime::ConversationRecord>(entity) {
+                    record.error = Some("This provider conversation is already represented by another chat. Open the existing chat instead.".into());
+                }
+                return;
+            }
+        }
+        let old_key = record.thread.as_ref().map(|session| ConversationKey { backend: record.provider.backend, workspace: record.provider.workspace.clone(), session: session.clone() });
+        let mut record = self.world.get_mut::<crate::conversation_runtime::ConversationRecord>(entity).unwrap();
+        record.reduce_event(event);
+        if preparation_failed && record.model_intent.is_some() {
+            if let Some(intent)=&mut record.model_intent {intent.phase=crate::conversation_runtime::ModelPhase::Failed;}
+            record.pending_thread=None; record.starting=false;
+        }
+        let new_key = record.thread.as_ref().map(|session| ConversationKey { backend: record.provider.backend, workspace: record.provider.workspace.clone(), session: session.clone() });
+        drop(record);
+        if old_key != new_key {
+            if let Some(key) = old_key { if self.conversation_remotes.get(&key) == Some(&id) { self.conversation_remotes.remove(&key); } }
+        }
+        if let Some(key) = new_key { self.conversation_remotes.insert(key, id); }
+        self.progress_model_intent(id, settled_option);
+    }
+    fn spawn_conversation_client(&mut self, id: Uuid) -> Result<(), String> {
+        use crate::conversation::Adapter;
+        if self.conversation_clients.contains_key(&id) { return Ok(()); }
+        if self.conversation_clients.len()>=Self::CONVERSATION_HANDLE_LIMIT { return Err("All eight conversation connections are in use. Disconnect one conversation and retry.".into()); }
+        let record=self.conversation(id).ok_or("Conversation no longer exists.")?;
+        let wake=self.conversation_wake.clone().unwrap_or_else(||std::sync::Arc::new(||{}));
+        let adapter=match record.provider.backend {
+            #[cfg(feature = "codex")]
+            crate::conversation::Backend::Codex => {
+                let config=record.config.clone();
+                let notify=wake.clone();
+                Adapter::Codex(crate::codex::CodexAdapter::spawn(config,move || notify()).map_err(|e|e.to_string())?)
+            }
+            #[cfg(feature = "kimi")]
+            crate::conversation::Backend::Kimi => {
+                let config=record.kimi.as_ref().ok_or("Kimi configuration missing.")?.config.clone();
+                let notify=wake.clone();
+                Adapter::Kimi(crate::kimi::KimiAdapter::spawn(config,move || notify()).map_err(|e|e.to_string())?)
+            }
+        };
+        let generation=self.attach_conversation_client(id,adapter)?;
+        if let Some(entity)=self.conversation_entities.get(&id).copied() {
+            if let Some(mut record)=self.world.get_mut::<crate::conversation_runtime::ConversationRecord>(entity) {
+                if let Some(intent)=&mut record.model_intent { intent.generation=generation; intent.phase=crate::conversation_runtime::ModelPhase::Waiting; }
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn create_conversation(&mut self, provider: &crate::model_catalog::ProviderKey) -> Result<Uuid,String> {
+        use crate::{conversation_runtime::ConversationRecord,model_catalog::ProviderConfig};
+        let config=self.conversation_configs.get(provider).cloned().ok_or("Provider is no longer enabled.")?;
+        let mut record=match config {
+            #[cfg(feature="codex")] ProviderConfig::Codex(mut config) => {config.resume_thread=None;ConversationRecord::new_codex(config)},
+            #[cfg(feature="kimi")] ProviderConfig::Kimi(mut config) => {config.resume_session=None;ConversationRecord::new_kimi(config)},
+        };
+        record.fresh_thread=true; self.insert_conversation(record)
+    }
+    pub(crate) fn open_remote_conversation(&mut self, source: Uuid, remote: &str) -> Result<Uuid,String> {
+        use crate::{conversation::ConversationKey,conversation_runtime::ConversationRecord,model_catalog::ProviderConfig};
+        let origin=self.conversation(source).ok_or("Conversation no longer exists.")?;
+        if !origin.threads.iter().any(|thread|thread.id==remote) || origin.unavailable_threads.contains(remote) {return Err("Refresh the provider's conversation list before opening this conversation.".into());}
+        let provider=origin.provider.clone();
+        let key=ConversationKey {backend:provider.backend,workspace:provider.workspace.clone(),session:remote.to_owned()};
+        if let Some(id)=self.conversation_for_remote(&key) {return Ok(id);}
+        let summaries=origin.threads.clone();
+        let config=self.conversation_configs.get(&provider).cloned().ok_or("Provider is no longer enabled.")?;
+        let mut record=match config {
+            #[cfg(feature="codex")] ProviderConfig::Codex(mut config) => {
+                if config.project.is_none() {return Err("Codex project membership is required to open an existing conversation.".into());}
+                config.resume_thread=Some(remote.to_owned());ConversationRecord::new_codex(config)
+            },
+            #[cfg(feature="kimi")] ProviderConfig::Kimi(mut config) => {config.resume_session=Some(remote.to_owned());ConversationRecord::new_kimi(config)},
+        };
+        record.thread=Some(remote.to_owned());record.threads=summaries;
+        let id=self.insert_conversation(record)?;
+        if let Err(error)=self.spawn_conversation_client(id) {
+            let entity=self.conversation_entities[&id];
+            if let Some(mut record)=self.world.get_mut::<ConversationRecord>(entity) {record.error=Some(format!("Could not load this conversation: {error}"));}
+        }
+        Ok(id)
+    }
+    pub(crate) fn set_conversation_vault_permission(&mut self,id:Uuid,allowed:Option<bool>) {
+        if let Some(entity)=self.conversation_entities.get(&id).copied() {
+            if let Some(mut record)=self.world.get_mut::<crate::conversation_runtime::ConversationRecord>(entity) {record.vault_write_enabled=allowed;}
+        }
+    }
+    pub(crate) fn set_conversation_research_workspace(&mut self,id:Uuid,workspace:Option<Uuid>) {
+        if let Some(entity)=self.conversation_entities.get(&id).copied() {
+            if let Some(mut record)=self.world.get_mut::<crate::conversation_runtime::ConversationRecord>(entity) {
+                if record.research_workspace!=workspace {record.research_workspace=workspace;record.relevant_sources=false;}
+            }
+        }
+    }
+    pub(crate) fn prepare_conversation_research(&mut self,id:Uuid,prompt:String,evidence:String,external:bool)->Result<(),String> {
+        let entity=*self.conversation_entities.get(&id).ok_or("Conversation no longer exists.")?;
+        let mut record=self.world.get_mut::<crate::conversation_runtime::ConversationRecord>(entity).ok_or("Conversation no longer exists.")?;
+        if !record.prompt.is_empty() || record.context_data.has_draft() || record.pending_thread.is_some() || record.history_loading || record.busy() {return Err("Conversation has a draft, context, or active work. Copy the prepared prompt or finish that work first.".into());}
+        if record.thread.is_none() || !record.ready {return Err("Open a conversation first. The prepared question and sources remain in Research.".into());}
+        if prompt.len()+evidence.len()+64>256*1024 {return Err("The prepared question and evidence exceed the 256 KiB input limit.".into());}
+        #[cfg(feature="codex")]
+        if !record.is_kimi() {
+            if record.controls.mode==crate::codex::WorkMode::Goal || record.controls.approval==crate::codex::ApprovalMode::FullAccess {return Err("Choose a sandboxed access profile and finish the active goal before preparing research.".into());}
+            record.controls.network_access=external;
+        }
+        record.prompt=prompt;
+        record.context_data.draft.attachments.push(crate::conversation::PromptAttachment {name:if external {"Research context · external gathering"} else {"Research sources"}.into(),text:evidence});
+        record.draft_revision=record.draft_revision.checked_add(1).ok_or("Draft revision exhausted.")?;
+        record.status="Research draft prepared · review before sending".into();
+        Ok(())
+    }
+    pub(crate) fn begin_conversation_shutdown(&mut self)->bool {
+        self.conversation_catalog.stop();
+        self.disconnect_all_conversations();
+        self.conversation_clients.is_empty() && self.conversation_catalog.is_stopped() && self.conversation_attachments.is_empty()
+    }
+    pub(crate) fn connect_conversation(&mut self,id:Uuid)->Result<(),String> {self.spawn_conversation_client(id)}
+    pub(crate) fn disconnect_all_conversations(&mut self) {
+        let ids:Vec<_>=self.conversation_clients.keys().copied().collect();
+        for id in ids {
+            if let Some(entity)=self.conversation_entities.get(&id).copied() {
+                if let Some(mut record)=self.world.get_mut::<crate::conversation_runtime::ConversationRecord>(entity) {record.disconnect();}
+            }
+        }
+    }
+    /// Create a separate target on a provider change. No prompt is submitted.
+    pub(crate) fn choose_conversation_model(&mut self, source: Uuid, key: crate::conversation_runtime::ModelKey) -> Result<Uuid,String> {
+        use crate::{conversation_runtime::{ConversationRecord,ModelIntent,ModelPhase,ModelPurpose},model_catalog::{ProviderConfig,Snapshot}};
+        let source_record=self.conversation(source).ok_or("Conversation no longer exists.")?;
+        let cross=source_record.provider!=key.provider;
+        if !cross && (source_record.busy() || source_record.approval_count()!=0 || source_record.model_intent.as_ref().is_some_and(|intent|intent.phase!=ModelPhase::Failed)) { return Err("Finish the current conversation operation before changing its model.".into()); }
+        let available=self.conversation_catalog.entries.iter().find(|entry|entry.key==key.provider).and_then(|entry|entry.snapshot.as_ref()).is_some_and(|snapshot| match snapshot {
+            #[cfg(feature="codex")] Snapshot::Codex(models) => key.option_id.is_none() && models.iter().any(|model|model.model==key.model),
+            #[cfg(feature="kimi")] Snapshot::Kimi(options) => options.iter().any(|option|option.category.as_deref()==Some("model") && Some(&option.id)==key.option_id.as_ref() && option.values().any(|value|value.value==key.model)),
+        });
+        if !available { return Err("That model is no longer in the available catalog. Refresh and choose again.".into()); }
+        let config=self.conversation_configs.get(&key.provider).cloned().ok_or("Provider is no longer enabled.")?;
+        let prompt=source_record.prompt.clone();
+        let attachments=source_record.context_data.draft.attachments.clone();
+        let purpose=if cross {ModelPurpose::NewWithTransfer} else if source_record.thread.is_none() {ModelPurpose::Fresh} else {ModelPurpose::InPlace};
+        let target=if cross {
+            let mut record=match config {
+                #[cfg(feature="codex")] ProviderConfig::Codex(mut config) => {config.resume_thread=None;ConversationRecord::new_codex(config)},
+                #[cfg(feature="kimi")] ProviderConfig::Kimi(mut config) => {config.resume_session=None;ConversationRecord::new_kimi(config)},
+            };
+            record.prompt=prompt; record.context_data.draft.attachments=attachments; record.fresh_thread=true;
+            self.insert_conversation(record)?
+        } else {source};
+        let entity=self.conversation_entities[&target];
+        let mut record=self.world.get_mut::<ConversationRecord>(entity).unwrap();
+        let generation=record.client_generation;
+        record.model_intent=Some(ModelIntent {id:Uuid::new_v4(),chat_id:target,key,generation,purpose,phase:ModelPhase::Waiting,baseline_modes:Vec::new()});
+        record.error=None; record.status="Preparing model…".into();
+        drop(record);
+        if let Err(error)=self.spawn_conversation_client(target) {
+            if let Some(mut record)=self.world.get_mut::<ConversationRecord>(entity) {
+                if let Some(intent)=&mut record.model_intent {intent.phase=ModelPhase::Failed;}
+                record.error=Some(format!("Could not prepare model: {error}. Your draft is retained; retry preparation."));
+            }
+        } else { self.progress_model_intent(target,false); }
+        Ok(target)
+    }
+    pub(crate) fn retry_conversation_model(&mut self, id: Uuid) -> Result<(),String> {
+        let entity=*self.conversation_entities.get(&id).ok_or("Conversation no longer exists.")?;
+        {
+            let mut record=self.world.get_mut::<crate::conversation_runtime::ConversationRecord>(entity).ok_or("Conversation no longer exists.")?;
+            let Some(intent)=&mut record.model_intent else {return Err("No model preparation to retry.".into());};
+            if intent.phase!=crate::conversation_runtime::ModelPhase::Failed {return Err("Model preparation is still in progress.".into());}
+            intent.phase=crate::conversation_runtime::ModelPhase::Waiting;
+            record.error=None;
+        }
+        if let Err(error)=self.spawn_conversation_client(id) {
+            let mut record=self.world.get_mut::<crate::conversation_runtime::ConversationRecord>(entity).unwrap();
+            if let Some(intent)=&mut record.model_intent {intent.phase=crate::conversation_runtime::ModelPhase::Failed;}
+            record.error=Some(error.clone()); return Err(error);
+        }
+        self.progress_model_intent(id,false); Ok(())
+    }
+    fn progress_model_intent(&mut self, id: Uuid, settled: bool) {
+        use crate::conversation_runtime::ModelPhase;
+        let Some(entity)=self.conversation_entities.get(&id).copied() else {return};
+        let Some(mut record)=self.world.get_mut::<crate::conversation_runtime::ConversationRecord>(entity) else {return};
+        let Some(intent)=record.model_intent.as_ref() else {return};
+        if intent.phase==ModelPhase::Failed || intent.chat_id!=id || intent.generation!=record.client_generation || !record.client_attached {return;}
+        let key=intent.key.clone(); let phase=intent.phase;
+        #[cfg(feature="kimi")]
+        if record.is_kimi() {
+            if record.thread.is_none() && record.project_ready && !record.threads_loading && record.pending_thread.is_none() {
+                record.fresh_thread=true; record.select_kimi(None); return;
+            }
+            if !record.ready {return;}
+            let options=record.kimi.as_ref().map(|state|state.options.clone()).unwrap_or_default();
+            let Some(option)=options.iter().find(|option|option.category.as_deref()==Some("model") && Some(&option.id)==key.option_id.as_ref()) else {
+                if let Some(intent)=&mut record.model_intent {intent.phase=ModelPhase::Failed;}
+                record.error=Some("The selected model is not available in this session. Choose another model.".into()); return;
+            };
+            if !option.values().any(|value|value.value==key.model) {
+                if let Some(intent)=&mut record.model_intent {intent.phase=ModelPhase::Failed;}
+                record.error=Some("The selected model disappeared from this session. Choose another model.".into()); return;
+            }
+            if phase==ModelPhase::Setting && !settled {return;}
+            if phase==ModelPhase::Setting {
+                let before=record.model_intent.as_ref().unwrap().baseline_modes.clone();
+                let after:Vec<_>=options.iter().filter(|o|o.category.as_deref()==Some("mode")).map(|o|(o.id.clone(),o.current.clone())).collect();
+                if before!=after {record.permission_review_required=true; record.error=Some("Kimi changed its access mode while changing models. Review the mode before sending.".into());}
+            }
+            if option.current==key.model {
+                record.confirmed_model=Some(key); record.model_intent=None;
+                if !record.permission_review_required {record.status="Ready".into();}
+            } else if phase==ModelPhase::Setting {
+                if let Some(intent)=&mut record.model_intent {intent.phase=ModelPhase::Failed;}
+                record.error=Some("Kimi did not confirm the selected model. Choose another model or retry.".into());
+            } else {
+                let modes=options.iter().filter(|o|o.category.as_deref()==Some("mode")).map(|o|(o.id.clone(),o.current.clone())).collect();
+                if record.send_kimi(crate::kimi::KimiRequest::SetOption {id:option.id.clone(),value:key.model.clone()}) {
+                    if let Some(state)=&mut record.kimi {state.option_pending=true;}
+                    if let Some(intent)=&mut record.model_intent {intent.phase=ModelPhase::Setting;intent.baseline_modes=modes;}
+                }
+            }
+            return;
+        }
+        #[cfg(feature="codex")]
+        {
+            if record.thread.is_none() && record.project_ready && record.binding_durable && !record.threads_loading && record.pending_thread.is_none() {
+                if record.send_request(crate::codex::CodexRequest::CreateThread) {
+                    record.fresh_thread=true; record.begin_thread_open(None);
+                }
+                return;
+            }
+            if !record.ready || !record.thread_model_seen {return;}
+            if record.models.is_empty() && !record.models_loading {
+                record.models_loading=record.send_request(crate::codex::CodexRequest::ListModels {cursor:None}); return;
+            }
+            if let Some(model)=record.models.iter().find(|model|model.model==key.model).cloned() {
+                record.selected_model=Some(model.model.clone());
+                record.selected_effort=model.efforts.iter().any(|(id,_)|id==&model.default_effort).then(||model.default_effort.clone());
+                record.model_override=true; record.confirmed_model=Some(key); record.model_intent=None; record.status="Ready".into();
+            } else if !record.models_loading {
+                if let Some(cursor)=record.models_cursor.clone() {
+                    record.models_loading=record.send_request(crate::codex::CodexRequest::ListModels {cursor:Some(cursor)});
+                } else {
+                    if let Some(intent)=&mut record.model_intent {intent.phase=ModelPhase::Failed;}
+                    record.error=Some("The selected model is no longer offered by Codex. Choose another model.".into());
+                }
+            }
+        }
+    }
+    pub(crate) fn execute_conversation(&mut self, action: crate::conversation_runtime::ConversationAction) -> Result<(), String> {
+        use crate::conversation_runtime::ConversationActionKind;
+        let entity = *self.conversation_entities.get(&action.chat_id).ok_or("Conversation no longer exists.")?;
+        let mut record = self.world.get_mut::<crate::conversation_runtime::ConversationRecord>(entity).ok_or("Conversation no longer exists.")?;
+        if action.expected_generation.is_some_and(|generation| generation != record.client_generation) { return Err("Conversation connection changed; try again.".into()); }
+        #[cfg(feature="codex")]
+        if let ConversationActionKind::ThreadAction {thread,action:operation}=&action.kind {
+            if record.is_kimi() || !record.project_ready || !record.binding_durable || record.disconnecting || record.busy() || record.history_loading || record.threads_loading || !record.threads.iter().any(|t|&t.id==thread) {return Err("Wait for the Codex connection and refresh its conversation list.".into());}
+            if record.fresh_thread && record.thread.as_ref()==Some(thread) {return Err("Send the first message before managing this new conversation.".into());}
+            if !matches!(operation,crate::codex::ThreadAction::Rename(_)) {
+                let provider=record.provider.clone();
+                drop(record);
+                for id in self.conversation_entities.keys() {
+                    if let Some(other)=self.conversation(*id).filter(|other|other.provider==provider) {
+                        if !other.prompt.is_empty() || other.context_data.any_drafts() || other.busy() || other.approval_count()>0 || matches!(other.observed_activity,crate::conversation::ThreadWorkState::Working|crate::conversation::ThreadWorkState::WaitingOnApproval|crate::conversation::ThreadWorkState::WaitingOnInput) {return Err("Finish active conversations and preserve their drafts before archiving or removing a conversation.".into());}
+                    }
+                }
+                record=self.world.get_mut::<crate::conversation_runtime::ConversationRecord>(entity).ok_or("Conversation no longer exists.")?;
+            }
+        }
+        if let ConversationActionKind::AttachFile { path } = &action.kind {
+            let generation = record.context_data.generation;
+            if record.context_data.file_job_pending || self.conversation_attachments.contains_key(&action.chat_id) { return Err("A file operation is already in progress for this conversation.".into()); }
+            let job_id=Uuid::new_v4();
+            let path=path.clone();
+            let (tx,receiver)=std::sync::mpsc::sync_channel(1);
+            let wake=self.conversation_wake.clone();
+            std::thread::Builder::new().name("tanglewood-conversation-attachment".into()).spawn(move || {
+                use std::{io::Read, os::unix::fs::OpenOptionsExt};
+                let result=(|| {
+                    let file=std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(&path).map_err(|e|e.to_string())?;
+                    if !file.metadata().map_err(|e|e.to_string())?.is_file() { return Err("Select a regular file.".into()); }
+                    let mut bytes=Vec::new();
+                    file.take(256*1024+1).read_to_end(&mut bytes).map_err(|e|e.to_string())?;
+                    if bytes.len()>256*1024 { return Err("File exceeds the 256 KiB attachment limit.".into()); }
+                    let text=String::from_utf8(bytes).map_err(|_|"Attach a UTF-8 text file.".to_owned())?;
+                    let name=path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                    if name.len()>256 || name.chars().any(char::is_control) { return Err("Attachment name is too long or contains control characters.".into()); }
+                    Ok(crate::conversation::PromptAttachment {name,text})
+                })();
+                let _=tx.send(result); if let Some(wake)=wake { wake(); }
+            }).map_err(|error|format!("Could not start file reader: {error}"))?;
+            record.context_data.file_job_pending=true;
+            record.context_data.attachment_pending=true;
+            record.context_data.attachment_job=Some(job_id);
+            drop(record);
+            self.conversation_attachments.insert(action.chat_id,ConversationAttachmentJob {id:job_id,context_generation:generation,receiver});
+            return Ok(());
+        }
+        match action.kind {
+            ConversationActionKind::SetDraft { expected_revision, text } => {
+                if record.draft_revision != expected_revision { return Err("The draft changed; review it before editing again.".into()); }
+                if record.prompt != text {
+                    record.draft_revision = record.draft_revision.checked_add(1).ok_or("Draft revision exhausted.")?;
+                    record.prompt = text;
+                }
+            }
+            ConversationActionKind::EditDraft { expected_revision, text, context } => {
+                if record.draft_revision!=expected_revision {return Err("The draft changed; review your edits again.".into());}
+                if text.len()+context.bytes()>256*1024 || context.attachments.len()>8 || context.skills.len()>8 || context.attachments.iter().any(|a|a.name.len()>256 || a.name.chars().any(char::is_control)) {return Err("The draft and context exceed their limits.".into());}
+                if record.prompt!=text || record.context_data.draft!=context {
+                    record.draft_revision=record.draft_revision.checked_add(1).ok_or("Draft revision exhausted.")?;
+                    record.prompt=text; record.context_data.draft=context;
+                }
+            }
+            ConversationActionKind::SetContextDraft { expected_revision, draft } => {
+                if record.draft_revision!=expected_revision {return Err("The draft changed; review its context again.".into());}
+                if draft.attachments.len()>8 || draft.skills.len()>8 || draft.bytes()>256*1024 || draft.attachments.iter().any(|a|a.name.len()>256 || a.name.chars().any(char::is_control)) {return Err("The draft context exceeds its limits.".into());}
+                record.context_data.draft=draft;
+                record.draft_revision=record.draft_revision.checked_add(1).ok_or("Draft revision exhausted.")?;
+            }
+            ConversationActionKind::Submit { evidence } => {
+                if !record.ready || record.busy() || record.disconnecting || record.model_intent.is_some() || record.permission_review_required {return Err("This conversation is not ready to send.".into());}
+                if record.prompt.trim().is_empty() || record.prompt.len()+record.context_data.total_input_bytes()>256*1024 || record.messages.len()>=256 {return Err("Enter a message within the supported size limit.".into());}
+                #[cfg(feature="kimi")]
+                if record.is_kimi() {
+                    if evidence.is_some() {return Err("Automatic research evidence is unavailable for this provider.".into());}
+                    let session=record.thread.clone().ok_or("Open a conversation first.")?;
+                    let submission=Uuid::new_v4().to_string(); let text=record.prompt.clone();
+                    let attachments=record.context_data.draft.attachments.clone();
+                    if !record.send_kimi(crate::kimi::KimiRequest::Prompt {session:session.clone(),submission:submission.clone(),text:text.clone(),attachments:attachments.clone()}) {return Err(record.error.clone().unwrap_or_else(||"Could not send message.".into()));}
+                    if let Some(state)=&mut record.kimi {state.submission=Some(crate::conversation_runtime::Submission {session:session.clone(),id:submission.clone(),text:text.clone(),attachments});}
+                    record.messages.push(crate::conversation_runtime::ConversationMessage {role:"You",key:Some((session,submission,"user".into())),text,command:None,activity:None,uncertain:false});
+                    record.starting=true;record.status="Starting turn…".into();record.error=None;
+                    return Ok(());
+                }
+                #[cfg(feature="codex")]
+                {
+                    if !record.binding_durable || !record.mode_consistent() || !record.context_data.skills_valid() || !record.models.iter().any(|m|Some(&m.model)==record.selected_model.as_ref()) {return Err("Confirm the model, access and conversation context before sending.".into());}
+                    let thread=record.thread.clone().ok_or("Open a conversation first.")?;
+                    let text=record.prompt.clone(); let attachments=record.context_data.draft.attachments.clone(); let skills=record.context_data.draft.skills.clone();
+                    let mut sent_attachments=attachments.clone();
+                    if let Some(evidence)=evidence {
+                        if !record.relevant_sources || record.research_workspace!=Some(evidence.workspace) || record.prompt!=evidence.prompt || self.research.get(&evidence.workspace).is_none_or(|workspace|workspace.revision!=evidence.revision) {return Err("Research evidence changed; review the updated preview before sending.".into());}
+                        if text.len()+record.context_data.total_input_bytes()+evidence.text.len()>256*1024 {return Err("Message and research evidence exceed 256 KiB.".into());}
+                        sent_attachments.push(crate::conversation::PromptAttachment {name:"Relevant local evidence".into(),text:evidence.text});
+                    }
+                    let request=crate::codex::CodexRequest::SendPromptWithControls {text:text.clone(),model:record.selected_model.clone(),effort:record.selected_effort.clone(),attachments:sent_attachments,skills:skills.clone(),controls:record.controls};
+                    if !record.send_request(request) {return Err(record.error.clone().unwrap_or_else(||"Could not send message.".into()));}
+                    let submission_id=Uuid::new_v4();
+                    record.codex_submission=Some(crate::conversation_runtime::CodexSubmission {id:submission_id,thread:thread.clone(),text:text.clone(),attachments,skills,draft_revision:record.draft_revision});
+                    record.context_submit_pending=true;record.starting=true;record.status="Starting turn…".into();record.error=None;
+                    record.messages.push(crate::conversation_runtime::ConversationMessage {role:"You",key:Some((thread,submission_id.to_string(),"pending-user".into())),text,command:None,activity:None,uncertain:false});
+                }
+            }
+            ConversationActionKind::Stop => {
+                #[cfg(feature="kimi")]
+                if record.is_kimi() { record.cancel_kimi(); return Ok(()); }
+                #[cfg(feature="codex")]
+                if record.send_request(crate::codex::CodexRequest::Interrupt) {record.status="Interrupt requested…".into();}
+            }
+            ConversationActionKind::ClearDisplay => {
+                if record.busy() || record.approval_count()!=0 {return Err("Finish the current operation before clearing displayed messages.".into());}
+                record.messages.clear();record.error=None;
+            }
+            ConversationActionKind::AcknowledgePermissionReview => {record.permission_review_required=false;record.error=None;},
+            ConversationActionKind::SetRelevantSources(enabled) => {
+                if record.research_workspace.is_none() {return Err("Open a research workspace first.".into());}
+                record.relevant_sources=enabled;
+            }
+            ConversationActionKind::RefreshThreads {cursor} => {
+                if !record.project_ready || record.threads_loading {return Err("Wait for the conversation list to finish loading.".into());}
+                #[cfg(feature="kimi")]
+                if record.is_kimi() {
+                    record.threads_append=cursor.is_some();
+                    record.threads_loading=record.send_kimi(crate::kimi::KimiRequest::ListSessions {cursor});
+                    return Ok(());
+                }
+                #[cfg(feature="codex")]
+                record.refresh_threads(cursor);
+            }
+            ConversationActionKind::LoadHistory => {
+                #[cfg(feature="codex")]
+                if !record.is_kimi() && record.history_cursor.is_some() && !record.history_loading && !record.busy() {
+                    let cursor=record.history_cursor.clone();record.history_loading=record.send_request(crate::codex::CodexRequest::LoadHistory {cursor});
+                }
+            }
+            #[cfg(feature="codex")]
+            ConversationActionKind::ThreadAction {thread,action} => {
+                if let crate::codex::ThreadAction::Rename(name)=&action {if name.trim().is_empty() || name.len()>256 || name.chars().any(char::is_control) {return Err("Enter a valid conversation name.".into());}}
+                if record.send_request(crate::codex::CodexRequest::ThreadAction {thread:thread.clone(),action}) {record.pending_thread_action=Some(thread);record.error=None;}
+            }
+            #[cfg(feature="codex")]
+            ConversationActionKind::RenameProject(name) => {
+                if record.is_kimi() || !record.project_ready || !record.binding_durable || record.busy() || name.trim().is_empty() || name.len()>256 || name.chars().any(char::is_control) {return Err("Enter a valid project name after the connection is ready.".into());}
+                if record.send_request(crate::codex::CodexRequest::RenameProject(name)) {
+                    record.project_expected=record.config.project.clone();
+                }
+            }
+            ConversationActionKind::SetEffort(effort) => {
+                if !record.ready || record.busy() || record.model_intent.is_some() {return Err("Finish preparing the model first.".into());}
+                #[cfg(feature="kimi")]
+                if record.is_kimi() {
+                    let option=record.kimi.as_ref().and_then(|state|state.options.iter().find(|o|o.category.as_deref()==Some("thought_level") && o.values().any(|v|v.value==effort))).map(|o|o.id.clone()).ok_or("That reasoning effort is not offered by this model.")?;
+                    if record.send_kimi(crate::kimi::KimiRequest::SetOption {id:option,value:effort}) {if let Some(state)=&mut record.kimi {state.option_pending=true;}} return Ok(());
+                }
+                #[cfg(feature="codex")]
+                {
+                    if !record.models.iter().any(|m|Some(&m.model)==record.selected_model.as_ref() && m.efforts.iter().any(|(value,_)|value==&effort)) {return Err("That reasoning effort is not offered by this model.".into());}
+                    record.selected_effort=Some(effort);record.model_override=true;
+                }
+            }
+            #[cfg(feature="codex")]
+            ConversationActionKind::Goal(request) => {
+                use crate::codex::{CodexRequest,WorkMode};
+                if record.is_kimi() || !record.ready || record.history_loading || record.pending_thread.is_some() || record.context_goal_pending.is_some() {return Err("Conversation goal is not ready to change.".into());}
+                if !matches!(request,CodexRequest::SetGoal{..}|CodexRequest::PauseGoal|CodexRequest::ClearGoal|CodexRequest::RefreshContext) {return Err("Unsupported context action.".into());}
+                let setting=matches!(request,CodexRequest::SetGoal{..}); let leaving=matches!(request,CodexRequest::PauseGoal|CodexRequest::ClearGoal);
+                if setting || leaving {record.context_goal_pending=record.thread.clone();}
+                if record.send_request(request) {
+                    if setting {record.controls.mode=WorkMode::Goal;record.controls.network_access=false;}
+                    if leaving && record.controls.mode==WorkMode::Goal {record.controls.mode=WorkMode::Work;}
+                } else {record.context_goal_pending=None;}
+            }
+            #[cfg(feature="codex")]
+            ConversationActionKind::SetCodexControls(controls) => {
+                if record.is_kimi() || record.busy() {return Err("Finish the current operation first.".into());}
+                let leaving_goal=controls.mode!=crate::codex::WorkMode::Goal && record.context_data.goal.as_ref().is_some_and(|goal|goal.status=="active");
+                if leaving_goal {
+                    if !record.ready || record.history_loading || record.pending_thread.is_some() {return Err("Conversation goal is not ready to change.".into());}
+                    let thread=record.thread.clone().ok_or("Open a conversation first.")?;
+                    if !record.send_request(crate::codex::CodexRequest::PauseGoal) {return Err(record.error.clone().unwrap_or_else(||"Could not pause the goal.".into()));}
+                    record.context_goal_pending=Some(thread);
+                }
+                record.controls=controls;
+            }
+            #[cfg(feature="codex")]
+            ConversationActionKind::AnswerCodex {id,decision} => {
+                if record.is_kimi() || !record.approvals.iter().any(|a|a.id==id && !a.answering && a.decisions.contains(&decision)) {return Err("That approval is no longer pending.".into());}
+                if record.send_request(crate::codex::CodexRequest::AnswerApproval {id:id.clone(),decision}) {if let Some(a)=record.approvals.iter_mut().find(|a|a.id==id) {a.answering=true;}}
+            }
+            #[cfg(feature="kimi")]
+            ConversationActionKind::AnswerKimi {id,option} => {
+                if !record.kimi.as_ref().is_some_and(|state|state.permissions.iter().any(|p|p.id==id && !p.answering && option.as_ref().is_none_or(|v|p.options.iter().any(|o|&o.id==v)))) {return Err("That permission is no longer pending.".into());}
+                if record.send_kimi(crate::kimi::KimiRequest::AnswerPermission {id:id.clone(),option}) {if let Some(permission)=record.kimi.as_mut().and_then(|state|state.permissions.iter_mut().find(|p|p.id==id)) {permission.answering=true;}}
+            }
+            #[cfg(feature="kimi")]
+            ConversationActionKind::SetKimiOption {id,value} => {
+                if record.busy() || record.model_intent.is_some() || !record.kimi.as_ref().is_some_and(|state|state.options.iter().any(|o|o.id==id && o.category.as_deref()!=Some("model") && o.category.as_deref()!=Some("thought_level") && o.values().any(|v|v.value==value))) {return Err("That option is not currently available.".into());}
+                if record.send_kimi(crate::kimi::KimiRequest::SetOption {id,value}) {if let Some(state)=&mut record.kimi {state.option_pending=true;}}
+            }
+            ConversationActionKind::Request(request) => {
+                if !record.client_attached { return Err("Connect this conversation first.".into()); }
+                if record.effects.len() >= 16 { return Err("Conversation request queue is full; try again.".into()); }
+                record.effects.push_back(request);
+            }
+            ConversationActionKind::AttachFile { .. } => unreachable!(),
+            ConversationActionKind::Disconnect => record.disconnect(),
+        }
+        Ok(())
+    }
+    fn tick_conversation_attachments(&mut self) {
+        use std::sync::mpsc::TryRecvError;
+        let mut complete=Vec::new();
+        for (&id,job) in &self.conversation_attachments {
+            match job.receiver.try_recv() {
+                Ok(result) => complete.push((id,job.id,job.context_generation,result)),
+                Err(TryRecvError::Disconnected) => complete.push((id,job.id,job.context_generation,Err("File reader stopped; existing inputs retained.".into()))),
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        for (id,job_id,generation,result) in complete {
+            self.conversation_attachments.remove(&id);
+            let Some(entity)=self.conversation_entities.get(&id).copied() else { continue; };
+            let Some(mut record)=self.world.get_mut::<crate::conversation_runtime::ConversationRecord>(entity) else { continue; };
+            if record.context_data.attachment_job!=Some(job_id) { continue; }
+            record.context_data.attachment_job=None;
+            record.context_data.attachment_pending=false;
+            record.context_data.file_job_pending=false;
+            if record.context_data.generation!=generation {
+                record.error=Some("File operation canceled because the conversation changed; select the file again.".into());
+                continue;
+            }
+            match result {
+                Ok(attachment) => {
+                    let current=record.context_data.draft.attachments.iter().map(|a|a.name.len()+a.text.len()).sum::<usize>();
+                    if record.context_data.draft.attachments.len()>=8 || current+attachment.name.len()+attachment.text.len()>256*1024 {
+                        record.error=Some("Attachment limit: eight text snapshots, 256 KiB total. Existing attachments retained.".into());
+                    } else if let Some(revision)=record.draft_revision.checked_add(1) {
+                        record.context_data.draft.attachments.push(attachment);
+                        record.draft_revision=revision;
+                    } else { record.error=Some("Draft revision exhausted; existing attachments retained.".into()); }
+                }
+                Err(error) => record.error=Some(error),
+            }
+        }
+    }
+    #[cfg(feature="codex")]
+    fn tick_conversation_projects(&mut self) {
+        fn same_project(a: &CodexProjectBinding, b: &CodexProjectBinding) -> bool {
+            a.creation_key == b.creation_key
+                && (a.project_id.is_none() || b.project_id.is_none() || a.project_id == b.project_id)
+        }
+        let ids:Vec<_>=self.conversation_entities.keys().copied().collect();
+        for id in ids {
+            let Some(entity)=self.conversation_entities.get(&id).copied() else {continue};
+            let Some(record)=self.world.get::<crate::conversation_runtime::ConversationRecord>(entity) else {continue};
+            if record.is_kimi() {continue;}
+            let project=record.config.project.clone(); let persist=record.persist_project;
+            let expected=record.project_expected.clone();
+            let mut failure=None;
+            let mut done = persist && self.codex_project()==project.as_ref();
+            if persist && !done && !self.codex_project_pending() {
+                if let Some(project)=project.clone() {
+                    match self.execute(Command::SetCodexProject {expected,project:project.clone()},Caller::Local) {
+                        Ok(_) => done=true,
+                        Err(CommandError::CodexProjectChanged)
+                            if self.codex_project().is_some_and(|current|same_project(current,&project)) => {
+                                // A different response was accepted first. The stale response
+                                // cannot overwrite it; adopt the durable binding below.
+                                done=true;
+                            }
+                        Err(CommandError::Busy) => {},
+                        Err(error) => {failure=Some(error.to_string());done=true;}
+                    }
+                }
+            }
+            let project_pending=self.codex_project_pending();
+            let durable_project=if !project_pending {self.codex_project().cloned()} else {None};
+            let metadata_error=self.codex_project_error().map(str::to_owned);
+            if let Some(mut record)=self.world.get_mut::<crate::conversation_runtime::ConversationRecord>(entity) {
+                if done {record.persist_project=false;record.project_expected=None;}
+                if let Some(error)=failure {record.error=Some(error);}
+                if !record.persist_project {
+                    if let (Some(current),Some(authoritative))=(&record.config.project,&durable_project) {
+                        if same_project(current,authoritative) {
+                            record.config.project=Some(authoritative.clone());
+                            record.project_name=authoritative.name.clone();
+                        }
+                    }
+                }
+                record.binding_durable=!project_pending && record.config.project==durable_project;
+                record.metadata_error=metadata_error;
+                if record.resume_requested && record.project_ready && record.binding_durable && !record.threads_loading && !record.busy() && !record.history_loading {
+                    if let Some(remote)=record.config.resume_thread.clone() {
+                        if record.listed_threads.contains(&remote) {
+                            if record.send_request(crate::codex::CodexRequest::ResumeThread(remote.clone())) {record.begin_thread_open(Some(remote));}
+                        } else if let Some(cursor)=record.threads_cursor.clone() {
+                            record.refresh_threads(Some(cursor));
+                        } else {
+                            record.resume_requested=false;
+                            record.error=Some("Requested Codex conversation is not listed in this project. Refresh conversations and try again.".into());
+                        }
+                    }
+                }
+            }
+            self.progress_model_intent(id,false);
+        }
+        if !self.codex_project_pending() {
+            if let Some(authoritative)=self.codex_project().cloned() {
+                for config in self.conversation_configs.values_mut() {
+                    if let crate::model_catalog::ProviderConfig::Codex(config)=config {
+                        if config.project.as_ref().is_some_and(|current|same_project(current,&authoritative)) {
+                            config.project=Some(authoritative.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    fn tick_conversations(&mut self) {
+        self.conversation_catalog.tick();
+        self.tick_conversation_attachments();
+        #[cfg(feature="codex")]
+        self.tick_conversation_projects();
+        let mut events = 0usize;
+        let mut idle = 0usize;
+        let mut effects = 0usize;
+        while !self.conversation_round_robin.is_empty() && events < Self::CONVERSATION_EVENT_LIMIT && idle < self.conversation_round_robin.len() {
+            let id = self.conversation_round_robin.pop_front().unwrap();
+            let Some(client) = self.conversation_clients.get(&id) else { idle = 0; continue; };
+            let generation = client.generation;
+            let event = client.adapter.try_recv();
+            if let Some(event) = event {
+                events += 1;
+                idle = 0;
+                self.route_conversation_event(id, generation, event);
+            } else { idle += 1; }
+            // One queued effect per visit bounds dispatch and preserves fairness as well.
+            if effects < Self::CONVERSATION_EVENT_LIMIT {
+                let entity = self.conversation_entities.get(&id).copied();
+                let request = entity.and_then(|entity| self.world.get_mut::<crate::conversation_runtime::ConversationRecord>(entity)).and_then(|mut record| {
+                    if record.client_attached && record.client_generation == generation { record.effects.pop_front() } else { None }
+                });
+                if let Some(request) = request {
+                    effects += 1;
+                    idle = 0;
+                    let result = self.conversation_clients.get(&id).ok_or_else(|| "Conversation connection is unavailable.".to_owned()).and_then(|client| client.adapter.try_send(request.clone()));
+                    if let Some(mut record) = entity.and_then(|entity| self.world.get_mut::<crate::conversation_runtime::ConversationRecord>(entity)) {
+                        match result { Ok(()) => record.dispatch_succeeded(&request), Err(error) => record.dispatch_failed(request, error) }
+                    }
+                }
+            }
+            let attached = self.conversation(id).is_some_and(|record| record.client_attached && record.client_generation == generation);
+            if attached { self.conversation_round_robin.push_back(id); }
+            else { self.conversation_clients.remove(&id); idle = 0; }
+        }
+        if events == Self::CONVERSATION_EVENT_LIMIT || effects == Self::CONVERSATION_EVENT_LIMIT {
+            if let Some(wake) = &self.conversation_wake { wake(); }
+        }
+    }
+}
+
+
+#[cfg(all(test, target_os = "linux", feature = "kimi"))]
+mod conversation_owner_tests {
+    use super::*;
+    use crate::{conversation::{Adapter, Event, Request, ThreadWorkState}, conversation_runtime::{ConversationAction, ConversationActionKind, ConversationRecord, Submission}, kimi::{KimiAdapter, KimiConfig, KimiEvent, KimiRequest}};
+    use std::{fs, os::unix::fs::PermissionsExt, time::{Duration, Instant}};
+
+    fn tick_until(app: &mut App, predicate: impl Fn(&App)->bool) {
+        let deadline=Instant::now()+Duration::from_secs(6);
+        while !predicate(app) {
+            assert!(Instant::now()<deadline, "timed out waiting for fixture state");
+            app.tick();
+            std::thread::sleep(Duration::from_millis(8));
+        }
+    }
+    fn request(app: &mut App, id: Uuid, request: KimiRequest) {
+        let generation=app.conversation(id).unwrap().client_generation;
+        app.execute_conversation(ConversationAction {chat_id:id,expected_generation:Some(generation),kind:ConversationActionKind::Request(Request::Kimi(request))}).unwrap();
+    }
+    #[test]
+    fn two_same_provider_clients_poll_and_route_without_a_view() {
+        let root=std::env::temp_dir().join(format!("tw-owner-{}",Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let fixture=Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/fixtures/model-picker/agent.py");
+        let audit=root.join("audit"); let state=root.join("state");
+        let mut app=App::new();
+        let mut ids=Vec::new();
+        for (index,behavior) in ["long_stream","permission"].into_iter().enumerate() {
+            let executable=root.join(format!("kimi-{index}"));
+            fs::write(&executable,format!("#!/bin/sh\nTW_FAKE_AUDIT='{}' TW_FAKE_STATE='{}' TW_FAKE_BEHAVIOR='{}' exec python3 '{}' \"$@\"\n",audit.display(),state.display(),behavior,fixture.display())).unwrap();
+            fs::set_permissions(&executable,fs::Permissions::from_mode(0o700)).unwrap();
+            let config=KimiConfig {executable,cwd:root.clone(),mcp_bridge:root.join("bridge"),socket:root.join("socket"),resume_session:None};
+            let record=ConversationRecord::new_kimi(config.clone());
+            let id=app.insert_conversation(record).unwrap();
+            app.attach_conversation_client(id,Adapter::Kimi(KimiAdapter::spawn(config,||{}).unwrap())).unwrap();
+            ids.push(id);
+        }
+        tick_until(&mut app,|a|ids.iter().all(|id|a.conversation(*id).is_some_and(|r|r.project_ready && !r.threads_loading)));
+        for &id in &ids { request(&mut app,id,KimiRequest::NewSession); }
+        tick_until(&mut app,|a|ids.iter().all(|id|a.conversation(*id).is_some_and(|r|r.ready && r.thread.is_some())));
+        assert_ne!(app.conversation(ids[0]).unwrap().thread,app.conversation(ids[1]).unwrap().thread);
+        for &id in &ids {
+            let entity=app.conversation_entities[&id];
+            let mut record=app.world.get_mut::<ConversationRecord>(entity).unwrap();
+            let session=record.thread.clone().unwrap();
+            let submission=Uuid::new_v4().to_string();
+            record.prompt=format!("draft for {id}");
+            record.kimi.as_mut().unwrap().submission=Some(Submission {session:session.clone(),id:submission.clone(),text:record.prompt.clone(),attachments:Vec::new()});
+            record.starting=true;
+            let text=record.prompt.clone();
+            drop(record);
+            request(&mut app,id,KimiRequest::Prompt {session,submission,text,attachments:Vec::new()});
+        }
+        tick_until(&mut app,|a|a.conversation(ids[0]).unwrap().messages.iter().any(|m|m.text.contains("chunk")) && a.conversation(ids[1]).unwrap().approval_count()==1);
+        assert_eq!(app.conversation(ids[1]).unwrap().observed_activity,ThreadWorkState::WaitingOnApproval);
+        let second=app.conversation(ids[1]).unwrap();
+        let session=second.thread.clone().unwrap(); let turn=second.active_turn.clone().unwrap(); let generation=second.client_generation;
+        let before=second.messages.iter().map(|m|m.text.len()).sum::<usize>();
+        app.route_conversation_event(ids[1],generation-1,Event::Kimi(KimiEvent::Delta {session,turn,item:"stale".into(),text:"must not appear".into()}));
+        assert_eq!(before,app.conversation(ids[1]).unwrap().messages.iter().map(|m|m.text.len()).sum::<usize>());
+        let permission=app.conversation(ids[1]).unwrap().kimi.as_ref().unwrap().permissions[0].id.clone();
+        request(&mut app,ids[0],KimiRequest::Cancel);
+        request(&mut app,ids[1],KimiRequest::AnswerPermission {id:permission,option:Some("allow".into())});
+        tick_until(&mut app,|a|a.conversation(ids[0]).unwrap().active_turn.is_none() && a.conversation(ids[1]).unwrap().messages.iter().map(|m|m.text.len()).sum::<usize>()>before);
+        assert!(app.conversation(ids[0]).unwrap().client_attached && app.conversation(ids[1]).unwrap().client_attached);
+        assert_eq!(app.conversation(ids[0]).unwrap().observed_activity,ThreadWorkState::Idle);
+        for &id in &ids {
+            let generation=app.conversation(id).unwrap().client_generation;
+            app.execute_conversation(ConversationAction {chat_id:id,expected_generation:Some(generation),kind:ConversationActionKind::Disconnect}).unwrap();
+        }
+        tick_until(&mut app,|a|a.conversation_clients.is_empty());
+        let calls=fs::read_to_string(&audit).unwrap();
+        assert_eq!(calls.lines().filter(|line|line.contains("session/prompt")).count(),2);
+        assert_eq!(calls.lines().filter(|line|line.contains("session/cancel")).count(),1);
+        drop(app); let _=fs::remove_dir_all(root);
+    }
+    #[test]
+    fn reconnect_kimi_reloads_existing_session_after_pending_approval() {
+        let root=std::env::temp_dir().join(format!("tw-reconnect-{}",Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let fixture=Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/fixtures/model-picker/agent.py");
+        let audit=root.join("audit"); let state=root.join("state"); let wrapper=root.join("kimi");
+        fs::write(&wrapper,format!("#!/bin/sh\nTW_FAKE_AUDIT='{}' TW_FAKE_STATE='{}' TW_FAKE_BEHAVIOR=permission exec python3 '{}' \"$@\"\n",audit.display(),state.display(),fixture.display())).unwrap();
+        fs::set_permissions(&wrapper,fs::Permissions::from_mode(0o700)).unwrap();
+        let config=KimiConfig {executable:wrapper,cwd:root.clone(),mcp_bridge:root.join("bridge"),socket:root.join("socket"),resume_session:None};
+        let mut app=App::new();
+        let id=app.insert_conversation(ConversationRecord::new_kimi(config)).unwrap();
+        app.connect_conversation(id).unwrap();
+        tick_until(&mut app,|a|a.conversation(id).unwrap().project_ready && !a.conversation(id).unwrap().threads_loading);
+        request(&mut app,id,KimiRequest::NewSession);
+        tick_until(&mut app,|a|a.conversation(id).unwrap().ready);
+        let session=app.conversation(id).unwrap().thread.clone().unwrap();
+        let entity=app.conversation_entities[&id];
+        app.world.get_mut::<ConversationRecord>(entity).unwrap().prompt="keep this draft".into();
+        app.execute_conversation(ConversationAction {chat_id:id,expected_generation:None,kind:ConversationActionKind::Submit {evidence:None}}).unwrap();
+        tick_until(&mut app,|a|a.conversation(id).unwrap().approval_count()==1);
+        let old_generation=app.conversation(id).unwrap().client_generation;
+        let cached:Vec<String>=app.conversation(id).unwrap().messages.iter().map(|m|m.text.clone()).collect();
+        app.execute_conversation(ConversationAction {chat_id:id,expected_generation:Some(old_generation),kind:ConversationActionKind::Disconnect}).unwrap();
+        tick_until(&mut app,|a|!a.conversation(id).unwrap().client_attached);
+        assert_eq!(app.conversation(id).unwrap().observed_activity,ThreadWorkState::WaitingOnApproval);
+        app.connect_conversation(id).unwrap();
+        tick_until(&mut app,|a|a.conversation(id).unwrap().ready);
+        let resumed=app.conversation(id).unwrap();
+        assert_eq!(resumed.thread.as_deref(),Some(session.as_str()));
+        assert_eq!(resumed.prompt,"keep this draft");
+        assert!(cached.iter().all(|text|resumed.messages.iter().any(|m|&m.text==text)));
+        assert_eq!(resumed.approval_count(),0);
+        assert!(!resumed.busy());
+        assert!(resumed.client_generation>old_generation);
+        let calls=fs::read_to_string(&audit).unwrap();
+        assert_eq!(calls.lines().filter(|line|line.contains("session/new")).count(),1);
+        assert_eq!(calls.lines().filter(|line|line.contains("session/load")).count(),1);
+        assert_eq!(calls.lines().filter(|line|line.contains("session/prompt")).count(),1);
+        app.disconnect_all_conversations(); tick_until(&mut app,|a|a.conversation_clients.is_empty());
+        drop(app); let _=fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature="codex")]
+    #[test]
+    fn leaving_goal_queues_pause_and_preserves_requested_mode() {
+        use crate::codex::{CodexConfig,CodexEvent,CodexRequest,TurnControls,WorkMode};
+        for mode in [WorkMode::Plan,WorkMode::Research] {
+            let root=std::env::temp_dir();
+            let config=CodexConfig {executable:root.join("unused"),cwd:root.clone(),mcp_bridge:root.join("bridge"),socket:root.join("socket"),resume_thread:None,project:None};
+            let mut app=App::new();let id=app.insert_conversation(ConversationRecord::new_codex(config)).unwrap();
+            let entity=app.conversation_entities[&id];
+            {let mut record=app.world.get_mut::<ConversationRecord>(entity).unwrap();record.client_attached=true;record.client_generation=1;record.ready=true;record.thread=Some("thread".into());record.context_data.goal_loaded=true;record.context_data.goal=Some(crate::conversation::GoalInfo {objective:"goal".into(),status:"active".into(),tokens_used:0,time_used_seconds:0,token_budget:None});record.controls.mode=WorkMode::Goal;}
+            let controls=TurnControls {mode,network_access:mode==WorkMode::Research,..Default::default()};
+            app.execute_conversation(ConversationAction {chat_id:id,expected_generation:Some(1),kind:ConversationActionKind::SetCodexControls(controls)}).unwrap();
+            let record=app.conversation(id).unwrap();assert_eq!(record.controls.mode,mode);assert!(record.context_goal_pending.is_some());assert!(record.effects.iter().any(|r|matches!(r,Request::Codex(CodexRequest::PauseGoal))));
+            app.route_conversation_event(id,1,Event::Codex(CodexEvent::GoalMutationFinished {thread:"thread".into(),goal:Some(crate::conversation::GoalInfo {objective:"goal".into(),status:"paused".into(),tokens_used:0,time_used_seconds:0,token_budget:None})}));
+            let record=app.conversation(id).unwrap();assert_eq!(record.controls.mode,mode);assert!(record.mode_consistent());assert!(record.context_goal_pending.is_none());
+        }
+    }
+
+    #[cfg(feature="codex")]
+    #[test]
+    fn reconnect_codex_validates_and_resumes_the_same_thread() {
+        use crate::{codex::{CodexConfig,CodexRequest},notes::CodexProjectBinding};
+        let root=std::env::temp_dir().join(format!("tw-codex-reconnect-{}",Uuid::new_v4()));fs::create_dir(&root).unwrap();
+        let fixture=Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/fixtures/model-picker/agent.py");
+        let audit=root.join("audit");let state=root.join("state");let wrapper=root.join("codex");
+        fs::write(&wrapper,format!("#!/bin/sh\nTW_FAKE_AUDIT='{}' TW_FAKE_STATE='{}' TW_FAKE_BEHAVIOR=permission exec python3 '{}' \"$@\"\n",audit.display(),state.display(),fixture.display())).unwrap();
+        fs::set_permissions(&wrapper,fs::Permissions::from_mode(0o700)).unwrap();
+        let mut app=App::open(&root.join("vault")).unwrap();
+        let project=CodexProjectBinding {project_id:Some("fixture-project".into()),name:"Fixture".into(),creation_key:Uuid::new_v4().to_string()};
+        app.execute(Command::SetCodexProject {expected:None,project:project.clone()},Caller::Local).unwrap();app.flush().unwrap();
+        let config=CodexConfig {executable:wrapper,cwd:root.clone(),mcp_bridge:root.join("bridge"),socket:root.join("socket"),resume_thread:None,project:Some(project)};
+        let id=app.insert_conversation(ConversationRecord::new_codex(config)).unwrap();
+        app.connect_conversation(id).unwrap();
+        tick_until(&mut app,|a|a.conversation(id).unwrap().project_ready && a.conversation(id).unwrap().binding_durable && !a.conversation(id).unwrap().threads_loading);
+        let entity=app.conversation_entities[&id];
+        {let mut record=app.world.get_mut::<ConversationRecord>(entity).unwrap();assert!(record.send_request(CodexRequest::CreateThread));record.begin_thread_open(None);}
+        tick_until(&mut app,|a|a.conversation(id).unwrap().ready && !a.conversation(id).unwrap().history_loading);
+        let session=app.conversation(id).unwrap().thread.clone().unwrap();
+        {let mut record=app.world.get_mut::<ConversationRecord>(entity).unwrap();record.prompt="preserved draft".into();assert!(record.send_request(CodexRequest::SendPrompt("fixture message".into())));}
+        tick_until(&mut app,|a|a.conversation(id).unwrap().approval_count()==1);
+        let generation=app.conversation(id).unwrap().client_generation;
+        let cached:Vec<String>=app.conversation(id).unwrap().messages.iter().map(|m|m.text.clone()).collect();
+        app.execute_conversation(ConversationAction {chat_id:id,expected_generation:Some(generation),kind:ConversationActionKind::Disconnect}).unwrap();
+        tick_until(&mut app,|a|!a.conversation(id).unwrap().client_attached);
+        assert_eq!(app.conversation(id).unwrap().observed_activity,ThreadWorkState::WaitingOnApproval);
+        app.connect_conversation(id).unwrap();
+        tick_until(&mut app,|a|a.conversation(id).unwrap().ready && !a.conversation(id).unwrap().history_loading);
+        let resumed=app.conversation(id).unwrap();
+        assert_eq!(resumed.thread.as_deref(),Some(session.as_str()));assert_eq!(resumed.prompt,"preserved draft");
+        assert!(cached.iter().all(|text|resumed.messages.iter().any(|m|&m.text==text)));
+        assert_eq!(resumed.approval_count(),0);assert!(!resumed.busy());assert!(resumed.client_generation>generation);
+        let calls=fs::read_to_string(&audit).unwrap();
+        assert_eq!(calls.lines().filter(|line|line.contains("thread/start")).count(),1);
+        assert_eq!(calls.lines().filter(|line|line.contains("thread/resume")).count(),1);
+        assert_eq!(calls.lines().filter(|line|line.contains("turn/start")).count(),1);
+        app.disconnect_all_conversations();tick_until(&mut app,|a|a.conversation_clients.is_empty());
+        app.shutdown().unwrap();drop(app);let _=fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature="codex")]
+    #[test]
+    fn acknowledged_project_rename_updates_other_conversations_and_provider_config() {
+        use crate::{codex::{CodexConfig,CodexEvent},model_catalog::ProviderConfig,notes::CodexProjectBinding};
+        let root=std::env::temp_dir().join(format!("tw-rename-{}",Uuid::new_v4()));
+        let mut app=App::open(&root).unwrap();
+        let project=CodexProjectBinding {project_id:Some("fixture-project".into()),name:"Old".into(),creation_key:Uuid::new_v4().to_string()};
+        app.execute(Command::SetCodexProject {expected:None,project:project.clone()},Caller::Local).unwrap();
+        app.flush().unwrap();
+        let config=CodexConfig {executable:root.join("codex"),cwd:root.clone(),mcp_bridge:root.join("bridge"),socket:root.join("socket"),resume_thread:None,project:Some(project.clone())};
+        let provider=ProviderConfig::Codex(config.clone()); let key=provider.key();
+        app.register_conversation_provider(provider);
+        let a=app.insert_conversation(ConversationRecord::new_codex(config.clone())).unwrap();
+        let b=app.insert_conversation(ConversationRecord::new_codex(config)).unwrap();
+        let other_entity=app.conversation_entities[&b];
+        {let mut record=app.world.get_mut::<ConversationRecord>(other_entity).unwrap();record.prepare_connection();record.client_attached=true;record.client_generation=1;}
+        let entity=app.conversation_entities[&a];
+        {let mut record=app.world.get_mut::<ConversationRecord>(entity).unwrap();record.client_attached=true;record.client_generation=1;}
+        app.route_conversation_event(a,1,Event::Codex(CodexEvent::ProjectReady {project_id:"fixture-project".into(),name:"Renamed".into()}));
+        tick_until(&mut app,|a|!a.codex_project_pending() && a.codex_project().is_some_and(|p|p.name=="Renamed"));
+        app.tick();
+        let other=app.conversation(b).unwrap();
+        assert_eq!(other.config.project.as_ref().unwrap().name,"Renamed");
+        assert!(other.binding_durable);
+        assert!(matches!(app.conversation_configs.get(&key),Some(ProviderConfig::Codex(c)) if c.project.as_ref().is_some_and(|p|p.name=="Renamed")));
+        assert_eq!(app.codex_project().unwrap().project_id,project.project_id);
+        assert_eq!(app.codex_project().unwrap().creation_key,project.creation_key);
+        // A project/read started before the rename may arrive after it. Its old
+        // name must not overwrite the newer acknowledged durable association.
+        app.route_conversation_event(b,1,Event::Codex(CodexEvent::ProjectReady {project_id:"fixture-project".into(),name:"Old".into()}));
+        for _ in 0..20 {app.tick(); std::thread::sleep(Duration::from_millis(2));}
+        assert_eq!(app.codex_project().unwrap().name,"Renamed");
+        assert_eq!(app.conversation(b).unwrap().config.project.as_ref().unwrap().name,"Renamed");
+        app.shutdown().unwrap(); drop(app); let _=fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn attachment_completion_targets_original_chat_when_view_is_gone() {
+        let root=std::env::temp_dir().join(format!("tw-attachment-{}",Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let file=root.join("evidence.txt"); fs::write(&file,"exact file content\n").unwrap();
+        let config=KimiConfig {executable:root.join("not-started"),cwd:root.clone(),mcp_bridge:root.join("bridge"),socket:root.join("socket"),resume_session:None};
+        let mut app=App::new();
+        let source=app.insert_conversation(ConversationRecord::new_kimi(config.clone())).unwrap();
+        let destination=app.insert_conversation(ConversationRecord::new_kimi(config)).unwrap();
+        app.execute_conversation(ConversationAction {chat_id:source,expected_generation:None,kind:ConversationActionKind::AttachFile {path:file}}).unwrap();
+        app.execute_conversation(ConversationAction {chat_id:destination,expected_generation:None,kind:ConversationActionKind::SetDraft {expected_revision:0,text:"other chat".into()}}).unwrap();
+        tick_until(&mut app,|a|!a.conversation(source).unwrap().context_data.attachment_pending);
+        let source_record=app.conversation(source).unwrap();
+        assert_eq!(source_record.context_data.draft.attachments.len(),1);
+        assert_eq!(source_record.context_data.draft.attachments[0].text,"exact file content\n");
+        assert!(app.conversation(destination).unwrap().context_data.draft.attachments.is_empty());
+        assert_eq!(app.conversation(destination).unwrap().prompt,"other chat");
+        let oversized=root.join("large.txt");fs::write(&oversized,vec![b'x';256*1024+1]).unwrap();
+        app.execute_conversation(ConversationAction {chat_id:source,expected_generation:None,kind:ConversationActionKind::AttachFile {path:oversized}}).unwrap();
+        tick_until(&mut app,|a|!a.conversation(source).unwrap().context_data.attachment_pending);
+        assert!(app.conversation(source).unwrap().error.as_deref().is_some_and(|e|e.contains("exceeds")));
+        assert_eq!(app.conversation(source).unwrap().context_data.draft.attachments.len(),1);
+        let stale=root.join("stale.txt");fs::write(&stale,"must not attach").unwrap();
+        app.execute_conversation(ConversationAction {chat_id:source,expected_generation:None,kind:ConversationActionKind::AttachFile {path:stale}}).unwrap();
+        let entity=app.conversation_entities[&source];app.world.get_mut::<ConversationRecord>(entity).unwrap().context_data.generation+=1;
+        tick_until(&mut app,|a|!a.conversation(source).unwrap().context_data.attachment_pending);
+        assert!(app.conversation(source).unwrap().error.as_deref().is_some_and(|e|e.contains("canceled")));
+        assert_eq!(app.conversation(source).unwrap().context_data.draft.attachments.len(),1);
+        drop(app); let _=fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature="codex")]
+    #[test]
+    fn cross_provider_model_preparation_copies_only_explicit_draft() {
+        use crate::{conversation::PromptAttachment, conversation_runtime::ModelKey, model_catalog::{Phase,ProviderConfig}};
+        let root=std::env::temp_dir().join(format!("tw-model-{}",Uuid::new_v4())); fs::create_dir(&root).unwrap();
+        let fixture=Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/fixtures/model-picker/agent.py");
+        let audit=root.join("audit"); let state=root.join("state");
+        let wrapper=root.join("agent");
+        fs::write(&wrapper,format!("#!/bin/sh\nTW_FAKE_AUDIT='{}' TW_FAKE_STATE='{}' exec python3 '{}' \"$@\"\n",audit.display(),state.display(),fixture.display())).unwrap();
+        fs::set_permissions(&wrapper,fs::Permissions::from_mode(0o700)).unwrap();
+        let kimi=KimiConfig {executable:wrapper.clone(),cwd:root.clone(),mcp_bridge:root.join("bridge"),socket:root.join("socket"),resume_session:None};
+        let kimi_key=ModelKey {provider:ProviderConfig::Kimi(kimi.clone()).key(),model:"kimi-a".into(),option_id:Some("model".into())};
+        let codex=crate::codex::CodexConfig {executable:wrapper,cwd:root.clone(),mcp_bridge:root.join("bridge"),socket:root.join("socket"),resume_thread:None,project:None};
+        let mut app=App::new();
+        app.register_conversation_provider(ProviderConfig::Kimi(kimi.clone()));
+        app.register_conversation_provider(ProviderConfig::Codex(codex.clone()));
+        let mut source=ConversationRecord::new_kimi(kimi);
+        source.prompt="  keep exact\n  ".into();
+        source.context_data.draft.attachments.push(PromptAttachment {name:"snapshot.txt".into(),text:"exact snapshot\n".into()});
+        source.context_data.draft.skills.push(crate::conversation::SkillInfo {name:"private skill".into(),path:"/tmp/skill".into(),description:"local".into(),enabled:true});
+        let source=app.insert_conversation(source).unwrap();
+        let mut existing=ConversationRecord::new_codex(codex.clone()); existing.prompt="existing destination".into();
+        let existing=app.insert_conversation(existing).unwrap();
+        app.catalog_mut().start_automatic();
+        tick_until(&mut app,|app|app.catalog().entries.iter().all(|e|matches!(e.phase,Phase::Available)));
+        let key=ModelKey {provider:ProviderConfig::Codex(codex).key(),model:"codex-a".into(),option_id:None};
+        let target=app.choose_conversation_model(source,key.clone()).unwrap();
+        assert_ne!(target,source); assert_ne!(target,existing);
+        tick_until(&mut app,|app|app.conversation(target).unwrap().confirmed_model.as_ref()==Some(&key));
+        let created=app.conversation(target).unwrap();
+        assert_eq!(created.prompt,"  keep exact\n  ");
+        assert_eq!(created.context_data.draft.attachments[0].text,"exact snapshot\n");
+        assert!(created.context_data.draft.skills.is_empty());
+        assert!(created.context_data.goal.is_none());
+        assert_eq!(app.conversation(source).unwrap().prompt,"  keep exact\n  ");
+        assert_eq!(app.conversation(existing).unwrap().prompt,"existing destination");
+        let methods=fs::read_to_string(&audit).unwrap();
+        assert!(!methods.lines().any(|line|line.contains("turn/start")||line.contains("session/prompt")));
+        let mut unavailable=match app.conversation_configs.get(&key.provider).cloned().unwrap() {ProviderConfig::Codex(config)=>config,_=>unreachable!()};
+        unavailable.executable=root.join("missing-codex");
+        app.conversation_configs.insert(key.provider.clone(),ProviderConfig::Codex(unavailable));
+        let failed=app.choose_conversation_model(source,key.clone()).unwrap();
+        tick_until(&mut app,|a|a.conversation(failed).unwrap().model_intent.as_ref().is_some_and(|i|i.phase==crate::conversation_runtime::ModelPhase::Failed));
+        assert_eq!(app.conversation(failed).unwrap().prompt,"  keep exact\n  ");
+        assert_eq!(app.conversation(failed).unwrap().context_data.draft.attachments[0].text,"exact snapshot\n");
+        let retry_target=app.choose_conversation_model(failed,kimi_key.clone()).unwrap();
+        tick_until(&mut app,|a|a.conversation(retry_target).unwrap().confirmed_model.as_ref()==Some(&kimi_key));
+        assert_eq!(app.conversation(retry_target).unwrap().prompt,"  keep exact\n  ");
+        assert_eq!(app.conversation(existing).unwrap().prompt,"existing destination");
+        app.disconnect_all_conversations();
+        tick_until(&mut app,|a|a.conversation_clients.is_empty());
+        drop(app); let _=fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn kimi_model_change_waits_for_settled_authoritative_effort() {
+        use crate::{conversation_runtime::{ModelKey,ModelPhase},model_catalog::{Phase,ProviderConfig}};
+        let root=std::env::temp_dir().join(format!("tw-options-{}",Uuid::new_v4())); fs::create_dir(&root).unwrap();
+        let fixture=Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/fixtures/model-picker/agent.py");
+        let audit=root.join("audit"); let state=root.join("state"); let wrapper=root.join("kimi");
+        fs::write(&wrapper,format!("#!/bin/sh\nTW_FAKE_AUDIT='{}' TW_FAKE_STATE='{}' TW_FAKE_BEHAVIOR=model_effort_change exec python3 '{}' \"$@\"\n",audit.display(),state.display(),fixture.display())).unwrap();
+        fs::set_permissions(&wrapper,fs::Permissions::from_mode(0o700)).unwrap();
+        let config=KimiConfig {executable:wrapper,cwd:root.clone(),mcp_bridge:root.join("bridge"),socket:root.join("socket"),resume_session:None};
+        let mut app=App::new(); app.register_conversation_provider(ProviderConfig::Kimi(config.clone()));
+        let id=app.insert_conversation(ConversationRecord::new_kimi(config.clone())).unwrap();
+        app.catalog_mut().start_automatic(); tick_until(&mut app,|a|a.catalog().entries[0].phase==Phase::Available);
+        let key=ModelKey {provider:ProviderConfig::Kimi(config).key(),model:"kimi-b".into(),option_id:Some("model".into())};
+        assert_eq!(app.choose_conversation_model(id,key.clone()).unwrap(),id);
+        tick_until(&mut app,|a|a.conversation(id).unwrap().model_intent.as_ref().is_some_and(|i|i.phase==ModelPhase::Setting) && a.conversation(id).unwrap().kimi.as_ref().is_some_and(|k|k.options.iter().any(|o|o.category.as_deref()==Some("model") && o.current=="kimi-b")));
+        assert!(app.conversation(id).unwrap().confirmed_model.is_none(),"notification cannot settle a model mutation");
+        tick_until(&mut app,|a|a.conversation(id).unwrap().confirmed_model.as_ref()==Some(&key));
+        let record=app.conversation(id).unwrap();
+        let thought=record.kimi.as_ref().unwrap().options.iter().find(|o|o.category.as_deref()==Some("thought_level")).unwrap();
+        assert_eq!(thought.current,"low"); assert!(thought.values().all(|value|value.value!="high"));
+        assert!(!record.permission_review_required);
+        let generation=record.client_generation;
+        app.execute_conversation(ConversationAction {chat_id:id,expected_generation:Some(generation),kind:ConversationActionKind::Disconnect}).unwrap();
+        tick_until(&mut app,|a|a.conversation_clients.is_empty()); drop(app); let _=fs::remove_dir_all(root);
+    }
+
 }
