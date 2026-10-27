@@ -98,45 +98,53 @@ pub(super) fn scroll_focus<R>(
     ctx: &egui::Context,
     scroll: &egui::scroll_area::ScrollAreaOutput<R>,
 ) {
-    let Some(response) = ctx.read_response(scroll.id.with(1usize)) else {
-        return;
-    };
-    if !response.has_focus() {
-        return;
-    }
-    ctx.layer_painter(response.layer_id).rect_stroke(
-        response.rect,
-        2.0,
-        ctx.style().visuals.selection.stroke,
-        egui::StrokeKind::Inside,
-    );
-    ctx.memory_mut(|m| {
-        m.set_focus_lock_filter(
-            response.id,
-            egui::EventFilter {
-                vertical_arrows: true,
-                ..Default::default()
-            },
-        )
-    });
-    let delta = ctx.input_mut(|i| {
-        if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
-            40.0
-        } else if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
-            -40.0
-        } else {
-            0.0
+    for axis in 0..2 {
+        let Some(response) = ctx.read_response(scroll.id.with(axis)) else {
+            continue;
+        };
+        if !response.has_focus() {
+            continue;
         }
-    });
-    if delta != 0.0 {
-        ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
-        let mut state = scroll.state.clone();
-        state.offset.y = (state.offset.y + delta).clamp(
-            0.0,
-            (scroll.content_size.y - scroll.inner_rect.height()).max(0.0),
+        ctx.layer_painter(response.layer_id).rect_stroke(
+            response.rect,
+            2.0,
+            ctx.style().visuals.selection.stroke,
+            egui::StrokeKind::Inside,
         );
-        state.store(ctx, scroll.id);
-        ctx.request_repaint();
+        ctx.memory_mut(|m| {
+            m.set_focus_lock_filter(
+                response.id,
+                egui::EventFilter {
+                    horizontal_arrows: axis == 0,
+                    vertical_arrows: axis == 1,
+                    ..Default::default()
+                },
+            )
+        });
+        let (back, forward) = if axis == 0 {
+            (egui::Key::ArrowLeft, egui::Key::ArrowRight)
+        } else {
+            (egui::Key::ArrowUp, egui::Key::ArrowDown)
+        };
+        let delta = ctx.input_mut(|i| {
+            if i.consume_key(egui::Modifiers::NONE, forward) {
+                40.0
+            } else if i.consume_key(egui::Modifiers::NONE, back) {
+                -40.0
+            } else {
+                0.0
+            }
+        });
+        if delta != 0.0 {
+            ctx.memory_mut(|m| m.move_focus(egui::FocusDirection::None));
+            let mut state = scroll.state.clone();
+            state.offset[axis] = (state.offset[axis] + delta).clamp(
+                0.0,
+                (scroll.content_size[axis] - scroll.inner_rect.size()[axis]).max(0.0),
+            );
+            state.store(ctx, scroll.id);
+            ctx.request_repaint();
+        }
     }
 }
 

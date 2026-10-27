@@ -1,7 +1,7 @@
 //! SQLite connection and durable mirror bookkeeping owned by one worker.
 use crate::{
     files::ExportBaseline,
-    notes::{NoteId, NoteRecord, Revision},
+    notes::{CodexProjectBinding, NoteId, NoteRecord, Revision},
 };
 use fs2::FileExt;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -36,6 +36,9 @@ pub struct MirrorConflict {
 }
 #[derive(Default)]
 pub struct StoreStartup {
+    pub automation_write_enabled: Option<bool>,
+    pub research: Vec<crate::research::ResearchWorkspace>,
+    pub codex_project: Option<CodexProjectBinding>,
     #[cfg(feature = "lan")]
     pub preparation: Option<crate::lan_owner::Preparation>,
     #[cfg(feature = "sync")]
@@ -56,6 +59,21 @@ pub struct SaveAck {
 }
 #[derive(Debug)]
 pub enum StoreEvent {
+    AutomationWriteSaved {
+        request_id: Uuid,
+        enabled: bool,
+        result: Result<(), String>,
+    },
+    ResearchSaved {
+        request_id: Uuid,
+        workspace: crate::research::ResearchWorkspace,
+        result: Result<(), String>,
+    },
+    CodexProjectSaved {
+        request_id: Uuid,
+        project: CodexProjectBinding,
+        result: Result<(), String>,
+    },
     #[cfg(feature = "lan")]
     Prepared {
         request_id: Uuid,
@@ -97,6 +115,19 @@ pub enum StoreEvent {
 }
 #[derive(Debug)]
 pub enum StoreRequest {
+    SetAutomationWriteEnabled {
+        request_id: Uuid,
+        enabled: bool,
+    },
+    SaveResearch {
+        request_id: Uuid,
+        expected: Option<Revision>,
+        workspace: crate::research::ResearchWorkspace,
+    },
+    SetCodexProject {
+        request_id: Uuid,
+        project: CodexProjectBinding,
+    },
     #[cfg(feature = "lan")]
     PrepareJoin {
         request_id: Uuid,
@@ -214,6 +245,21 @@ impl Store {
                         }
                         Job::Control(request) => {
                             let event = match request {
+                                StoreRequest::SetAutomationWriteEnabled { request_id, enabled } => {
+                                    let result = connection.execute(
+                                        "INSERT INTO settings(key,value) VALUES('automation_write_enabled',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                                        params![enabled],
+                                    ).map(|_| ()).map_err(|error| error.to_string());
+                                    StoreEvent::AutomationWriteSaved { request_id, enabled, result }
+                                },
+                                StoreRequest::SaveResearch { request_id, expected, workspace } => {
+                                    let result = save_research(&connection, expected, &workspace).map_err(|e|e.to_string());
+                                    StoreEvent::ResearchSaved { request_id, workspace, result }
+                                },
+                                StoreRequest::SetCodexProject { request_id, project } => {
+                                    let result = connection.execute("INSERT INTO codex_project(singleton,project_id,name,creation_key) VALUES(1,?1,?2,?3) ON CONFLICT(singleton) DO UPDATE SET project_id=excluded.project_id,name=excluded.name,creation_key=excluded.creation_key", params![project.project_id, project.name, project.creation_key]).map(|_| ()).map_err(|e| e.to_string());
+                                    StoreEvent::CodexProjectSaved { request_id, project, result }
+                                },
                                 #[cfg(feature = "lan")]
                                 StoreRequest::PrepareJoin {
                                     request_id,
@@ -434,6 +480,8 @@ fn initialize(path: &Path) -> Result<(Connection, StoreStartup), StoreError> {
     }
     connection.execute_batch("BEGIN;
 CREATE TABLE IF NOT EXISTS notes(id TEXT PRIMARY KEY NOT NULL,path TEXT UNIQUE NOT NULL,text TEXT NOT NULL,revision TEXT NOT NULL,trashed INTEGER NOT NULL CHECK(trashed IN(0,1)));
+CREATE TABLE IF NOT EXISTS research_workspaces(id TEXT PRIMARY KEY NOT NULL,revision TEXT NOT NULL,payload TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS codex_project(singleton INTEGER PRIMARY KEY CHECK(singleton=1),project_id TEXT,name TEXT NOT NULL,creation_key TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value INTEGER NOT NULL);
 INSERT OR IGNORE INTO settings VALUES('mirror_enabled',0);
 CREATE TABLE IF NOT EXISTS export_baselines(note_id TEXT PRIMARY KEY,path TEXT NOT NULL,text TEXT NOT NULL);
@@ -448,6 +496,43 @@ COMMIT;").map_err(storage)?;
     #[cfg(feature="lan")]
     connection.execute_batch("CREATE TABLE IF NOT EXISTS lan_preparation(singleton INTEGER PRIMARY KEY CHECK(singleton=1),payload BLOB NOT NULL)").map_err(storage)?;
     let mut state = StoreStartup {
+        automation_write_enabled: {
+            let value: Option<i64> = connection
+                .query_row(
+                    "SELECT value FROM settings WHERE key='automation_write_enabled'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(storage)?;
+            match value {
+                None => None,
+                Some(0) => Some(false),
+                Some(1) => Some(true),
+                Some(_) => return Err(storage("invalid persisted automation write permission")),
+            }
+        },
+        research: load_research(&connection)?,
+        codex_project: {
+            let project: Option<CodexProjectBinding> = connection
+                .query_row(
+                    "SELECT project_id,name,creation_key FROM codex_project WHERE singleton=1",
+                    [],
+                    |row| {
+                        Ok(CodexProjectBinding {
+                            project_id: row.get(0)?,
+                            name: row.get(1)?,
+                            creation_key: row.get(2)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(storage)?;
+            if project.as_ref().is_some_and(|project| !project.valid()) {
+                return Err(storage("invalid persisted Codex project"));
+            }
+            project
+        },
         #[cfg(feature = "lan")]
         preparation: {
             let bytes: Option<Vec<u8>> = connection
@@ -892,4 +977,70 @@ mod tests {
         drop(store);
         std::fs::remove_dir_all(directory).unwrap();
     }
+}
+
+fn save_research(
+    connection: &Connection,
+    expected: Option<Revision>,
+    workspace: &crate::research::ResearchWorkspace,
+) -> Result<(), StoreError> {
+    let payload = serde_json::to_string(workspace).map_err(storage)?;
+    let changed = if let Some(expected) = expected {
+        connection
+            .execute(
+                "UPDATE research_workspaces SET revision=?1,payload=?2 WHERE id=?3 AND revision=?4",
+                params![
+                    workspace.revision.0.to_string(),
+                    payload,
+                    workspace.id.to_string(),
+                    expected.0.to_string()
+                ],
+            )
+            .map_err(storage)?
+    } else {
+        connection
+            .execute(
+                "INSERT INTO research_workspaces(id,revision,payload) VALUES(?1,?2,?3)",
+                params![
+                    workspace.id.to_string(),
+                    workspace.revision.0.to_string(),
+                    payload
+                ],
+            )
+            .map_err(storage)?
+    };
+    if changed != 1 {
+        return Err(storage("research workspace revision changed"));
+    }
+    Ok(())
+}
+fn load_research(
+    connection: &Connection,
+) -> Result<Vec<crate::research::ResearchWorkspace>, StoreError> {
+    let mut statement = connection
+        .prepare("SELECT id,revision,payload FROM research_workspaces ORDER BY id")
+        .map_err(storage)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(storage)?;
+    let mut workspaces = Vec::new();
+    for row in rows {
+        let (id, revision, payload) = row.map_err(storage)?;
+        let workspace: crate::research::ResearchWorkspace =
+            serde_json::from_str(&payload).map_err(storage)?;
+        if workspace.id.to_string() != id || workspace.revision.0.to_string() != revision {
+            return Err(storage(
+                "research workspace identity disagrees with storage",
+            ));
+        }
+        crate::research::validate(&workspace).map_err(storage)?;
+        workspaces.push(workspace);
+    }
+    Ok(workspaces)
 }

@@ -107,6 +107,7 @@ pub(super) fn palette(ctx: &egui::Context) {
 
 pub(super) enum Icon {
     Notes,
+    Folder,
     Search,
     Links,
     Codex,
@@ -118,6 +119,7 @@ pub(super) enum Icon {
     Ready,
     Cancel,
     More,
+    Copy,
 }
 impl Icon {
     fn bytes(&self) -> (&'static str, &'static [u8]) {
@@ -136,6 +138,7 @@ impl Icon {
         }
         match self {
             Self::Notes => asset!("file-text"),
+            Self::Folder => asset!("folder-open"),
             Self::Search => asset!("search"),
             Self::Links => asset!("link"),
             Self::Codex => asset!("sparkles"),
@@ -147,6 +150,7 @@ impl Icon {
             Self::Ready => asset!("check"),
             Self::Cancel => asset!("x"),
             Self::More => asset!("ellipsis"),
+            Self::Copy => asset!("copy"),
         }
     }
 }

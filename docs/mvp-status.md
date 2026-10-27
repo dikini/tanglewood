@@ -24,3 +24,101 @@ Final Android input changes were independently reviewed after composition recove
 Optional D-Bus and the external filter process runner were explicitly deferred; native contracts/example are delivered. Block editing/general plugin management and other plan-deferred features remain outside this MVP. Physical wireless LAN, ARM64 runtime and other Android devices/keyboards were not tested. A representative API35 emulator plus Linux owner satisfies the planned platform/two-device gate; it does not prove a broad hardware matrix. Android sync remains explicit and foreground-only. Wait for SQLite Saved before terminating; unsaved drafts/preedit are not durable acknowledgements.
 
 The user accepted the SDK license and chose the emulator. Temporary SDK/NDK: `/tmp/tanglewood-android-sdk`; AVD `Tanglewood_API35`, serial `emulator-5580`. No external publication is authorized or performed. Only PM stages/commits, unsigned. No required implementation or acceptance task remains.
+
+## Codex vault-project follow-up
+
+CP1 protocol and CP2 durable metadata handoffs are integrated with CP3 sidebar/
+main-pane UI. Header connection/new-thread icons, project rename, paginated
+project-only threads/history and pushed status indicators are implemented.
+Final combined host checks and isolated real project/reply/resume workflow are
+recorded in `codex-live-evidence.md`; note source remained byte-exact. This is
+an optional Linux follow-up; the required MVP acceptance scope is unchanged.
+
+The optional Codex follow-up also includes composer profiles (Work/Plan/Research/
+Goal), independent approval/network controls, a goal banner and bounded live
+command cards. Research may create topic-folder notes through the existing MCP
+write policy; source-file access stays separately restricted. Evidence and
+remaining live-validation limits are in `codex-live-evidence.md`.
+
+## Rich conversation follow-up task board
+
+| Task | Owner / paths | State | Next evidence |
+| --- | --- | --- | --- |
+| RT1 native reply Markdown/code | renderer; ui/codex_markdown.rs, ui/code.rs, compact ui/document.rs helper | done | Bounded parser/cache and keyboard fixtures; exact native Copy |
+| RT2 structured activity | context_protocol; codex.rs | done | Scoped lifecycle/bounds fixture passed |
+| RT3 integration / reported plan display / docs | root; ui.rs, docs | done | Combined host, native layout and full-response/code clipboard |
+| RT4 independent review | reviewer; read-only frozen delta | done | READY after Copy, activity termination and code whitespace fixes |
+
+## Plan / approval correction task board
+
+| Task | Owner / paths | State | Next evidence |
+| --- | --- | --- | --- |
+| MT1 truthful read-only MCP path | mcp_read_tools; mcp.rs | done | Forged-call regression + live two reads, zero approvals |
+| CP1 structured plan setup / permission combinations | context_protocol; codex.rs | done | Four live plan updates; permission/capability fixture |
+| UI1 stronger mode picker / documentation | root; ui.rs, docs | done | Combined host/build and native four-mode/access check |
+| RV1 frozen delta review | reviewer | done | READY; command/MCP wording and capability fix reviewed |
+
+## Research workspace follow-up (2026-10-27)
+
+Approved design: `plans/2026-10-27-research-workspaces-design.md`. Initial scope
+is explicitly added sources; discovery, OCR and rich output exporters are later
+increments. Developer settings follow the user's Sol 6.1 medium request;
+independent reviews use Sol 6.1 xhigh.
+
+| Task | Owner / paths | State | Next evidence |
+| --- | --- | --- | --- |
+| R1 workspace commands / durability | research_core; research.rs, app.rs, commands.rs, store.rs, lib.rs | done | Real SQLite/CAS/restart/save-before-link and failure retention |
+| R2 bounded text/PDF worker | research_import; research_import.rs | done | Page/bounds/text fixtures and actual native PDF import |
+| R3 quiet workspace/source/agent UI | research_ui; ui.rs, ui/research.rs | done | Actual Linux workspace/note/citation flow; guarded exact evidence attachment |
+| R4 integration / independent review | root / research_review | done | Independent READY; exact commands/limits in research.md |
+
+## Research flow and artifact follow-up (2026-10-27)
+
+Plan: `plans/2026-10-27-research-flow-and-artifacts.md`. User prioritized capturing
+ongoing investigation flow, many associated threads, retained files/web Markdown,
+and new report notes on demand. Parallel Sol 6.1 medium implementation; xhigh review.
+
+| Task | Owner / files | State | Evidence / next |
+| --- | --- | --- | --- |
+| F1 flow records / dispatch | flow_core; research.rs, app.rs, commands.rs, lib.rs | done | Old JSON/restart/CAS/receipt retry; bounded context + index/paged reads |
+| F2 retained artifact worker | flow_assets; research_assets.rs | done | Exact originals, real native HTTP/Pandoc archive and restart |
+| F3 conversation/workspace flow | flow_ui; ui.rs, ui/research.rs | done | Native retained artifacts/two report versions + focused draft/provenance tests |
+| F4 integration / review | root / flow_review | done | Independent READY; test/build/native evidence in research.md |
+
+## Quiet research UI (2026-10-27)
+
+Scope: presentation/navigation only, following the conversation-centered direction.
+No source discovery, citation pipeline, retrieval or new output generators added.
+Plan and capability gaps: `plans/2026-10-27-quiet-research-ui.md`.
+
+| Task | Owner / paths | State | Evidence / next |
+| --- | --- | --- | --- |
+| Q1 design review and gap record | root / ux_design_review; plan/docs | done | Conversation/sources/outcomes direction; explicit deferred gaps |
+| Q2 source/outcome panes and contextual windows | quiet_research_ui; ui/research.rs | done | Quiet source list, readable findings, guarded report preparation |
+| Q3 existing chat integration and responsive shell | root; ui.rs, examples/research_demo.rs | done | Wide/empty/narrow native layout; successful preparation and draft refusal |
+| Q4 independent review and acceptance | ux_design_review / root | done | Independent READY; 26 UI + 5 no-Codex GUI tests; native evidence in research.md |
+
+## Vault agent permission (2026-10-27)
+
+Plan: `plans/2026-10-27-vault-agent-permissions.md`. Replace the launch-flag-only
+experience with a saved local permission; preserve headless compatibility.
+
+| Task | Owner / paths | State | Evidence |
+| --- | --- | --- | --- |
+| P1 durable local-only preference | vault_permission_state; app.rs, store.rs, commands.rs | done | Grant/revoke, SQLite failure/retry, restart and unauthorized caller regression |
+| P2 live policy and cached tools | live_mcp_permission; mcp.rs, codex.rs | done | Same-socket queued revocation, accepted acknowledgments, stable schema, no self-grant |
+| P3 controls and integration | root; ui.rs, docs | done | Native Settings grant and conversation-menu revoke; build passed |
+| P4 independent review | ux_design_review | done | READY; combined library suite 79 passed, 1 optional external-tool case ignored |
+
+## Desktop research completion (2026-10-27)
+
+Plan: `plans/2026-10-27-desktop-research-completion.md`. Sync/mobile and multi-agent
+research orchestration explicitly deferred.
+
+| Slice | State | Evidence |
+| --- | --- | --- |
+| References, discovery, native import | done | Explicit candidate collection/dedup; native chooser retained Markdown; live Crossref passed |
+| Acquisition, reading, OCR | done | Durable batch/retry/restart tests; actual PDF and OCR; native PDF/text/search/citation navigation |
+| Retrieval and assessments | done | Selected-source lexical preview bound to workspace/revision/query; contextual history and gap suggestions |
+| Output roles and generators | done | Immutable real HTML/SVG outputs with source links; legacy Unclassified role; browser/SVG renders |
+| Integration and UX review | done | Final focused gui/headless tests and build passed; Sol6.1 xhigh review; native evidence/limits in research.md |

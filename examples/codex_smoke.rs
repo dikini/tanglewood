@@ -65,6 +65,7 @@ fn live(directory: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
             mcp_bridge: bridge,
             socket,
             resume_thread: None,
+            project: None,
         },
         || {},
     )?;

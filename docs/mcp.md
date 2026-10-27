@@ -35,13 +35,18 @@ not build the bridge binary automatically. Substitute your actual user runtime
 directory; do not copy user ID 1000 blindly. A headless owner uses `--headless`
 with the same socket flag and continuously polls the same App dispatch.
 
-The default owner policy is read-only. Mutations require the owner launch flag
-`--mcp-write`, not a tool argument. Caller identity comes from the trusted owner
-setting; the socket envelope rejects unknown fields. Both discovery and dispatch
-use the shared command descriptors' automation allowlist, which excludes
-local-only filesystem/mirror commands. Read-only exposes read/search; read-write
-also exposes create, revision-checked edit/rename/trash/restore. The adapter does
-not provide arbitrary filesystem, process, SQL or ECS access.
+The default owner policy is read-only. In the app, use **Settings → Connections →
+Allow agents to update notes and research**, or **Conversation actions → Vault
+updates**. The permission is saved with this vault and applies to all its connected
+automation clients. Changes affect the existing socket and conversation without a
+restart. Enabling waits for durable persistence; disabling immediately blocks
+requests that have not already been accepted. Failed saves leave updates disabled
+and expose a retry action. Only local user actions can change the permission.
+
+`--mcp-write` remains a startup fallback for headless/legacy use when this vault has
+no saved preference. An explicit saved disable overrides that flag. Caller identity
+comes from the owner, never a tool argument. Shared command validation and local-only
+restrictions remain enforced, independently of process/network permissions.
 
 The socket is mode 0600 inside the private directory, and both endpoints verify
 Linux SO_PEERCRED has the current effective UID. This is a same-user local
@@ -53,11 +58,21 @@ starts a second writable vault runtime.
 
 ## Tools and shared schema
 
+The `execute` tool keeps a stable schema containing potentially authorized mutation
+commands, so clients caching their initial tool list can use a later local grant.
+It always has mutating annotations. This schema is not authorization: `capabilities`
+reports the current policy, and the owner checks it again for every dispatch.
+The `read` tool remains non-mutating. Research sources use research workspace
+commands; they do not require a specially named sources note.
+
+
 `capabilities` returns protocol version, request ID and the running owner's
 allowed command names and policy. `execute` accepts `{"command": ...}` using the
 same serde Command representation as the application. Tool input schema is
-produced by schemars from shared request types, then unauthorized variants are
-removed using those same descriptors. A changed/unknown schema-generator layout
+produced by schemars from shared request types. Local-only commands are removed
+using the same descriptors; the read tool also excludes mutating variants. The
+execute schema covers the maximum automation allowlist, independently of current
+permission. A changed/unknown schema-generator layout
 fails closed. A policy change between discovery and invocation does not bypass
 owner enforcement.
 

@@ -39,7 +39,16 @@ pub(super) fn render_node(
             ui.weak("Artwork unavailable");
             ui.add_space(29.0);
         }
-        BlockKind::Fence(fence) => code(ui, &fence.body),
+        BlockKind::Fence(fence) => super::code::show(
+            ui,
+            &fence.body,
+            fence
+                .attributes
+                .classes
+                .first()
+                .map(String::as_str)
+                .unwrap_or(""),
+        ),
         BlockKind::Source(source) => render_source(ui, source, navigate),
         BlockKind::Paragraph => prose(ui, block.inlines, None, navigate),
         BlockKind::Heading(level) => prose(ui, block.inlines, Some(*level), navigate),
@@ -62,6 +71,91 @@ fn prose(
     heading: Option<u8>,
     navigate: &mut Option<String>,
 ) {
+    prose_impl(ui, inlines, heading, navigate, false);
+}
+
+/// Read-only conversation prose; destinations are prefiltered by its parser.
+pub(super) fn transcript_prose(ui: &mut egui::Ui, inlines: &[Inline], heading: Option<u8>) {
+    prose_impl(ui, inlines, heading, &mut None, true);
+}
+
+fn citation_inlines(inlines: &[Inline]) -> Vec<Inline> {
+    let mut joined = Vec::new();
+    for inline in inlines {
+        if let Inline::Text(text) = inline {
+            if let Some(Inline::Text(previous)) = joined.last_mut() {
+                previous.push_str(text);
+                continue;
+            }
+        }
+        joined.push(inline.clone());
+    }
+    let mut result = Vec::new();
+    for inline in &joined {
+        let Inline::Text(text) = inline else {
+            result.push(inline.clone());
+            continue;
+        };
+        let mut rest = text.as_str();
+        while let Some(start) = rest.find("[source:") {
+            result.push(Inline::Text(rest[..start].to_owned()));
+            let tail = &rest[start..];
+            let Some(end) = tail.find(']') else {
+                rest = tail;
+                break;
+            };
+            let fields = tail[8..end].split_whitespace().collect::<Vec<_>>();
+            let valid = fields.first().and_then(|id| uuid::Uuid::parse_str(id).ok());
+            if let Some(id) = valid {
+                let page = fields
+                    .get(1)
+                    .and_then(|s| s.strip_prefix("page:"))
+                    .and_then(|p| p.parse::<u32>().ok())
+                    .filter(|p| *p > 0);
+                if fields.len() == 1 || (fields.len() == 2 && page.is_some()) {
+                    let target = page
+                        .map(|p| format!("source://{id}?page={p}"))
+                        .unwrap_or_else(|| format!("source://{id}"));
+                    result.push(Inline::Link {
+                        target,
+                        label: page
+                            .map(|p| format!("[p. {p}]"))
+                            .unwrap_or_else(|| "[source]".into()),
+                        wiki: false,
+                    });
+                } else {
+                    result.push(Inline::Text(tail[..=end].to_owned()));
+                }
+            } else {
+                result.push(Inline::Text(tail[..=end].to_owned()));
+            }
+            rest = &tail[end + 1..];
+        }
+        if !rest.is_empty() {
+            result.push(Inline::Text(rest.to_owned()));
+        }
+    }
+    result
+}
+fn open_source(ui: &egui::Ui, target: &str) -> bool {
+    if target.starts_with("source://") {
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(egui::Id::new("research-open-citation"), target.to_owned())
+        });
+        true
+    } else {
+        false
+    }
+}
+fn prose_impl(
+    ui: &mut egui::Ui,
+    inlines: &[Inline],
+    heading: Option<u8>,
+    navigate: &mut Option<String>,
+    compact: bool,
+) {
+    let expanded = citation_inlines(inlines);
+    let inlines = expanded.as_slice();
     let size = match heading {
         Some(1) => 28.0,
         Some(2) => 23.0,
@@ -155,14 +249,29 @@ fn prose(
     }
     ui.painter()
         .galley(rect.min, galley.clone(), ui.visuals().text_color());
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &plain));
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            if compact && !links.is_empty() {
+                egui::WidgetType::Link
+            } else {
+                egui::WidgetType::Label
+            },
+            true,
+            if compact && !links.is_empty() {
+                format!("{plain}. Enter or Space to choose a link")
+            } else {
+                plain.clone()
+            },
+        )
+    });
     if let Some(pos) = response.hover_pos() {
         let cursor = galley.cursor_from_pos(pos - rect.min).index;
         if let Some((_, target, wiki)) = links.iter().find(|(range, _, _)| range.contains(&cursor))
         {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            if response.clicked() {
-                if !wiki && (target.contains("://") || target.starts_with("mailto:")) {
+            if response.clicked() && (!compact || ui.input(|i| i.pointer.primary_clicked())) {
+                if open_source(ui, target) {
+                } else if !wiki && (target.contains("://") || target.starts_with("mailto:")) {
                     ui.ctx().open_url(egui::OpenUrl::new_tab(target));
                 } else {
                     *navigate = Some(target.clone());
@@ -170,7 +279,61 @@ fn prose(
             }
         }
     }
-    if !links.is_empty() {
+    if compact && !links.is_empty() {
+        if response.has_focus() {
+            ui.painter().rect_stroke(
+                rect.expand(3.0),
+                3.0,
+                egui::Stroke::new(0.8, ui.visuals().weak_text_color()),
+                egui::StrokeKind::Outside,
+            );
+        }
+        let keyboard_open = response.has_focus()
+            && ui.input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+                    || i.consume_key(egui::Modifiers::NONE, egui::Key::Space)
+            });
+        egui::Popup::from_response(&response)
+            .kind(egui::PopupKind::Menu)
+            .layout(egui::Layout::top_down_justified(egui::Align::Min))
+            .open_memory(
+                (keyboard_open || response.secondary_clicked())
+                    .then_some(egui::SetOpenCommand::Bool(true)),
+            )
+            .show(|ui| {
+                for (index, (range, target, _)) in links.iter().enumerate() {
+                    // Keep this boundary safe even if another transcript caller
+                    // accidentally supplies an unfiltered destination later.
+                    let lower = target.to_ascii_lowercase();
+                    if lower.starts_with("source://") {
+                        let label: String =
+                            plain.chars().skip(range.start).take(range.len()).collect();
+                        let link = ui
+                            .link(label)
+                            .on_hover_text("Open retained source at this page");
+                        if keyboard_open && index == 0 {
+                            link.request_focus();
+                        }
+                        if link.clicked() {
+                            open_source(ui, target);
+                            ui.close();
+                        }
+                        continue;
+                    }
+                    if !lower.starts_with("http://") && !lower.starts_with("https://") {
+                        continue;
+                    }
+                    let label: String = plain.chars().skip(range.start).take(range.len()).collect();
+                    let link = ui.hyperlink_to(label, target);
+                    if keyboard_open && index == 0 {
+                        link.request_focus();
+                    }
+                    if link.clicked() {
+                        ui.close();
+                    }
+                }
+            });
+    } else if !links.is_empty() {
         // Real link widgets retain independent keyboard and accessibility actions;
         // the paragraph above remains one coherent galley rather than token widgets.
         ui.menu_button(
@@ -180,7 +343,12 @@ fn prose(
             |ui| {
                 for (range, target, wiki) in &links {
                     let label: String = plain.chars().skip(range.start).take(range.len()).collect();
-                    if !wiki && (target.contains("://") || target.starts_with("mailto:")) {
+                    if target.starts_with("source://") {
+                        if ui.link(label).clicked() {
+                            open_source(ui, target);
+                            ui.close();
+                        }
+                    } else if !wiki && (target.contains("://") || target.starts_with("mailto:")) {
                         ui.hyperlink_to(label, target);
                     } else if ui.link(label).clicked() {
                         *navigate = Some(target.clone());
@@ -192,7 +360,13 @@ fn prose(
         .response
         .on_hover_text("Links in this paragraph");
     }
-    ui.add_space(if heading.is_some() { 17.0 } else { 18.0 });
+    ui.add_space(if compact {
+        7.0
+    } else if heading.is_some() {
+        17.0
+    } else {
+        18.0
+    });
 }
 
 /// Inline code backgrounds follow font metrics, not the paragraph's line box.
@@ -226,10 +400,6 @@ fn code_highlights(galley: &egui::Galley, spans: &[Range<usize>]) -> Vec<egui::R
     }
     highlights
 }
-fn code(ui: &mut egui::Ui, source: &str) {
-    ui.add(egui::Label::new(egui::RichText::new(source).monospace().size(13.0)).wrap());
-    ui.add_space(18.0);
-}
 fn quote(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
     let response = ui
         .horizontal_top(|ui| {
@@ -249,7 +419,8 @@ fn quote(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
 }
 fn render_source(ui: &mut egui::Ui, source: &str, _navigate: &mut Option<String>) {
     // Preserve the existing reader's unsupported structures as original source.
-    code(ui, source);
+    ui.add(egui::Label::new(egui::RichText::new(source).monospace().size(13.0)).wrap());
+    ui.add_space(18.0);
 }
 
 /// Reserve a quiet gutter, keeping the pencil keyboard reachable even before hover.
@@ -543,7 +714,16 @@ pub(super) fn render_pandoc(
                     Some(block["c"][0].as_u64().unwrap_or(1) as u8),
                     navigate,
                 ),
-                "CodeBlock" => code(ui, block["c"][1].as_str().unwrap_or("")),
+                "RawBlock"
+                    if block["c"][0] == "html"
+                        && crate::markdown::only_html_comments(
+                            block["c"][1].as_str().unwrap_or(""),
+                        ) => {}
+                "CodeBlock" => super::code::show(
+                    ui,
+                    block["c"][1].as_str().unwrap_or(""),
+                    block["c"][0][1][0].as_str().unwrap_or(""),
+                ),
                 "Div" => {
                     if let Some(children) = block["c"][1].as_array() {
                         render(
@@ -798,6 +978,45 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn transcript_links_keyboard_opens_chooser_before_any_url() {
+        let ctx = egui::Context::default();
+        let inlines = [
+            Inline::Text("Read ".into()),
+            Inline::Link {
+                target: "https://example.com/evidence".into(),
+                label: "the evidence".into(),
+                wiki: false,
+            },
+        ];
+        let frame = |key: Option<egui::Key>| {
+            let mut input = egui::RawInput::default();
+            if let Some(key) = key {
+                input.events.push(egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    transcript_prose(ui, &inlines, None);
+                });
+            })
+        };
+        frame(None);
+        let tab = frame(Some(egui::Key::Tab));
+        assert!(ctx.memory(|m| m.focused()).is_some());
+        assert!(tab.platform_output.commands.is_empty());
+        let chooser = frame(Some(egui::Key::Enter));
+        assert!(egui::Popup::is_any_open(&ctx));
+        assert!(chooser.platform_output.commands.is_empty());
+        let follow = frame(Some(egui::Key::Enter));
+        assert!(follow.platform_output.commands.iter().any(|command| matches!(command, egui::OutputCommand::OpenUrl(url) if url.url == "https://example.com/evidence")));
+    }
+
+    #[test]
     fn only_unique_unchanged_adapter_figures_bind_and_old_pixels_are_discarded() {
         let source = "```{#fig-proof .illustration}\nsaved artwork\n```\n";
         let figure = crate::illustration::PreparedFigure {
@@ -859,5 +1078,28 @@ mod tests {
         cache.poll(&egui::Context::default());
         assert!(cache.images.is_empty());
         assert!(!cache.is_busy());
+    }
+}
+
+#[cfg(test)]
+mod citation_tests {
+    use super::*;
+    #[test]
+    fn split_markers_become_exact_local_links() {
+        let id = uuid::Uuid::new_v4();
+        let chunks = vec![
+            Inline::Text("See [".into()),
+            Inline::Text(format!("source:{id} page:61")),
+            Inline::Text("] now.".into()),
+        ];
+        let expanded = citation_inlines(&chunks);
+        assert!(expanded.iter().any(
+            |i| matches!(i,Inline::Link {target,..} if target==&format!("source://{id}?page=61"))
+        ));
+        assert!(
+            citation_inlines(&[Inline::Code(format!("[source:{id}]"))])
+                .iter()
+                .all(|i| matches!(i, Inline::Code(_)))
+        );
     }
 }

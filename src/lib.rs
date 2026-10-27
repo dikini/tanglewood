@@ -45,3 +45,11 @@ pub mod android_input;
 pub mod document_jobs;
 #[cfg(feature = "documents")]
 pub mod pandoc;
+
+pub mod research;
+pub mod research_assets;
+
+pub(crate) mod research_import;
+
+pub mod research_desktop;
+pub mod research_reader;

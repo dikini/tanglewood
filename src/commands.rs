@@ -1,4 +1,4 @@
-use crate::notes::{NoteId, NoteView, Revision, TextEdit};
+use crate::notes::{CodexProjectBinding, NoteId, NoteView, Revision, TextEdit};
 use serde::{Deserialize, Serialize};
 
 /// Constructed by a trusted adapter, never from a request's claimed identity.
@@ -39,6 +39,15 @@ pub enum ImportDestination {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub enum Command {
+    Research(crate::research::ResearchCommand),
+    GetCodexProject,
+    SetAutomationWriteEnabled {
+        enabled: bool,
+    },
+    SetCodexProject {
+        expected: Option<CodexProjectBinding>,
+        project: CodexProjectBinding,
+    },
     ListenLan {
         bind: String,
         advertised_ip: Option<String>,
@@ -111,7 +120,7 @@ pub struct CommandDescriptor {
     pub mutation: bool,
     pub local_only: bool,
 }
-const COMMANDS: [CommandDescriptor; 22] = [
+const COMMANDS: [CommandDescriptor; 26] = [
     CommandDescriptor {
         name: "lan.listen",
         wire_variant: "ListenLan",
@@ -266,6 +275,34 @@ const COMMANDS: [CommandDescriptor; 22] = [
         mutation: true,
         local_only: true,
     },
+    CommandDescriptor {
+        name: "codex.project.read",
+        wire_variant: "GetCodexProject",
+        available: true,
+        mutation: false,
+        local_only: false,
+    },
+    CommandDescriptor {
+        name: "codex.project.set",
+        wire_variant: "SetCodexProject",
+        available: true,
+        mutation: true,
+        local_only: true,
+    },
+    CommandDescriptor {
+        name: "research.execute",
+        wire_variant: "Research",
+        available: true,
+        mutation: false,
+        local_only: false,
+    },
+    CommandDescriptor {
+        name: "automation.set_write_enabled",
+        wire_variant: "SetAutomationWriteEnabled",
+        available: true,
+        mutation: true,
+        local_only: true,
+    },
 ];
 impl CommandDescriptor {
     pub fn allowed(self, caller: Caller) -> bool {
@@ -276,7 +313,35 @@ impl CommandDescriptor {
 }
 impl Command {
     pub fn descriptor(&self) -> CommandDescriptor {
+        if let Self::Research(command) = self {
+            return CommandDescriptor {
+                mutation: command.is_mutation(),
+                local_only: matches!(
+                    command,
+                    crate::research::ResearchCommand::ImportSources { .. }
+                        | crate::research::ResearchCommand::ImportSource { .. }
+                        | crate::research::ResearchCommand::AcquireSource {
+                            input: crate::research::ArtifactInput::LocalFile { .. },
+                            ..
+                        }
+                        | crate::research::ResearchCommand::SavePaper {
+                            input: crate::research::ArtifactInput::LocalFile { .. },
+                            ..
+                        }
+                        | crate::research::ResearchCommand::AssessSource { human: true, .. }
+                        | crate::research::ResearchCommand::RetryArtifact { .. }
+                        | crate::research::ResearchCommand::CollectArtifact {
+                            input: crate::research::ArtifactInput::LocalFile { .. }
+                                | crate::research::ArtifactInput::Url { archive: true, .. },
+                            ..
+                        }
+                ),
+                ..COMMANDS[24]
+            };
+        }
         let index = match self {
+            Self::Research(_) => 24,
+            Self::SetAutomationWriteEnabled { .. } => 25,
             Self::ListenLan { .. } => 0,
             Self::GetLanTicket => 1,
             Self::PrepareJoin { .. } => 2,
@@ -300,6 +365,8 @@ impl Command {
             Self::ImportMarkdown { .. } => 19,
             Self::ExportMarkdown { .. } => 20,
             Self::RescanMirror => 21,
+            Self::GetCodexProject => 22,
+            Self::SetCodexProject { .. } => 23,
         };
         COMMANDS[index]
     }
@@ -311,11 +378,19 @@ impl Command {
             .collect()
     }
     pub fn is_mutation(&self) -> bool {
-        !matches!(self, Self::ReadNote { .. } | Self::SearchNotes { .. })
+        if let Self::Research(command) = self {
+            return command.is_mutation();
+        }
+        !matches!(
+            self,
+            Self::ReadNote { .. } | Self::SearchNotes { .. } | Self::GetCodexProject
+        )
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum CommandResult {
+    Research(crate::research::ResearchResult),
+    CodexProject(Option<CodexProjectBinding>),
     LanTicket { ticket: String },
     LanStatus(LanStatus),
     Accepted { request_id: uuid::Uuid },
@@ -325,6 +400,12 @@ pub enum CommandResult {
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
 pub enum CommandError {
+    #[error("invalid research request: {0}")]
+    InvalidResearch(String),
+    #[error("Codex project association changed")]
+    CodexProjectChanged,
+    #[error("invalid Codex project: {0}")]
+    InvalidCodexProject(String),
     #[error("caller is not authorized for this command")]
     Unauthorized,
     #[error("I/O queue is full")]
@@ -343,4 +424,26 @@ pub enum CommandError {
     Trashed,
     #[error("capability unavailable: {0}")]
     Unavailable(String),
+}
+
+#[cfg(test)]
+mod paper_policy_tests {
+    use super::*;
+    #[test]
+    fn paper_download_is_authorized_but_local_paths_stay_local() {
+        let base = serde_json::json!({"Research":{"SavePaper":{
+            "id":uuid::Uuid::new_v4(),"expected":uuid::Uuid::new_v4(),
+            "source_id":uuid::Uuid::new_v4(),
+            "input":{"Url":{"url":"https://example.org/paper.pdf","archive":true}}
+        }}});
+        let remote: Command = serde_json::from_value(base.clone()).expect("paper save command");
+        assert!(remote.descriptor().allowed(Caller::AutomationReadWrite));
+        assert!(!remote.descriptor().allowed(Caller::AutomationReadOnly));
+        let mut local = base;
+        local["Research"]["SavePaper"]["input"] =
+            serde_json::json!({"LocalFile":{"path":"/tmp/paper.pdf"}});
+        let local: Command = serde_json::from_value(local).unwrap();
+        assert!(local.descriptor().allowed(Caller::Local));
+        assert!(!local.descriptor().allowed(Caller::AutomationReadWrite));
+    }
 }

@@ -1,0 +1,31 @@
+%YAML 1.2
+---
+name: Ash
+file_extensions: [ash]
+scope: source.ash
+contexts:
+  main:
+    - match: "^\\s*(?:(pub)\\s+)?([a-z_][A-Za-z0-9_]*)(?=\\s*(?:<[^\\n]*>)?\\s*:)"
+      captures:
+        1: keyword.control.ash
+        2: entity.name.function.ash
+    - match: "\\b(?:fn|let|rec|and|type|newtype|interface|impl|effect|perform|handle|with|resume|discard|resource|hook|register|cleanup|where|match|import|as|pub|opaque)\\b"
+      scope: keyword.control.ash
+    - match: "\\b(?:Int|Bool|Unit)\\b"
+      scope: support.type.ash
+    - match: "\\b(?:true|false|_)\\b"
+      scope: constant.language.ash
+    - match: "\\b(?:0|[1-9][0-9]*)\\b"
+      scope: constant.numeric.ash
+    - match: "\\b[A-Z][A-Za-z0-9_]*\\b"
+      scope: entity.name.type.ash
+    - match: "\\b[a-z_][A-Za-z0-9_]*\\b"
+      scope: variable.other.ash
+    - match: "->|=>|==|[=+*!|]"
+      scope: keyword.operator.ash
+    - match: "[(){}<>]"
+      scope: punctuation.section.ash
+    - match: "@"
+      scope: punctuation.definition.module.ash
+    - match: "[.,:]"
+      scope: punctuation.separator.ash

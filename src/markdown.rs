@@ -94,6 +94,38 @@ pub fn read(note: NoteId, revision: Revision, source: &str) -> Document {
     let events: Vec<_> = Parser::new_ext(source, Options::ENABLE_WIKILINKS)
         .into_offset_iter()
         .collect();
+    let mut html_regions: Vec<Range<usize>> = Vec::new();
+    for (event, range) in &events {
+        if matches!(event, Event::Html(_) | Event::InlineHtml(_)) {
+            if let Some(previous) = html_regions.last_mut().filter(|r| r.end == range.start) {
+                previous.end = range.end;
+            } else {
+                html_regions.push(range.clone());
+            }
+        }
+    }
+    let comments: Vec<_> = html_regions
+        .into_iter()
+        .flat_map(|range| {
+            html_comment_ranges(&source[range.clone()])
+                .into_iter()
+                .map(move |comment| range.start + comment.start..range.start + comment.end)
+        })
+        .collect();
+    let visible = |range: Range<usize>| {
+        let mut text = String::new();
+        let mut cursor = range.start;
+        let first = comments.partition_point(|comment| comment.end <= range.start);
+        for comment in &comments[first..] {
+            if comment.start >= range.end {
+                break;
+            }
+            text.push_str(&source[cursor..comment.start.max(cursor)]);
+            cursor = comment.end.min(range.end);
+        }
+        text.push_str(&source[cursor..range.end]);
+        text
+    };
     let mut links = Vec::new();
     for (event, _) in &events {
         if let Event::Start(Tag::Link { dest_url, .. }) = event {
@@ -119,6 +151,10 @@ pub fn read(note: NoteId, revision: Revision, source: &str) -> Document {
             let end = index;
             let bytes = range.start..events[end - 1].1.end;
             let raw = &source[bytes.clone()];
+            let presentation = visible(bytes.clone());
+            if presentation.trim().is_empty() {
+                continue;
+            }
             let origin = Some(SourceOrigin {
                 note,
                 revision,
@@ -139,16 +175,15 @@ pub fn read(note: NoteId, revision: Revision, source: &str) -> Document {
                         .collect(),
                     source: raw.to_owned(),
                 }),
-                _ => BlockKind::Source(raw.to_owned()),
+                _ => BlockKind::Source(presentation.clone()),
             };
             let kind = if matches!(kind, BlockKind::Paragraph | BlockKind::Heading(_))
-                && events[start + 1..end - 1].iter().any(|(event, _)| {
-                    matches!(
-                        event,
-                        Event::InlineHtml(_) | Event::Html(_) | Event::Start(Tag::Image { .. })
-                    )
+                && events[start + 1..end - 1].iter().any(|(event, range)| {
+                    matches!(event, Event::Start(Tag::Image { .. }))
+                        || (matches!(event, Event::InlineHtml(_) | Event::Html(_))
+                            && !visible(range.clone()).trim().is_empty())
                 }) {
-                BlockKind::Source(raw.to_owned())
+                BlockKind::Source(presentation)
             } else {
                 kind
             };
@@ -165,8 +200,13 @@ pub fn read(note: NoteId, revision: Revision, source: &str) -> Document {
                 origin,
             });
         } else {
+            let presentation = visible(range.clone());
+            if presentation.trim().is_empty() {
+                index += 1;
+                continue;
+            }
             blocks.push(RenderBlock {
-                kind: BlockKind::Source(source[range.clone()].to_owned()),
+                kind: BlockKind::Source(presentation),
                 inlines: Vec::new(),
                 children: Vec::new(),
                 attributes: Attributes::default(),
@@ -187,6 +227,100 @@ pub fn read(note: NoteId, revision: Revision, source: &str) -> Document {
         links,
         read_only: false,
     }
+}
+
+/// Scan only parser-designated HTML, respecting quoted tags and raw-text elements.
+/// Regions never extend into subsequent Markdown or fenced/inline code.
+fn html_comment_ranges(html: &str) -> Vec<Range<usize>> {
+    let bytes = html.as_bytes();
+    let mut comments = Vec::new();
+    let mut cursor = 0;
+    let mut raw_element: Option<Vec<u8>> = None;
+    while cursor < bytes.len() {
+        if let Some(name) = raw_element.as_ref() {
+            if bytes[cursor..].starts_with(b"</")
+                && bytes
+                    .get(cursor + 2..cursor + 2 + name.len())
+                    .is_some_and(|tag| tag.eq_ignore_ascii_case(name))
+                && bytes
+                    .get(cursor + 2 + name.len())
+                    .is_some_and(|b| b.is_ascii_whitespace() || *b == b'>')
+            {
+                raw_element = None;
+            } else {
+                cursor += 1;
+                continue;
+            }
+        }
+        if bytes[cursor..].starts_with(b"<!--") {
+            let end = bytes[cursor + 2..]
+                .windows(3)
+                .position(|w| w == b"-->")
+                .map_or(bytes.len(), |end| cursor + 2 + end + 3);
+            comments.push(cursor..end);
+            cursor = end;
+        } else if bytes[cursor..].starts_with(b"<![CDATA[") {
+            cursor = bytes[cursor + 9..]
+                .windows(3)
+                .position(|w| w == b"]]>")
+                .map_or(bytes.len(), |end| cursor + 9 + end + 3);
+        } else if bytes[cursor] == b'<' {
+            let start = cursor;
+            cursor += 1;
+            let name_start = cursor;
+            while cursor < bytes.len() && bytes[cursor].is_ascii_alphanumeric() {
+                cursor += 1;
+            }
+            let name = &bytes[name_start..cursor];
+            let exact_tag_name = bytes
+                .get(cursor)
+                .is_some_and(|b| b.is_ascii_whitespace() || matches!(b, b'>' | b'/'));
+            let mut quote = None;
+            while cursor < bytes.len() {
+                let byte = bytes[cursor];
+                cursor += 1;
+                match (quote, byte) {
+                    (Some(q), b) if q == b => quote = None,
+                    (None, b'\'' | b'"') => quote = Some(byte),
+                    (None, b'>') => break,
+                    _ => {}
+                }
+            }
+            if exact_tag_name
+                && !bytes[start..cursor].ends_with(b"/>")
+                && [
+                    b"script".as_slice(),
+                    b"style",
+                    b"textarea",
+                    b"title",
+                    b"xmp",
+                    b"iframe",
+                    b"noembed",
+                    b"noframes",
+                    b"plaintext",
+                ]
+                .iter()
+                .any(|raw| name.eq_ignore_ascii_case(raw))
+            {
+                raw_element = Some(name.to_vec());
+            }
+        } else {
+            cursor += 1;
+        }
+    }
+    comments
+}
+
+/// Used for raw HTML emitted by optional processors, never on code text.
+pub(crate) fn only_html_comments(text: &str) -> bool {
+    let mut cursor = 0;
+    for comment in html_comment_ranges(text) {
+        if !text[cursor..comment.start].trim().is_empty() {
+            return false;
+        }
+        cursor = comment.end;
+    }
+    text[cursor..].trim().is_empty()
 }
 
 fn read_inlines(events: &[(Event<'_>, Range<usize>)]) -> Vec<Inline> {
@@ -306,4 +440,68 @@ pub fn fence_attributes(info: &str) -> Option<Attributes> {
         }
     }
     Some(attrs)
+}
+
+#[cfg(test)]
+mod reader_comment_tests {
+    use super::*;
+    #[test]
+    fn html_comments_are_hidden_without_touching_code_or_source_ranges() {
+        let source = "<!-- source: lesson.ash -->\n\nHello <!-- hidden --> world.\n\n- item <!-- list comment -->\n\n`<!-- literal -->`\n\n```html\n<!-- code literal -->\n```\n";
+        let doc = read(
+            NoteId(uuid::Uuid::new_v4()),
+            Revision(uuid::Uuid::new_v4()),
+            source,
+        );
+        for html in [
+            "<div title=\"<!--\">kept</div>\n\n# Kept heading\n",
+            "<script>let marker = \"<!--\";</script>\n\n# Kept heading\n",
+        ] {
+            let parsed = read(doc.note, doc.revision, html);
+            assert!(matches!(
+                parsed.blocks.last().unwrap().kind,
+                BlockKind::Heading(1)
+            ));
+            assert!(
+                matches!(&parsed.blocks[0].kind, BlockKind::Source(text) if text.contains("<!--"))
+            );
+        }
+        assert_eq!(
+            html_comment_ranges("<div title=\"<!--\">keep <!-- real --> text</div>"),
+            vec![23..36]
+        );
+        for short in ["<!-->", "<!--->"] {
+            assert!(only_html_comments(short));
+            assert!(!only_html_comments(&format!("{short}kept")));
+        }
+        let custom = "<script-example><!-- hidden --></script-example>";
+        let ranges = html_comment_ranges(custom);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(&custom[ranges[0].clone()], "<!-- hidden -->");
+        assert!(only_html_comments("<!-- first -->\n<!-- second -->"));
+        assert!(!only_html_comments(
+            "<!-- first --><div>visible</div><!-- last -->"
+        ));
+        assert_eq!(doc.blocks.len(), 4);
+        assert_eq!(
+            doc.blocks[0].inlines,
+            vec![
+                Inline::Text("Hello ".into()),
+                Inline::Text(" world.".into())
+            ]
+        );
+        assert!(matches!(&doc.blocks[1].kind, BlockKind::Source(s) if !s.contains("list comment")));
+        assert_eq!(
+            doc.blocks[2].inlines,
+            vec![Inline::Code("<!-- literal -->".into())]
+        );
+        assert!(
+            matches!(&doc.blocks[3].kind, BlockKind::Fence(f) if f.body.contains("<!-- code literal -->"))
+        );
+        let range = &doc.blocks[0].origin.as_ref().unwrap().bytes;
+        assert_eq!(
+            source[range.clone()].trim_end(),
+            "Hello <!-- hidden --> world."
+        );
+    }
 }

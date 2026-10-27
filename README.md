@@ -40,6 +40,11 @@ and Escape releases focus. A muted line spanning the block height in the left ma
 current block. The notes-pane divider shows a focus line and uses Left/Right to resize;
 focused scrollbars use Up/Down to scroll. Text fields retain their normal cursor keys. Ready/Cancel return
 focus to the block. Arbitrary Pandoc output has no inferred block navigation.
+Rendered Markdown hides HTML comments while preserving authored source. Ordinary code
+fences use syntax colouring, language labels and rounded containers; long lines scroll
+horizontally. Ash uses the local VS Code grammar adaptation. The demo vault includes
+“Code and comments”; its [source fixture](docs/fixtures/mvp-2/code-and-comments.md) covers
+comments, Ash/Bash/Rust, long lines and literal HTML comments in code.
 Explicit Markdown I/O and Linux directory mirroring are available through the shared
 API and CLI. Imports/exports use local filesystem paths; note paths remain relative
 to the vault. The mirror lives in `<vault>/markdown`:
@@ -73,10 +78,16 @@ are required boundaries throughout implementation.
 Linux automation uses an optional [MCP stdio bridge](docs/mcp.md) into the running
 app; it never opens a second vault writer. Enable it with `--features gui,mcp`,
 `--mcp-socket /private/directory/owner.sock`, and optionally `--mcp-write`.
-Default MCP policy is read-only. The Linux Codex adapter and conversation panel are implemented. Build both
+Default MCP policy is read-only. Enable agent updates per vault in Settings → Connections
+or Conversation actions → Vault updates; changes apply without reconnecting.
+The Linux Codex adapter and conversation panel are implemented. Build both
 binaries with `cargo build --bins --features gui,codex`, then add `--codex`
-to an editor launch with `--mcp-socket`. Use `--mcp-write` only when note mutation
-is intended. The panel connects lazily and requires explicit one-action approvals.
+to an editor launch with `--mcp-socket`. Use `--mcp-write` as a headless/legacy fallback when note mutation
+is intended. The Codex activity icon switches the left pane to the vault's project
+and threads. Its header offers connect/disconnect and new-thread icons; the project
+menu offers rename. Thread status indicators have tooltips; thread context menus offer rename/archive/remove.
+The rounded composer includes model and reasoning-effort selection from Codex’s catalog. Connection is lazy,
+with explicit one-action approvals.
 See [Codex setup](docs/codex.md) and [actual live evidence](docs/codex-live-evidence.md).
 The optional `sync` feature provides explicit authoritative CRDT migration:
 
@@ -92,3 +103,19 @@ GUI controls and a CLI workflow. See [LAN setup and evidence](docs/lan-sync.md).
 Two-App and actual Android emulator/Linux pairing, offline edits, reconnect and
 both-owner restart passed; see [cross-platform evidence](docs/android-linux-sync-evidence.md).
 Physical wireless LAN remains untested.
+
+The Linux Codex composer now offers Work, Plan, Research and Goal profiles with
+separate approval/network controls. Research can save linked notes under
+`Research/<topic>/`; enable the vault agent-update permission to permit note creation through the
+owner. See [Codex workflow](docs/codex.md#composer-profiles-and-command-execution).
+
+Preview the rich native conversation UI without connecting Codex:
+`RUSTC_WRAPPER= cargo run --locked --offline --example transcript_demo --features gui,codex`.
+Response checklists and reported plan steps are display-only; vault tasks are
+not implemented.
+
+
+Research workspaces retain the investigation brief, associated conversations,
+checkpoint rounds, sources and artifacts (original files, references and optional
+web Markdown copies). Create new report notes from saved research on demand.
+See [research workflow, limits and evidence](docs/research.md).

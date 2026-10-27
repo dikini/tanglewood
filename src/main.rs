@@ -195,6 +195,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             mcp_bridge: std::env::current_exe()?.with_file_name("tanglewood-mcp"),
             socket: std::path::absolute(mcp_path.as_ref().expect("validated MCP socket"))?,
             resume_thread: codex_resume,
+            project: None,
         })
     } else {
         None

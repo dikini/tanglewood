@@ -6,6 +6,27 @@ use uuid::Uuid;
 #[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
 pub struct NoteId(pub Uuid);
 
+/// Local vault association with a Codex project; never synchronized as note content.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]
+pub struct CodexProjectBinding {
+    pub project_id: Option<String>,
+    pub name: String,
+    pub creation_key: String,
+}
+impl CodexProjectBinding {
+    pub(crate) fn valid(&self) -> bool {
+        fn text(value: &str, maximum: usize) -> bool {
+            !value.trim().is_empty()
+                && value.len() <= maximum
+                && !value.chars().any(char::is_control)
+        }
+        text(&self.name, 256)
+            && text(&self.creation_key, 256)
+            && self.project_id.as_deref().is_none_or(|id| text(id, 256))
+    }
+}
+
 /// Opaque equality token. Revisions have no ordering semantics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "mcp", derive(schemars::JsonSchema))]

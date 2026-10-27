@@ -3,10 +3,16 @@ use std::collections::HashMap;
 
 use eframe::egui;
 
+mod code;
+#[cfg(all(target_os = "linux", feature = "codex"))]
+mod codex_context;
+#[cfg(all(target_os = "linux", feature = "codex"))]
+mod codex_markdown;
 mod document;
 mod editor;
 mod navigation;
 mod processing;
+mod research;
 mod theme;
 use editor::Draft;
 #[cfg(test)]
@@ -59,11 +65,44 @@ fn field_multi(ui: &mut egui::Ui, text: &mut String, name: &str) -> egui::Respon
     }
 }
 
+/// The local user owns this permission; agent execution access is independent.
+fn agent_permission_controls(ui: &mut egui::Ui, app: &App, enabled: bool) -> Option<bool> {
+    let mut requested = None;
+    let mut value = enabled;
+    let error = app.automation_permission_error();
+    ui.strong("Vault permission");
+    if ui.add_enabled(
+        !app.automation_permission_pending() || error.is_some(),
+        egui::Checkbox::new(&mut value, "Allow agents to update notes and research"),
+    ).on_hover_text("Applies to all connected tools for this vault. Process and network access are separate.").changed() {
+        requested = Some(value);
+    }
+    if let Some(error) = error {
+        ui.colored_label(
+            ui.visuals().error_fg_color,
+            format!("Updates are disabled. Permission could not be saved: {error}"),
+        );
+        if ui
+            .button("Keep updates disabled and retry saving")
+            .clicked()
+        {
+            requested = Some(false);
+        }
+    } else if app.automation_permission_pending() {
+        ui.weak("Saving permission… Updates remain disabled until saved.");
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(100));
+    }
+    requested
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SidebarView {
     Notes,
     Search,
     Backlinks,
+    Research,
+    Codex,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsPage {
@@ -106,6 +145,10 @@ pub struct TanglewoodUi {
     io_message: String,
     io_error: Option<String>,
     processing: processing::Processing,
+    research: research::ResearchUi,
+    research_chats_open: bool,
+    research_outcomes_open: bool,
+    research_outcomes_narrow: bool,
     #[cfg(feature = "lan")]
     lan_panel: LanPanel,
     #[cfg(target_os = "android")]
@@ -147,6 +190,10 @@ impl TanglewoodUi {
             io_message: String::new(),
             io_error: None,
             processing,
+            research: research::ResearchUi::default(),
+            research_chats_open: false,
+            research_outcomes_open: true,
+            research_outcomes_narrow: false,
             #[cfg(feature = "lan")]
             lan_panel: LanPanel::default(),
             #[cfg(target_os = "android")]
@@ -167,7 +214,31 @@ impl TanglewoodUi {
     }
 
     #[cfg(all(target_os = "linux", feature = "codex"))]
-    pub fn with_codex(mut self, config: crate::codex::CodexConfig) -> Self {
+    pub fn with_codex(mut self, mut config: crate::codex::CodexConfig) -> Self {
+        let binding = self.app.codex_project().cloned().unwrap_or_else(|| {
+            crate::notes::CodexProjectBinding {
+                project_id: None,
+                name: self
+                    .app
+                    .vault_directory()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Notes".into()),
+                creation_key: uuid::Uuid::new_v4().to_string(),
+            }
+        });
+        if self.app.codex_project().is_none() {
+            if let Err(error) = self.app.execute(
+                Command::SetCodexProject {
+                    expected: None,
+                    project: binding.clone(),
+                },
+                Caller::Local,
+            ) {
+                self.error = Some(error.to_string());
+            }
+        }
+        config.project = Some(binding);
         self.conversation = Some(ConversationPanel::new(config));
         self
     }
@@ -412,7 +483,11 @@ impl TanglewoodUi {
     }
     fn close_blocked(&self, pending_saves: bool, conversation_pending: bool) -> bool {
         pending_saves
+            || self.research.busy()
+            || self.research.unsaved(&self.app)
             || conversation_pending
+            || self.app.codex_project_pending()
+            || self.app.automation_permission_pending()
             || self.io_request.is_some()
             || self.io_error.is_some()
             || self.drafts.values().any(Draft::unsubmitted)
@@ -449,7 +524,11 @@ impl TanglewoodUi {
                 }
                 self.select(view.note.id);
             }
-            Ok(CommandResult::Notes(_)) => {}
+            Ok(
+                CommandResult::Notes(_)
+                | CommandResult::CodexProject(_)
+                | CommandResult::Research(_),
+            ) => {}
             Ok(CommandResult::LanTicket { .. } | CommandResult::LanStatus(_)) => {}
             Ok(CommandResult::Accepted { request_id }) => {
                 self.io_request = Some(request_id);
@@ -723,6 +802,66 @@ impl eframe::App for TanglewoodUi {
             self.theme_installed = true;
         }
         self.app.tick();
+        if self.app.research_jobs_active() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        if let Some(target) =
+            ctx.data_mut(|data| data.remove_temp::<String>(egui::Id::new("research-open-citation")))
+        {
+            let locator = target
+                .strip_prefix("source://")
+                .map(|value| {
+                    let (id, page) = value
+                        .split_once("?page=")
+                        .map(|(id, page)| (id, Some(page)))
+                        .unwrap_or((value, None));
+                    page.map(|p| format!("[source:{id} page:{p}]"))
+                        .unwrap_or_else(|| format!("[source:{id}]"))
+                })
+                .unwrap_or(target);
+            self.research.open_citation(&self.app, &locator);
+            self.sidebar_view = SidebarView::Research;
+        }
+        self.research.poll(ctx, &mut self.app);
+        #[cfg(all(target_os = "linux", feature = "codex"))]
+        if let Some(panel) = &mut self.conversation {
+            if let Some(enabled) = panel.vault_permission_requested.take() {
+                if let Err(error) = self.app.execute(
+                    Command::SetAutomationWriteEnabled { enabled },
+                    Caller::Local,
+                ) {
+                    panel.error = Some(error.to_string());
+                }
+            }
+            panel.vault_write_enabled = self
+                .mcp
+                .as_ref()
+                .map(|socket| socket.policy(&self.app) == crate::mcp::AccessPolicy::ReadWrite);
+            self.research.set_conversation(panel.research_capture());
+            let workspace = if self.sidebar_view == SidebarView::Research {
+                self.research.selected_workspace_id()
+            } else {
+                None
+            };
+            if panel.research_workspace != workspace {
+                panel.relevant_sources = false;
+                panel.relevant_cache = None;
+                panel.research_workspace = workspace;
+            }
+            if let Some((text, turn)) = panel.collect_references.take() {
+                self.research.open_references_with_origin(
+                    &text,
+                    panel.research_capture().current,
+                    turn,
+                );
+                self.sidebar_view = SidebarView::Research;
+            }
+            if std::mem::take(&mut panel.research_requested) {
+                self.research.start_from_conversation();
+                self.sidebar_view = SidebarView::Research;
+                self.show_notes = true;
+            }
+        }
         #[cfg(feature = "lan")]
         self.lan_panel.poll(ctx, &mut self.app, false);
         #[cfg(target_os = "android")]
@@ -739,6 +878,38 @@ impl eframe::App for TanglewoodUi {
         #[cfg(all(target_os = "linux", feature = "codex"))]
         if let Some(panel) = &mut self.conversation {
             panel.poll(ctx);
+            if panel.persist_project {
+                if let Some(project) = panel.config.project.clone() {
+                    let expected = self.app.codex_project().cloned();
+                    match self.app.execute(
+                        Command::SetCodexProject { expected, project },
+                        Caller::Local,
+                    ) {
+                        Ok(_) => panel.persist_project = false,
+                        Err(error) => panel.error = Some(error.to_string()),
+                    }
+                }
+            }
+            panel.binding_durable = !self.app.codex_project_pending()
+                && self.app.codex_project() == panel.config.project.as_ref();
+            panel.metadata_error = self.app.codex_project_error().map(str::to_owned);
+            if panel.resume_requested
+                && panel.project_ready
+                && panel.binding_durable
+                && !panel.threads_loading
+                && !panel.busy()
+                && !panel.history_loading
+            {
+                if let Some(id) = panel
+                    .config
+                    .resume_thread
+                    .clone()
+                    .filter(|id| panel.threads.iter().any(|t| &t.id == id))
+                {
+                    panel.select_thread(Some(id));
+                    panel.resume_requested = false;
+                }
+            }
         }
         if let Some(request) = self.io_request {
             if let Some(status) = self.app.io_status(request) {
@@ -766,6 +937,7 @@ impl eframe::App for TanglewoodUi {
                 self.select(view.note.id);
             }
         }
+        let mut research_action = None;
         let mut command = None;
         let mut select = None;
         let mut adopt = None;
@@ -794,8 +966,15 @@ impl eframe::App for TanglewoodUi {
         let view = notes
             .iter()
             .find(|view| Some(view.note.id) == self.selected);
-        if navigation::enter_reader(ctx, self.show_preview && !self.show_settings
-            && !self.show_status && self.note_dialog.is_none()) {
+        if navigation::enter_reader(
+            ctx,
+            self.sidebar_view != SidebarView::Codex
+                && self.sidebar_view != SidebarView::Research
+                && self.show_preview
+                && !self.show_settings
+                && !self.show_status
+                && self.note_dialog.is_none(),
+        ) {
             if let Some(view) = view.filter(|view| !view.note.trashed) {
                 self.processing.focus_block(view.note.id, 0);
                 ctx.request_repaint();
@@ -806,6 +985,10 @@ impl eframe::App for TanglewoodUi {
                 self.processing.update(ctx, view, document.clone());
             }
         }
+        #[cfg(all(target_os = "linux", feature = "codex"))]
+        let codex_mode = self.sidebar_view == SidebarView::Codex && self.conversation.is_some();
+        #[cfg(not(all(target_os = "linux", feature = "codex")))]
+        let codex_mode = false;
         egui::SidePanel::left("activity-rail")
             .resizable(false)
             .exact_width(48.0)
@@ -849,22 +1032,29 @@ impl eframe::App for TanglewoodUi {
                 {
                     self.sidebar(SidebarView::Backlinks, false);
                 }
-                #[cfg(all(target_os = "linux", feature = "codex"))]
-                if let Some(panel) = &mut self.conversation {
-                    if theme::selected_button(
-                        ui,
-                        theme::Icon::Codex,
-                        "Codex conversation",
-                        true,
-                        panel.visible,
-                    )
-                    .clicked()
-                    {
-                        panel.visible = !panel.visible;
+                if theme::selected_button(
+                    ui,
+                    theme::Icon::Folder,
+                    "Research",
+                    true,
+                    self.sidebar_view == SidebarView::Research,
+                )
+                .clicked()
+                {
+                    if self.selected.is_none_or(|id| self.prepare_transition(id)) {
+                        self.sidebar(SidebarView::Research, false);
                     }
                 }
-                let bottom_controls_height = 2.0 * if mobile { 44.0 } else { 34.0 }
-                    + ui.spacing().item_spacing.y;
+                #[cfg(all(target_os = "linux", feature = "codex"))]
+                if self.conversation.is_some() {
+                    if theme::selected_button(ui, theme::Icon::Codex, "Codex", true, codex_mode)
+                        .clicked()
+                    {
+                        self.sidebar(SidebarView::Codex, false);
+                    }
+                }
+                let bottom_controls_height =
+                    2.0 * if mobile { 44.0 } else { 34.0 } + ui.spacing().item_spacing.y;
                 ui.add_space((ui.available_height() - bottom_controls_height).max(0.0));
                 ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
                     if theme::selected_button(
@@ -901,7 +1091,10 @@ impl eframe::App for TanglewoodUi {
                 } else {
                     228.0
                 })
-                .width_range(if mobile {
+                .width_range(if mobile && self.sidebar_view == SidebarView::Research {
+                    let width = ctx.available_rect().width();
+                    width..=width
+                } else if mobile {
                     180.0..=ctx.available_rect().width().max(180.0)
                 } else {
                     180.0..=360.0
@@ -912,6 +1105,25 @@ impl eframe::App for TanglewoodUi {
                         .inner_margin(egui::Margin::symmetric(12, 17)),
                 )
                 .show(ctx, |ui| {
+                    #[cfg(all(target_os = "linux", feature = "codex"))]
+                    if codex_mode {
+                        if let Some(panel) = &mut self.conversation {
+                            panel.sidebar(ui, ctx);
+                        }
+                        return;
+                    }
+                    if self.sidebar_view == SidebarView::Research {
+                        if mobile
+                            && theme::button(ui, theme::Icon::Sidebar, "Back to conversation", true)
+                                .clicked()
+                        {
+                            self.show_notes = false;
+                        }
+                        if self.research.sidebar(ui, &mut self.app) && mobile {
+                            self.show_notes = false;
+                        }
+                        return;
+                    }
                     ui.horizontal(|ui| {
                         ui.add_space(8.0);
                         ui.strong("Tanglewood");
@@ -937,6 +1149,8 @@ impl eframe::App for TanglewoodUi {
                     ui.add_space(6.0);
                     ui.label(
                         egui::RichText::new(match self.sidebar_view {
+                            SidebarView::Codex => "Codex",
+                            SidebarView::Research => "Research",
                             SidebarView::Backlinks => "Backlinks",
                             SidebarView::Search => "Search",
                             SidebarView::Notes => {
@@ -1046,19 +1260,164 @@ impl eframe::App for TanglewoodUi {
                             .color(theme::muted(ui)),
                     );
                 });
-            if !mobile { navigation::panel_focus(ctx, egui::Id::new("notes"), false, "Resize notes pane"); }
-        }
-        #[cfg(all(target_os = "linux", feature = "codex"))]
-        if let Some(panel) = &mut self.conversation {
-            if panel.visible {
-                egui::SidePanel::right("codex-conversation")
-                    .resizable(true)
-                    .default_width(300.0)
-                    .frame(egui::Frame::new().fill(main_fill).inner_margin(18))
-                    .show(ctx, |ui| panel.show(ui, ctx));
+            if !mobile {
+                navigation::panel_focus(ctx, egui::Id::new("notes"), false, "Resize notes pane");
             }
         }
-        if !mobile || !self.show_notes {
+        if self.sidebar_view == SidebarView::Research && (!mobile || !self.show_notes) {
+            let wide_research = ctx.content_rect().width() >= 1050.0;
+            #[cfg(all(target_os = "linux", feature = "codex"))]
+            let conversation_available = self.conversation.is_some();
+            #[cfg(not(all(target_os = "linux", feature = "codex")))]
+            let conversation_available = false;
+            egui::TopBottomPanel::top("research-header")
+                .exact_height(58.0)
+                .frame(egui::Frame::new().fill(main_fill).inner_margin(12))
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if theme::button(ui, theme::Icon::Sidebar, "Toggle sources", true).clicked()
+                        {
+                            self.show_notes = !self.show_notes;
+                        }
+                        let title = self.research.selected_title(&self.app);
+                        let width = (ui.available_width() - 84.0).max(20.0);
+                        ui.add_sized([width, 34.0], egui::Label::new(title).truncate());
+                        if theme::button(
+                            ui,
+                            theme::Icon::Codex,
+                            "Conversations",
+                            conversation_available,
+                        )
+                        .clicked()
+                        {
+                            self.research_chats_open = !self.research_chats_open;
+                        }
+                        if theme::button(ui, theme::Icon::Notes, "Toggle outcomes", true).clicked()
+                        {
+                            if wide_research {
+                                self.research_outcomes_open = !self.research_outcomes_open;
+                            } else {
+                                self.research_outcomes_narrow = !self.research_outcomes_narrow;
+                            }
+                        }
+                    });
+                });
+            if wide_research && self.research_outcomes_open {
+                egui::SidePanel::right("research-outcomes")
+                    .default_width(260.0)
+                    .width_range(220.0..=360.0)
+                    .frame(egui::Frame::new().fill(side_fill).inner_margin(16))
+                    .show(ctx, |ui| {
+                        research_action = self.research.outcomes(ui, ctx, &mut self.app, &notes);
+                    });
+            } else if !wide_research && self.research_outcomes_narrow {
+                // A requested pane overlays narrow windows instead of squeezing the chat.
+                let mut open = true;
+                egui::Window::new("Research outcomes")
+                    .open(&mut open)
+                    .default_width(300.0)
+                    .show(ctx, |ui| {
+                        research_action = self.research.outcomes(ui, ctx, &mut self.app, &notes);
+                    });
+                self.research_outcomes_narrow = open;
+            }
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(main_fill).inner_margin(20))
+                .show(ctx, |ui| {
+                    let width = ui.available_width().min(780.0);
+                    let mut rect = ui.available_rect_before_wrap();
+                    rect.min.x += (rect.width() - width) * 0.5;
+                    rect.max.x = rect.min.x + width;
+                    ui.scope_builder(
+                        egui::UiBuilder::new()
+                            .max_rect(rect)
+                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                        |ui| {
+                            if self.research.reader_visible() {
+                                self.research.source_reader(ui, ctx, &mut self.app);
+                                return;
+                            }
+                            #[cfg(all(target_os = "linux", feature = "codex"))]
+                            if let Some(panel) = &mut self.conversation {
+                                if panel.thread.is_none() && !panel.history_loading {
+                                    ui.add_space(24.0);
+                                    ui.heading("What would you like to explore?");
+                                    if ui.button("Choose a conversation…").clicked() {
+                                        self.research_chats_open = true;
+                                    }
+                                    ui.add_space(16.0);
+                                }
+                                panel.show_surface(ui, ctx, &self.app, None, true);
+                                return;
+                            }
+                            ui.add_space(32.0);
+                            ui.heading("Research");
+                            ui.weak("Sources and outcomes stay together here.");
+                            ui.add_space(12.0);
+                            ui.label("Open this vault with Codex enabled to use the conversation.");
+                        },
+                    );
+                });
+            #[cfg(all(target_os = "linux", feature = "codex"))]
+            if let Some(panel) = &mut self.conversation {
+                if self.research_chats_open {
+                    egui::Window::new("Conversations")
+                        .open(&mut self.research_chats_open)
+                        .default_width(320.0)
+                        .vscroll(true)
+                        .show(ctx, |ui| panel.sidebar(ui, ctx));
+                }
+                if panel.context.open {
+                    let ready = panel.ready
+                        && panel.pending_thread.is_none()
+                        && !panel.disconnecting
+                        && panel.context_goal_pending.is_none();
+                    let cwd = panel.config.cwd.clone();
+                    let mut action = None;
+                    let mut context_open = true;
+                    egui::Window::new("Conversation context")
+                        .open(&mut context_open)
+                        .default_width(320.0)
+                        .show(ctx, |ui| {
+                            action = panel.context.panel(ui, ctx, &cwd, ready);
+                        });
+                    panel.context.open &= context_open;
+                    if let Some(action) = action {
+                        panel.context_action(action);
+                    }
+                }
+            }
+        } else if codex_mode {
+            #[cfg(all(target_os = "linux", feature = "codex"))]
+            if let Some(panel) = &mut self.conversation {
+                if panel.context.open {
+                    let ready = panel.ready
+                        && panel.pending_thread.is_none()
+                        && !panel.disconnecting
+                        && panel.context_goal_pending.is_none();
+                    let cwd = panel.config.cwd.clone();
+                    let mut action = None;
+                    egui::SidePanel::right("codex-thread-context")
+                        .default_width(320.0)
+                        .width_range(240.0..=480.0)
+                        .frame(egui::Frame::new().fill(side_fill).inner_margin(16))
+                        .show(ctx, |ui| {
+                            action = panel.context.panel(ui, ctx, &cwd, ready);
+                        });
+                    if let Some(action) = action {
+                        panel.context_action(action);
+                    }
+                }
+            }
+            #[cfg(all(target_os = "linux", feature = "codex"))]
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(main_fill).inner_margin(24))
+                .show(ctx, |ui| {
+                    if let Some(panel) = &mut self.conversation {
+                        panel.show(ui, ctx, &self.app, self.selected);
+                    }
+                });
+        } else if self.sidebar_view != SidebarView::Research && (!mobile || !self.show_notes) {
             egui::TopBottomPanel::top("document-header")
                 .exact_height(66.0)
                 .frame(
@@ -1344,7 +1703,7 @@ impl eframe::App for TanglewoodUi {
                 .frame(egui::Frame::new().fill(side_fill))
                 .show(ctx, |_| {});
         }
-        if !self.show_preview {
+        if !codex_mode && self.sidebar_view != SidebarView::Research && !self.show_preview {
             if let Some(view) = view {
                 if let Some(draft) = self.drafts.get_mut(&view.note.id) {
                     if draft.range.is_some() && draft.inline_block().is_none() {
@@ -1388,7 +1747,10 @@ impl eframe::App for TanglewoodUi {
         if let Some(action) = editor_action {
             if let Some(view) = view {
                 let draft = self.drafts.get(&view.note.id).expect("selected note draft");
-                return_to_block = draft.range.as_ref().map(|range| (view.note.id, range.start));
+                return_to_block = draft
+                    .range
+                    .as_ref()
+                    .map(|range| (view.note.id, range.start));
                 match action {
                     editor::EditorAction::Ready => {
                         if let Some(edit) = draft.edit() {
@@ -1404,6 +1766,73 @@ impl eframe::App for TanglewoodUi {
                     editor::EditorAction::Cancel => {
                         adopt = Some(view.clone());
                         self.show_preview = true;
+                    }
+                }
+            }
+        }
+        if let Some(action) = self.research.overlays(ctx, &mut self.app, &notes) {
+            research_action = Some(action);
+        }
+        if let Some(action) = research_action {
+            match action {
+                research::Action::OpenNote(id) => {
+                    self.select(id);
+                    self.sidebar_view = SidebarView::Notes;
+                }
+                research::Action::OpenThread(thread) => {
+                    #[cfg(all(target_os = "linux", feature = "codex"))]
+                    if let Some(panel) = &mut self.conversation {
+                        if panel
+                            .research_capture()
+                            .threads
+                            .iter()
+                            .any(|candidate| candidate.same_identity(&thread))
+                        {
+                            panel.select_thread(Some(thread.thread_id));
+                            if self.sidebar_view != SidebarView::Research {
+                                self.sidebar_view = SidebarView::Codex;
+                                self.show_notes = true;
+                            }
+                            self.research_chats_open = false;
+                        } else {
+                            self.research.error = Some("Conversation is not listed in the current Codex project. Refresh that project's conversations first.".into());
+                        }
+                    }
+                    #[cfg(not(all(target_os = "linux", feature = "codex")))]
+                    {
+                        let _ = thread;
+                        self.research.error =
+                            Some("Codex conversations are unavailable in this build.".into());
+                    }
+                }
+                research::Action::Prepare {
+                    prompt,
+                    evidence,
+                    external,
+                } => {
+                    #[cfg(all(target_os = "linux", feature = "codex"))]
+                    if let Some(panel) = &mut self.conversation {
+                        match panel.prepare_research_context(prompt, evidence, external) {
+                            Ok(()) => {
+                                self.research.conversation_prepared();
+                                if self.sidebar_view != SidebarView::Research {
+                                    self.sidebar_view = SidebarView::Codex;
+                                    self.show_notes = true;
+                                }
+                            }
+                            Err(error) => self.research.error = Some(error.into()),
+                        }
+                    } else {
+                        self.research.error = Some(
+                            "Conversation is unavailable in this session. Use Copy prompt.".into(),
+                        );
+                    }
+                    #[cfg(not(all(target_os = "linux", feature = "codex")))]
+                    {
+                        let _ = (prompt, evidence, external);
+                        self.research.error = Some(
+                            "Conversation is unavailable in this build. Use Copy prompt.".into(),
+                        );
                     }
                 }
             }
@@ -1501,6 +1930,24 @@ impl eframe::App for TanglewoodUi {
                         });
                     }
                     SettingsPage::Connections => {
+                        #[cfg(all(target_os = "linux", feature = "mcp"))]
+                        let allowed = self.mcp.as_ref().map_or_else(
+                            || self.app.automation_write_preference().unwrap_or(false),
+                            |socket| {
+                                socket.policy(&self.app) == crate::mcp::AccessPolicy::ReadWrite
+                            },
+                        );
+                        #[cfg(not(all(target_os = "linux", feature = "mcp")))]
+                        let allowed = self.app.automation_write_preference().unwrap_or(false);
+                        if let Some(enabled) = agent_permission_controls(ui, &self.app, allowed) {
+                            if let Err(error) = self.app.execute(
+                                Command::SetAutomationWriteEnabled { enabled },
+                                Caller::Local,
+                            ) {
+                                self.error = Some(error.to_string());
+                            }
+                        }
+                        ui.add_space(14.0);
                         #[cfg(feature = "lan")]
                         self.lan_panel.show(ui, ctx, &mut self.app);
                         #[cfg(not(feature = "lan"))]
@@ -1795,6 +2242,17 @@ impl eframe::App for TanglewoodUi {
                         " Review and acknowledge the file error in Status details before closing.",
                     );
                 }
+                if self.app.automation_permission_pending() {
+                    status.push_str(" Vault permission is not saved; open Settings → Connections to review or retry.");
+                }
+                if self.app.codex_project_pending() {
+                    status
+                        .push_str(" Project metadata is not saved; open Codex to review or retry.");
+                }
+                if self.research.busy() || self.research.unsaved(&self.app) {
+                    self.research.error=Some("Close paused: save or discard research edits and finish or discard any retained import first.".into());
+                    status.push_str(" Research changes need attention in Research.");
+                }
                 if local_drafts {
                     status.push_str(" A local draft is not accepted; preserve it or adopt the current note first.");
                 }
@@ -1807,6 +2265,9 @@ impl eframe::App for TanglewoodUi {
             }
         }
         if pending
+            || self.app.codex_project_pending()
+            || (self.app.automation_permission_pending()
+                && self.app.automation_permission_error().is_none())
             || self.io_request.is_some()
             || current
                 .iter()
@@ -1863,6 +2324,536 @@ mod tests {
     use super::{
         App, Caller, Command, CommandResult, contiguous_edit, linked_path, resolve_note_target,
     };
+
+    #[cfg(all(target_os = "linux", feature = "codex"))]
+    #[test]
+    fn research_capture_requires_listed_project_and_matching_thread_origin() {
+        use crate::codex::{CodexConfig, ThreadSummary, ThreadWorkState};
+        let mut panel = super::ConversationPanel::new(CodexConfig {
+            executable: "codex".into(),
+            cwd: "/tmp".into(),
+            mcp_bridge: "bridge".into(),
+            socket: "owner".into(),
+            resume_thread: None,
+            project: Some(crate::notes::CodexProjectBinding {
+                project_id: Some("project".into()),
+                name: "Project".into(),
+                creation_key: "key".into(),
+            }),
+        });
+        panel.project_ready = true;
+        panel.binding_durable = true;
+        panel.ready = true;
+        panel.thread = Some("current".into());
+        panel.threads.push(ThreadSummary {
+            id: "current".into(),
+            title: "Investigation".into(),
+            updated_at: 0,
+            state: ThreadWorkState::Idle,
+        });
+        for (thread, text) in [("current", "current finding"), ("old", "stale finding")] {
+            panel.messages.push(super::ConversationMessage {
+                role: "Codex",
+                key: Some((thread.into(), "turn".into(), "item".into())),
+                text: text.into(),
+                command: None,
+                activity: None,
+            });
+        }
+        let capture = panel.research_capture();
+        assert_eq!(
+            capture.answer,
+            Some(("current finding".into(), Some("turn".into())))
+        );
+        assert!(!capture.discussion.contains("stale finding"));
+        panel.pending_thread = Some(Some("other".into()));
+        assert!(panel.research_capture().answer.is_none());
+        assert!(panel.research_capture().discussion.is_empty());
+        panel.pending_thread = None;
+        panel.threads.clear();
+        assert!(panel.research_capture().current.is_none());
+        panel
+            .prepare_research_context("gather".into(), "context".into(), true)
+            .unwrap();
+        assert!(panel.controls.network_access);
+        assert_eq!(
+            panel.context.draft.attachments[0].name,
+            "Research context · external gathering"
+        );
+        assert!(
+            panel
+                .prepare_research_context("replace".into(), "replace".into(), false)
+                .is_err()
+        );
+        assert_eq!(panel.prompt, "gather");
+        assert!(panel.controls.network_access);
+    }
+
+    #[cfg(all(target_os = "linux", feature = "codex"))]
+    #[test]
+    fn research_preparation_preserves_drafts_context_and_access() {
+        use crate::codex::{ApprovalMode, CodexConfig, PromptAttachment};
+        let mut panel = super::ConversationPanel::new(CodexConfig {
+            executable: "codex".into(),
+            cwd: "/tmp".into(),
+            mcp_bridge: "bridge".into(),
+            socket: "owner".into(),
+            resume_thread: None,
+            project: None,
+        });
+        let rejected = panel
+            .prepare_research_prompt("research".into(), "exact source evidence".into())
+            .unwrap_err();
+        assert!(rejected.contains("open or create a conversation"));
+        assert!(panel.prompt.is_empty());
+        assert!(panel.context.draft.attachments.is_empty());
+        assert!(panel.prompt_drafts.is_empty());
+        panel.thread = Some("research-thread".into());
+        panel.prompt = " ".into();
+        assert!(
+            panel
+                .prepare_research_prompt("research".into(), "exact source evidence".into())
+                .is_err()
+        );
+        assert_eq!(panel.prompt, " ");
+        assert!(panel.context.draft.attachments.is_empty());
+        panel.prompt.clear();
+        panel.context.draft.attachments.push(PromptAttachment {
+            name: "evidence".into(),
+            text: "retain".into(),
+        });
+        assert!(
+            panel
+                .prepare_research_prompt("research".into(), "exact source evidence".into())
+                .is_err()
+        );
+        assert_eq!(panel.context.draft.attachments[0].text, "retain");
+        assert_eq!(panel.context.draft.attachments.len(), 1);
+        assert!(panel.prompt.is_empty());
+        panel.context.draft.attachments.clear();
+        panel.controls.approval = ApprovalMode::FullAccess;
+        assert!(
+            panel
+                .prepare_research_prompt("research".into(), "exact source evidence".into())
+                .is_err()
+        );
+        assert_eq!(panel.controls.approval, ApprovalMode::FullAccess);
+        assert!(panel.prompt.is_empty());
+        assert!(panel.context.draft.attachments.is_empty());
+        panel.controls.approval = ApprovalMode::Ask;
+        panel.controls.network_access = true;
+        assert!(
+            panel
+                .prepare_research_prompt("research".into(), "exact source evidence".into())
+                .is_ok()
+        );
+        assert_eq!(panel.prompt, "research");
+        assert!(!panel.controls.network_access);
+        assert_eq!(panel.context.draft.attachments.len(), 1);
+        assert_eq!(panel.context.draft.attachments[0].name, "Research sources");
+        assert_eq!(
+            panel.context.draft.attachments[0].text,
+            "exact source evidence"
+        );
+        // Confirmed switches cache both pieces under the selected conversation.
+        panel
+            .prompt_drafts
+            .insert("other-thread".into(), "other draft".into());
+        panel.begin_thread_open(Some("other-thread".into()));
+        panel.commit_thread_open("other-thread".into());
+        assert_eq!(panel.prompt, "other draft");
+        assert!(panel.context.draft.attachments.is_empty());
+        panel.begin_thread_open(Some("research-thread".into()));
+        panel.commit_thread_open("research-thread".into());
+        assert_eq!(panel.prompt, "research");
+        assert_eq!(panel.context.draft.attachments.len(), 1);
+        assert_eq!(panel.context.draft.attachments[0].name, "Research sources");
+        assert_eq!(
+            panel.context.draft.attachments[0].text,
+            "exact source evidence"
+        );
+        assert!(panel.adapter.is_none());
+        assert!(panel.active_turn.is_none());
+    }
+
+    #[cfg(all(target_os = "linux", feature = "codex"))]
+    #[test]
+    fn composer_profiles_keep_goals_and_command_output_scoped() {
+        use crate::codex::{CodexConfig, CommandExecution, GoalInfo, WorkMode};
+        let mut panel = super::ConversationPanel::new(CodexConfig {
+            executable: "codex".into(),
+            cwd: "/tmp".into(),
+            mcp_bridge: "bridge".into(),
+            socket: "owner".into(),
+            resume_thread: None,
+            project: None,
+        });
+        panel.thread = Some("A".into());
+        panel.ready = true;
+        assert!(!panel.mode_consistent());
+        panel.accept_goal(None);
+        assert!(panel.mode_consistent());
+        panel.select_mode(WorkMode::Research);
+        assert_eq!(panel.controls.mode, WorkMode::Research);
+        assert!(panel.controls.network_access);
+        panel.prompt = "keep draft".into();
+        panel.select_mode(WorkMode::Goal); // Opens setup; no goal or turn is invented.
+        assert_eq!(panel.controls.mode, WorkMode::Research);
+        assert_eq!(panel.prompt, "keep draft");
+        assert!(panel.context.goal.is_none());
+        panel.accept_goal(Some(GoalInfo {
+            objective: "Research".into(),
+            status: "active".into(),
+            tokens_used: 0,
+            time_used_seconds: 42,
+            token_budget: None,
+        }));
+        assert_eq!(panel.controls.mode, WorkMode::Goal);
+        assert!(panel.mode_consistent());
+        panel.select_mode(WorkMode::Goal);
+        assert!(!panel.controls.network_access);
+        panel.controls.network_access = true; // Later explicit Access choice survives routine updates.
+        panel.accept_goal(panel.context.goal.clone());
+        assert!(panel.controls.network_access);
+        panel.select_mode(WorkMode::Plan); // No adapter: pause fails, so Send must stay blocked.
+        assert_eq!(panel.controls.mode, WorkMode::Plan);
+        assert!(!panel.mode_consistent());
+        assert!(panel.context_goal_pending.is_none());
+        assert!(!panel.controls.network_access);
+        panel.accept_goal(None);
+        assert!(panel.mode_consistent());
+        let command = CommandExecution {
+            item: "item".into(),
+            command: "echo test".into(),
+            cwd: "/tmp".into(),
+            status: "inProgress".into(),
+            exit_code: None,
+            output: "test".into(),
+            truncated: false,
+            output_complete: true,
+        };
+        panel.command_card("B".into(), "turn".into(), command.clone());
+        assert!(panel.messages.is_empty());
+        panel.command_card("A".into(), "turn".into(), command.clone());
+        assert_eq!(panel.messages.len(), 1);
+        assert_eq!(panel.messages[0].text, "test");
+        let mut completed = command;
+        completed.status = "completed".into();
+        completed.exit_code = Some(0);
+        completed.output = "test done".into();
+        panel.command_card("A".into(), "turn".into(), completed);
+        assert_eq!(panel.messages.len(), 1);
+        assert_eq!(panel.messages[0].text, "test done");
+        assert_eq!(
+            panel.messages[0].command.as_ref().unwrap().exit_code,
+            Some(0)
+        );
+        let mut no_aggregate = panel.messages[0].command.clone().unwrap();
+        no_aggregate.output_complete = false;
+        no_aggregate.truncated = true;
+        panel.command_card("A".into(), "turn".into(), no_aggregate);
+        assert_eq!(panel.messages[0].text, "test done");
+        assert!(panel.messages[0].command.as_ref().unwrap().truncated);
+        panel.context.goal_loaded = false;
+        assert!(!panel.mode_consistent());
+        panel
+            .context
+            .draft
+            .attachments
+            .push(crate::codex::PromptAttachment {
+                name: "source".into(),
+                text: "exact snapshot".into(),
+            });
+        panel.context_submit_pending = true;
+        panel.start_turn("A".into(), "automatic-goal-turn".into());
+        assert!(panel.context_submit_pending);
+        assert_eq!(panel.context.draft.attachments[0].text, "exact snapshot");
+        panel.accept_turn("B");
+        assert!(panel.context_submit_pending);
+        panel.accept_turn("A");
+        assert!(!panel.context_submit_pending);
+        assert!(panel.context.draft.is_empty());
+        panel.prompt = "keep prompt".into();
+        let activity = crate::codex::Activity {
+            item: "tool".into(),
+            kind: "mcpToolCall".into(),
+            title: "Read a note".into(),
+            status: "inProgress".into(),
+            details: "args".into(),
+            truncated: false,
+        };
+        let count = panel.messages.len();
+        panel.activity_card("B".into(), "turn".into(), activity.clone());
+        assert_eq!(panel.messages.len(), count);
+        panel.activity_card("A".into(), "turn".into(), activity.clone());
+        panel.retire_activity(Some("B"), Some("turn"), "ended");
+        assert_eq!(
+            panel
+                .messages
+                .last()
+                .unwrap()
+                .activity
+                .as_ref()
+                .unwrap()
+                .status,
+            "inProgress"
+        );
+        panel.retire_activity(Some("A"), Some("different"), "ended");
+        assert_eq!(
+            panel
+                .messages
+                .last()
+                .unwrap()
+                .activity
+                .as_ref()
+                .unwrap()
+                .status,
+            "inProgress"
+        );
+        panel.retire_activity(Some("A"), Some("turn"), "ended");
+        assert_eq!(
+            panel
+                .messages
+                .last()
+                .unwrap()
+                .activity
+                .as_ref()
+                .unwrap()
+                .status,
+            "ended"
+        );
+        assert_eq!(panel.messages.last().unwrap().text, "args");
+        let mut complete = activity;
+        complete.status = "completed".into();
+        complete.details = "result".into();
+        panel.activity_card("A".into(), "turn".into(), complete);
+        assert_eq!(panel.messages.len(), count + 1);
+        assert_eq!(panel.messages.last().unwrap().text, "result");
+        assert_eq!(
+            panel
+                .messages
+                .last()
+                .unwrap()
+                .activity
+                .as_ref()
+                .unwrap()
+                .status,
+            "completed"
+        );
+        assert_eq!(panel.prompt, "keep prompt");
+    }
+
+    #[cfg(all(target_os = "linux", feature = "codex"))]
+    #[test]
+    fn thread_actions_preserve_drafts_and_only_clear_acknowledged_target() {
+        use crate::codex::{ThreadAction, ThreadSummary, ThreadWorkState};
+        let mut panel = super::ConversationPanel::new(crate::codex::CodexConfig {
+            executable: "codex".into(),
+            cwd: "/tmp".into(),
+            mcp_bridge: "bridge".into(),
+            socket: "owner".into(),
+            resume_thread: None,
+            project: None,
+        });
+        panel.project_ready = true;
+        panel.binding_durable = true;
+        panel.threads = vec![
+            ThreadSummary {
+                id: "A".into(),
+                title: "First".into(),
+                state: ThreadWorkState::Idle,
+                updated_at: 0,
+            },
+            ThreadSummary {
+                id: "B".into(),
+                title: "Second".into(),
+                state: ThreadWorkState::Idle,
+                updated_at: 0,
+            },
+        ];
+        panel.thread = Some("A".into());
+        panel.ready = true;
+        panel.prompt = "unsent".into();
+        assert!(panel.can_thread_action("A", &ThreadAction::Remove).is_err());
+        assert!(
+            panel
+                .can_thread_action("A", &ThreadAction::Rename("Title".into()))
+                .is_ok()
+        );
+        panel.prompt.clear();
+        panel
+            .prompt_drafts
+            .insert("B".into(), "cached draft".into());
+        assert!(
+            panel
+                .can_thread_action("A", &ThreadAction::Archive)
+                .is_err()
+        );
+        panel.prompt_drafts.clear();
+        assert!(
+            panel
+                .can_thread_action("foreign", &ThreadAction::Remove)
+                .is_err()
+        );
+        panel.threads[1].state = ThreadWorkState::Working;
+        assert!(panel.can_thread_action("A", &ThreadAction::Remove).is_err());
+        panel.threads[1].state = ThreadWorkState::Idle;
+        assert!(panel.can_thread_action("A", &ThreadAction::Remove).is_ok());
+        panel.finish_thread_action("B", &ThreadAction::Rename("New title".into()));
+        assert_eq!(panel.threads[1].title, "New title");
+        panel.finish_thread_action("B", &ThreadAction::Archive);
+        assert_eq!(panel.thread.as_deref(), Some("A"));
+        assert!(panel.ready);
+        panel.finish_thread_action("A", &ThreadAction::Remove);
+        assert!(panel.thread.is_none());
+        assert!(panel.config.resume_thread.is_none());
+        assert!(!panel.ready);
+        assert!(panel.threads.is_empty());
+        panel.threads = vec![ThreadSummary {
+            id: "A".into(),
+            title: "First".into(),
+            state: ThreadWorkState::Idle,
+            updated_at: 0,
+        }];
+        panel.thread = Some("A".into());
+        panel.prompt = "recover me".into();
+        panel.active_turn = Some("work".into());
+        panel.finish_thread_action("A", &ThreadAction::Remove);
+        assert_eq!(panel.thread.as_deref(), Some("A"));
+        assert_eq!(panel.prompt, "recover me");
+        assert!(!panel.busy());
+        assert!(!panel.ready);
+        assert!(panel.unavailable_threads.contains("A"));
+        panel.select_thread(None);
+        assert!(panel.error.as_deref().unwrap().contains("Copy or clear"));
+        panel.prompt.clear();
+        panel.thread = None;
+        panel
+            .prompt_drafts
+            .insert("A".into(), "cached recovery".into());
+        panel.select_thread(Some("A".into()));
+        assert_eq!(panel.prompt, "cached recovery");
+        assert!(!panel.ready);
+        panel
+            .prompt_drafts
+            .insert("not-on-page".into(), "off-page recovery".into());
+        panel.finish_thread_action("not-on-page", &ThreadAction::Archive);
+        assert!(panel.threads.iter().any(|t| t.id == "not-on-page"));
+        assert_eq!(panel.prompt_drafts["not-on-page"], "off-page recovery");
+
+        panel.models = vec![crate::codex::ModelChoice {
+            model: "small".into(),
+            name: "Small".into(),
+            description: String::new(),
+            default_effort: "low".into(),
+            efforts: vec![("low".into(), "Fast".into())],
+        }];
+        panel
+            .context
+            .draft
+            .attachments
+            .push(crate::codex::PromptAttachment {
+                name: "note.md".into(),
+                text: "source snapshot".into(),
+            });
+        panel.threads = vec![ThreadSummary {
+            id: "C".into(),
+            title: "Context".into(),
+            state: ThreadWorkState::Idle,
+            updated_at: 0,
+        }];
+        panel.unavailable_threads.clear();
+        panel.thread = Some("C".into());
+        panel.prompt.clear();
+        assert!(panel.can_thread_action("C", &ThreadAction::Remove).is_err());
+        panel.finish_thread_action("C", &ThreadAction::Remove);
+        assert!(panel.unavailable_threads.contains("C"));
+        assert!(panel.context.has_draft());
+        panel.context_submit_pending = true;
+        panel.starting = false;
+        assert!(panel.busy()); // Optional inventory errors cannot unlock in-flight input.
+        assert_eq!(panel.context.draft.attachments[0].text, "source snapshot");
+        panel.context_submit_pending = false;
+        panel.selected_effort = Some("ultra".into());
+        panel.choose_model("small");
+        assert_eq!(panel.selected_effort.as_deref(), Some("low"));
+        assert!(panel.model_override);
+    }
+
+    #[cfg(all(target_os = "linux", feature = "codex"))]
+    #[test]
+    fn failed_thread_switch_keeps_prompt_ownership_and_provisional_drafts() {
+        let mut panel = super::ConversationPanel::new(crate::codex::CodexConfig {
+            executable: "codex".into(),
+            cwd: "/tmp".into(),
+            mcp_bridge: "bridge".into(),
+            socket: "owner".into(),
+            resume_thread: None,
+            project: None,
+        });
+        panel.thread = Some("A".into());
+        panel.ready = true;
+        panel.prompt = "Draft A".into();
+        panel.prompt_drafts.insert("B".into(), "Draft B".into());
+        panel.begin_thread_open(Some("B".into()));
+        assert_eq!(panel.prompt, "Draft A");
+        assert_eq!(panel.thread.as_deref(), Some("A"));
+        // Failed/open-disconnected: no prompt was moved or cache entry overwritten.
+        panel.pending_thread = None;
+        panel.starting = false;
+        panel.begin_thread_open(Some("A".into()));
+        panel.commit_thread_open("A".into());
+        assert_eq!(panel.prompt, "Draft A");
+        assert_eq!(panel.prompt_drafts["B"], "Draft B");
+        panel.begin_thread_open(Some("B".into()));
+        panel.commit_thread_open("B".into());
+        assert_eq!(panel.prompt, "Draft B");
+        assert_eq!(panel.prompt_drafts["A"], "Draft A");
+        panel.project_ready = true;
+        panel.binding_durable = true;
+        panel.fresh_thread = true;
+        panel.select_thread(Some("A".into()));
+        assert_eq!(panel.prompt, "Draft B");
+        assert!(panel.error.as_deref().unwrap().contains("Send or clear"));
+    }
+
+    #[cfg(all(target_os = "linux", feature = "codex"))]
+    #[test]
+    fn codex_sidebar_preserves_note_drafts_and_waits_for_project_metadata() {
+        let vault =
+            std::env::temp_dir().join(format!("tanglewood-codex-sidebar-{}", uuid::Uuid::new_v4()));
+        let app = App::open(&vault).unwrap();
+        let mut ui = super::TanglewoodUi::new(app).with_codex(crate::codex::CodexConfig {
+            executable: "codex".into(),
+            cwd: vault.join("context"),
+            mcp_bridge: "tanglewood-mcp".into(),
+            socket: vault.join("owner.sock"),
+            resume_thread: None,
+            project: None,
+        });
+        assert!(ui.close_blocked(false, false));
+        assert!(ui.conversation.as_ref().unwrap().adapter.is_none());
+        ui.dispatch(Command::CreateNote {
+            path: "Draft.md".into(),
+            text: "Original".into(),
+        });
+        let id = ui.selected.unwrap();
+        ui.refresh(&ui.app.notes());
+        ui.show_preview = false;
+        ui.drafts.get_mut(&id).unwrap().text = "Unsubmitted text".into();
+        ui.sidebar(super::SidebarView::Codex, false);
+        assert_eq!(ui.selected, Some(id));
+        ui.sidebar(super::SidebarView::Notes, false);
+        assert_eq!(ui.drafts[&id].text, "Unsubmitted text");
+        assert!(!ui.show_preview);
+        ui.app.flush().unwrap();
+        let binding = ui.app.codex_project().cloned().unwrap();
+        assert!(binding.project_id.is_none());
+        assert_eq!(ui.app.note(id).unwrap().note.text, "Original");
+        ui.app.shutdown().unwrap();
+        drop(ui);
+        std::fs::remove_dir_all(vault).unwrap();
+    }
 
     #[test]
     fn file_request_keeps_correlation_and_blocks_close_until_acknowledged() {
@@ -1968,13 +2959,18 @@ mod tests {
 }
 
 #[cfg(all(target_os = "linux", feature = "codex"))]
-use crate::codex::{ApprovalDecision, CodexAdapter, CodexConfig, CodexEvent, CodexRequest};
+use crate::codex::{
+    ApprovalDecision, ApprovalMode, CodexAdapter, CodexConfig, CodexEvent, CodexRequest,
+    ThreadAction, ThreadWorkState, TurnControls, WorkMode,
+};
 
 #[cfg(all(target_os = "linux", feature = "codex"))]
 struct ConversationMessage {
     role: &'static str,
     key: Option<(String, String, String)>,
     text: String,
+    command: Option<crate::codex::CommandExecution>,
+    activity: Option<crate::codex::Activity>,
 }
 #[cfg(all(target_os = "linux", feature = "codex"))]
 struct ConversationApproval {
@@ -1986,10 +2982,58 @@ struct ConversationApproval {
     decisions: Vec<ApprovalDecision>,
 }
 #[cfg(all(target_os = "linux", feature = "codex"))]
+struct ThreadActionDialog {
+    thread: String,
+    title: String,
+    action: ThreadAction,
+    focus: bool,
+}
+#[cfg(all(target_os = "linux", feature = "codex"))]
 struct ConversationPanel {
+    vault_permission_requested: Option<bool>,
+    vault_write_enabled: Option<bool>,
+    research_requested: bool,
+    collect_references: Option<(String, Option<String>)>,
+    relevant_sources: bool,
+    research_workspace: Option<uuid::Uuid>,
+    relevant_cache: Option<(
+        uuid::Uuid,
+        Revision,
+        String,
+        Vec<crate::research_desktop::Passage>,
+    )>,
     config: CodexConfig,
     adapter: Option<CodexAdapter>,
-    visible: bool,
+    project_ready: bool,
+    fresh_thread: bool,
+    resume_requested: bool,
+    pending_thread: Option<Option<String>>,
+    pending_thread_action: Option<String>,
+    thread_action_dialog: Option<ThreadActionDialog>,
+    binding_durable: bool,
+    persist_project: bool,
+    metadata_error: Option<String>,
+    threads: Vec<crate::codex::ThreadSummary>,
+    threads_cursor: Option<String>,
+    threads_loading: bool,
+    threads_append: bool,
+    prompt_drafts: HashMap<String, String>,
+    unavailable_threads: std::collections::HashSet<String>,
+    history_cursor: Option<String>,
+    history_loading: bool,
+    renaming: bool,
+    project_name: String,
+    models: Vec<crate::codex::ModelChoice>,
+    models_cursor: Option<String>,
+    models_loading: bool,
+    selected_model: Option<String>,
+    selected_effort: Option<String>,
+    model_override: bool,
+    controls: TurnControls,
+    composer_height: f32,
+    context: codex_context::ContextUi,
+    context_goal_pending: Option<String>,
+    context_submit_pending: bool,
     ready: bool,
     starting: bool,
     active_turn: Option<String>,
@@ -1997,18 +3041,198 @@ struct ConversationPanel {
     disconnecting: bool,
     prompt: String,
     messages: Vec<ConversationMessage>,
+    markdown: codex_markdown::Cache,
     approvals: Vec<ConversationApproval>,
     status: String,
     error: Option<String>,
 }
 #[cfg(all(target_os = "linux", feature = "codex"))]
 impl ConversationPanel {
+    #[cfg(test)]
+    fn prepare_research_prompt(
+        &mut self,
+        prompt: String,
+        evidence: String,
+    ) -> Result<(), &'static str> {
+        self.prepare_research_context(prompt, evidence, false)
+    }
+    fn research_capture(&self) -> research::ConversationCapture {
+        let Some(project_id) = self
+            .config
+            .project
+            .as_ref()
+            .and_then(|p| p.project_id.as_ref())
+        else {
+            return Default::default();
+        };
+        if !self.project_ready || !self.binding_durable {
+            return Default::default();
+        }
+        let threads: Vec<_> = self
+            .threads
+            .iter()
+            .filter(|t| !self.unavailable_threads.contains(&t.id))
+            .map(|t| crate::research::ThreadRef {
+                provider: "codex".into(),
+                project_id: Some(project_id.clone()),
+                thread_id: t.id.clone(),
+                title: t.title.clone(),
+            })
+            .collect();
+        let current = self
+            .thread
+            .as_ref()
+            .and_then(|id| threads.iter().find(|t| &t.thread_id == id))
+            .cloned();
+        let mut capture = research::ConversationCapture {
+            threads,
+            current,
+            ..Default::default()
+        };
+        if capture.current.is_none()
+            || self.pending_thread.is_some()
+            || self.history_loading
+            || !self.ready
+        {
+            return capture;
+        }
+        // History belongs to the currently confirmed thread; keyed live messages must match too.
+        let messages: Vec<_> = self
+            .messages
+            .iter()
+            .filter(|m| {
+                m.command.is_none()
+                    && m.activity.is_none()
+                    && matches!(m.role, "You" | "Codex")
+                    && m.key
+                        .as_ref()
+                        .is_none_or(|(thread, _, _)| Some(thread) == self.thread.as_ref())
+            })
+            .collect();
+        let mut pieces = Vec::new();
+        let mut bytes = 0;
+        for message in messages.iter().rev() {
+            let piece = format!("{}: {}", message.role, message.text);
+            if bytes + piece.len() > 24_000 {
+                break;
+            }
+            bytes += piece.len();
+            pieces.push(piece);
+        }
+        pieces.reverse();
+        capture.discussion = pieces.join("\n\n");
+        if !self.busy() {
+            capture.answer = messages
+                .iter()
+                .rev()
+                .find(|m| m.role == "Codex" && !m.text.trim().is_empty())
+                .filter(|m| m.text.len() <= 24_000)
+                .map(|m| {
+                    (
+                        m.text.clone(),
+                        m.key.as_ref().map(|(_, turn, _)| turn.clone()),
+                    )
+                });
+        }
+        capture
+    }
+    fn prepare_research_context(
+        &mut self,
+        prompt: String,
+        evidence: String,
+        external: bool,
+    ) -> Result<(), &'static str> {
+        if !self.prompt.is_empty()
+            || !self.context.draft.is_empty()
+            || self.pending_thread.is_some()
+            || self.history_loading
+            || self.busy()
+            || self.controls.mode == WorkMode::Goal
+        {
+            return Err(
+                "Conversation has a draft, context, or active work. Copy the prepared prompt or finish that work first.",
+            );
+        }
+        if self.controls.approval == crate::codex::ApprovalMode::FullAccess {
+            return Err(
+                "Choose a sandboxed Access profile in the conversation before preparing grounded research. Full access permits network use.",
+            );
+        }
+        if self.thread.is_none() {
+            return Err(
+                "Connect and open or create a conversation first. The prepared question and sources remain in Research.",
+            );
+        }
+        self.prompt = prompt;
+        self.context
+            .draft
+            .attachments
+            .push(crate::codex::PromptAttachment {
+                name: if external {
+                    "Research context · external gathering"
+                } else {
+                    "Research sources"
+                }
+                .into(),
+                text: evidence,
+            });
+        self.controls.network_access = external;
+        self.status = if external {
+            "Research draft prepared · external gathering requested · review before sending"
+        } else {
+            "Research draft prepared · network access disabled · review before sending"
+        }
+        .into();
+        Ok(())
+    }
     const BYTE_LIMIT: usize = 2 * 1024 * 1024;
     fn new(config: CodexConfig) -> Self {
+        let project_name = config
+            .project
+            .as_ref()
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        let resume_requested = config.resume_thread.is_some();
         Self {
+            vault_permission_requested: None,
+            vault_write_enabled: None,
+            research_requested: false,
+            collect_references: None,
+            relevant_sources: false,
+            research_workspace: None,
+            relevant_cache: None,
             config,
             adapter: None,
-            visible: false,
+            project_name,
+            project_ready: false,
+            fresh_thread: false,
+            resume_requested,
+            pending_thread: None,
+            pending_thread_action: None,
+            thread_action_dialog: None,
+            binding_durable: false,
+            persist_project: false,
+            metadata_error: None,
+            threads: Vec::new(),
+            threads_cursor: None,
+            threads_loading: false,
+            threads_append: false,
+            prompt_drafts: HashMap::new(),
+            unavailable_threads: Default::default(),
+            history_cursor: None,
+            history_loading: false,
+            renaming: false,
+            models: Vec::new(),
+            models_cursor: None,
+            models_loading: false,
+            selected_model: None,
+            selected_effort: None,
+            model_override: false,
+            controls: Default::default(),
+            composer_height: 160.0,
+            context: Default::default(),
+            context_goal_pending: None,
+            context_submit_pending: false,
             ready: false,
             starting: false,
             active_turn: None,
@@ -2016,24 +3240,38 @@ impl ConversationPanel {
             disconnecting: false,
             prompt: String::new(),
             messages: Vec::new(),
+            markdown: Default::default(),
             approvals: Vec::new(),
             status: "Disconnected".into(),
             error: None,
         }
     }
     fn busy(&self) -> bool {
-        self.starting || self.active_turn.is_some()
+        self.starting
+            || self.active_turn.is_some()
+            || self.pending_thread_action.is_some()
+            || self.context.loading()
+            || self.context_goal_pending.is_some()
+            || self.context_submit_pending
     }
     fn bytes(&self) -> usize {
         self.messages
             .iter()
             .map(|message| {
                 message.text.len()
+                    + message.activity.as_ref().map_or(0, |a| {
+                        a.item.len() + a.kind.len() + a.title.len() + a.status.len()
+                    })
+                    + message.command.as_ref().map_or(0, |c| {
+                        c.command.len() + c.cwd.len() + c.status.len() + c.item.len()
+                    })
                     + message.key.as_ref().map_or(0, |(thread, turn, item)| {
                         thread.len() + turn.len() + item.len()
                     })
             })
             .sum::<usize>()
+            + self.prompt_drafts.values().map(String::len).sum::<usize>()
+            + self.context.bytes()
             + self
                 .approvals
                 .iter()
@@ -2098,28 +3336,406 @@ impl ConversationPanel {
                 role: "Codex",
                 key: Some(key),
                 text,
+                command: None,
+                activity: None,
             });
         }
     }
+    fn command_card(
+        &mut self,
+        thread: String,
+        turn: String,
+        mut command: crate::codex::CommandExecution,
+    ) {
+        if self.thread.as_ref() != Some(&thread) {
+            return;
+        }
+        let key = (thread, turn, command.item.clone());
+        if !command.output_complete {
+            if let Some(previous) = self.messages.iter().find(|m| m.key.as_ref() == Some(&key)) {
+                command.output = previous.text.clone();
+                command.truncated |= previous.command.as_ref().is_some_and(|c| c.truncated);
+            }
+        }
+        let output = std::mem::take(&mut command.output);
+        let metadata_bytes =
+            command.command.len() + command.cwd.len() + command.status.len() + command.item.len();
+        if self.bytes() + output.len() + metadata_bytes > Self::BYTE_LIMIT {
+            self.limit_exceeded();
+            return;
+        }
+        self.message(key.clone(), output, true);
+        if let Some(message) = self
+            .messages
+            .iter_mut()
+            .find(|m| m.key.as_ref() == Some(&key))
+        {
+            message.command = Some(command);
+        }
+    }
+    fn activity_card(
+        &mut self,
+        thread: String,
+        turn: String,
+        mut activity: crate::codex::Activity,
+    ) {
+        if self.thread.as_ref() != Some(&thread) {
+            return;
+        }
+        let key = (thread, turn, activity.item.clone());
+        let details = std::mem::take(&mut activity.details);
+        let metadata = activity.item.len()
+            + activity.kind.len()
+            + activity.title.len()
+            + activity.status.len();
+        if self.bytes() + details.len() + metadata > Self::BYTE_LIMIT {
+            self.limit_exceeded();
+            return;
+        }
+        self.message(key.clone(), details, true);
+        if let Some(message) = self
+            .messages
+            .iter_mut()
+            .find(|m| m.key.as_ref() == Some(&key))
+        {
+            message.activity = Some(activity);
+        }
+    }
+    fn retire_activity(&mut self, thread: Option<&str>, turn: Option<&str>, status: &str) {
+        for message in &mut self.messages {
+            let Some((owner, work, _)) = &message.key else {
+                continue;
+            };
+            if thread.is_some_and(|t| t != owner) || turn.is_some_and(|t| t != work) {
+                continue;
+            }
+            if let Some(activity) = &mut message.activity {
+                if matches!(
+                    activity.status.as_str(),
+                    "inProgress" | "started" | "running"
+                ) {
+                    activity.status = status.into();
+                }
+            }
+            if let Some(command) = &mut message.command {
+                if matches!(
+                    command.status.as_str(),
+                    "inProgress" | "started" | "running"
+                ) {
+                    command.status = status.into();
+                }
+            }
+        }
+    }
+    fn plan_rows(&mut self, ui: &mut egui::Ui) {
+        if self.context.plan.is_empty() && self.context.plan_text.is_none() {
+            return;
+        }
+        egui::CollapsingHeader::new("Plan")
+            .id_salt(("conversation-plan", &self.thread))
+            .default_open(self.context.plan.iter().any(|s| s.status == "inProgress"))
+            .show(ui, |ui| {
+                if let Some(text) = &self.context.plan_text {
+                    self.markdown.show(ui, ("plan-text", &self.thread), text);
+                }
+                for step in &self.context.plan {
+                    ui.horizontal_top(|ui| {
+                        match step.status.as_str() {
+                            "inProgress" if self.active_turn.is_some() => {
+                                ui.add(egui::Spinner::new().size(12.0));
+                            }
+                            "inProgress" => {
+                                ui.weak("◉");
+                            }
+                            "completed" => {
+                                ui.weak("✓");
+                            }
+                            _ => {
+                                ui.weak("○");
+                            }
+                        }
+                        ui.add(egui::Label::new(&step.text).wrap())
+                            .on_hover_text(format!("Codex plan step · {}", step.status));
+                    });
+                }
+            });
+        ui.add_space(12.0);
+    }
+    fn accept_turn(&mut self, thread: &str) {
+        if self.thread.as_deref() == Some(thread) && self.context_submit_pending {
+            self.context.draft = Default::default();
+            self.context_submit_pending = false;
+        }
+    }
+    fn start_turn(&mut self, thread: String, turn: String) {
+        // A goal can start a turn without accepting our queued message/context.
+        if self.thread.as_ref() != Some(&thread) {
+            return;
+        }
+        self.fresh_thread = false;
+        self.starting = false;
+        self.active_turn = Some(turn);
+        self.status = "Streaming…".into();
+    }
     fn poll(&mut self, ctx: &egui::Context) {
+        self.context.poll(ctx);
         for _ in 0..64 {
             let Some(event) = self.adapter.as_ref().and_then(CodexAdapter::try_recv) else {
                 return;
             };
             match event {
+                CodexEvent::Activity {
+                    thread,
+                    turn,
+                    activity,
+                } => self.activity_card(thread, turn, activity),
+                CodexEvent::Command {
+                    thread,
+                    turn,
+                    command,
+                } => self.command_card(thread, turn, command),
+                CodexEvent::CommandOutput {
+                    thread,
+                    turn,
+                    item,
+                    text,
+                    truncated,
+                } => {
+                    if self.thread.as_ref() == Some(&thread) {
+                        let key = (thread, turn, item);
+                        // A delta only belongs to a command that has already started.
+                        if self
+                            .messages
+                            .iter()
+                            .any(|m| m.key.as_ref() == Some(&key) && m.command.is_some())
+                        {
+                            self.message(key.clone(), text, false);
+                            if truncated {
+                                if let Some(c) = self
+                                    .messages
+                                    .iter_mut()
+                                    .find(|m| m.key.as_ref() == Some(&key))
+                                    .and_then(|m| m.command.as_mut())
+                                {
+                                    c.truncated = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                CodexEvent::TurnRejected { thread, error } => {
+                    if self.thread.as_ref() == Some(&thread) || thread.is_empty() {
+                        self.context_submit_pending = false;
+                        self.starting = false;
+                    }
+                    self.error = Some(error);
+                }
+                CodexEvent::GoalFailed { thread, error } => {
+                    if self.context_goal_pending.as_ref() == Some(&thread) || thread.is_empty() {
+                        self.context_goal_pending = None;
+                    }
+                    self.error = Some(error);
+                }
+                CodexEvent::GoalMutationFinished { thread, goal } => {
+                    if self.context_goal_pending.as_ref() == Some(&thread) {
+                        self.context_goal_pending = None;
+                        if self.thread.as_ref() == Some(&thread) {
+                            self.accept_goal(goal);
+                        }
+                    }
+                }
+                CodexEvent::Goal { thread, goal } => {
+                    if self.thread.as_ref() == Some(&thread) {
+                        if self.context_goal_pending.is_none() {
+                            self.accept_goal(goal);
+                        } else {
+                            self.context.goal = goal;
+                            self.context.goal_loaded = true;
+                        }
+                    }
+                }
+                CodexEvent::Plan {
+                    thread,
+                    steps,
+                    text,
+                } => {
+                    if self.thread.as_ref() == Some(&thread) {
+                        if !steps.is_empty() {
+                            self.context.plan = steps;
+                        }
+                        if text.is_some() {
+                            self.context.plan_text = text;
+                        }
+                    }
+                }
+                CodexEvent::Files { thread, files } => {
+                    if self.thread.as_ref() == Some(&thread) {
+                        self.context.merge_files(files);
+                    }
+                }
+                CodexEvent::Skills(skills) => {
+                    self.context.skills = skills;
+                    self.context.capabilities_loaded = true;
+                }
+                CodexEvent::Connections(connections) => {
+                    self.context.connections = connections;
+                    self.context.capabilities_loaded = true;
+                }
+                CodexEvent::Models {
+                    models,
+                    next_cursor,
+                } => {
+                    self.models_loading = false;
+                    for model in models {
+                        if let Some(old) = self.models.iter_mut().find(|m| m.model == model.model) {
+                            *old = model;
+                        } else if self.models.len() < 128 {
+                            self.models.push(model);
+                        }
+                    }
+                    self.models_cursor = next_cursor;
+                }
+                CodexEvent::ThreadModel {
+                    thread,
+                    model,
+                    effort,
+                } => {
+                    if self.thread.as_ref() == Some(&thread) {
+                        self.selected_model = Some(model);
+                        self.selected_effort = effort;
+                        self.model_override = false;
+                    }
+                }
+                CodexEvent::ProjectReady { project_id, name } => {
+                    if let Some(binding) = &mut self.config.project {
+                        binding.project_id = Some(project_id);
+                        binding.name = name.clone();
+                    }
+                    self.project_name = name;
+                    self.project_ready = true;
+                    if self.models.is_empty() && !self.models_loading {
+                        self.models_loading =
+                            self.send_request(CodexRequest::ListModels { cursor: None });
+                    }
+                    self.persist_project = true;
+                    self.status = "Connected".into();
+                    self.refresh_threads(None);
+                }
+                CodexEvent::Threads {
+                    threads,
+                    next_cursor,
+                } => {
+                    self.threads_loading = false;
+                    if !self.threads_append {
+                        self.threads.retain(|t| {
+                            (self.fresh_thread && Some(&t.id) == self.thread.as_ref())
+                                || (self.unavailable_threads.contains(&t.id)
+                                    && ((Some(&t.id) == self.thread.as_ref()
+                                        && (!self.prompt.is_empty() || self.context.has_draft()))
+                                        || self.context.cached_draft(&t.id)
+                                        || self
+                                            .prompt_drafts
+                                            .get(&t.id)
+                                            .is_some_and(|p| !p.is_empty())))
+                        });
+                    }
+                    self.unavailable_threads
+                        .retain(|id| self.threads.iter().any(|t| &t.id == id));
+                    for thread in threads {
+                        self.unavailable_threads.remove(&thread.id);
+                        if let Some(old) = self.threads.iter_mut().find(|old| old.id == thread.id) {
+                            *old = thread;
+                        } else if self.threads.len() < 256 {
+                            self.threads.push(thread);
+                        }
+                    }
+                    self.threads_cursor = next_cursor;
+                }
+                CodexEvent::History {
+                    thread,
+                    messages,
+                    next_cursor,
+                } => {
+                    if self.thread.as_ref() == Some(&thread) {
+                        self.history_loading = false;
+                        let extra: usize = messages.iter().map(|m| m.text.len()).sum();
+                        if self.messages.len() + messages.len() > 256
+                            || self.bytes() + extra > Self::BYTE_LIMIT
+                        {
+                            self.limit_exceeded();
+                        } else {
+                            let mut older: Vec<_> = messages
+                                .into_iter()
+                                .map(|m| ConversationMessage {
+                                    role: if matches!(m.role.as_str(), "user" | "You") {
+                                        "You"
+                                    } else {
+                                        "Codex"
+                                    },
+                                    key: None,
+                                    text: m.text,
+                                    command: None,
+                                    activity: None,
+                                })
+                                .collect();
+                            older.append(&mut self.messages);
+                            self.messages = older;
+                            self.history_cursor = next_cursor;
+                        }
+                    }
+                }
+                CodexEvent::ThreadActionFinished { thread, action } => {
+                    self.finish_thread_action(&thread, &action);
+                }
+                CodexEvent::ThreadActionFailed { thread, error } => {
+                    if self.pending_thread_action.as_ref() == Some(&thread) {
+                        self.pending_thread_action = None;
+                    }
+                    self.error = Some(error);
+                }
+                CodexEvent::ThreadStatus { thread, state } => {
+                    if let Some(summary) = self.threads.iter_mut().find(|t| t.id == thread) {
+                        summary.state = state;
+                    }
+                    if self.thread.as_ref() == Some(&thread) && self.pending_thread.is_none() {
+                        self.status = Self::state_label(state).into();
+                    }
+                }
                 CodexEvent::Connecting => self.status = "Connecting…".into(),
                 CodexEvent::Ready { thread } => {
-                    self.thread = Some(thread.clone());
-                    self.config.resume_thread = Some(thread);
-                    self.ready = true;
-                    self.status = "Ready".into();
+                    self.selected_model = None;
+                    self.selected_effort = None;
+                    self.model_override = false;
+                    self.controls = Default::default();
+                    self.context.goal_loaded = false;
+                    self.commit_thread_open(thread);
+                    self.send_request(CodexRequest::RefreshContext);
+                    if self.config.project.is_some() {
+                        if self.fresh_thread {
+                            if !self
+                                .threads
+                                .iter()
+                                .any(|t| Some(&t.id) == self.thread.as_ref())
+                            {
+                                self.threads.insert(
+                                    0,
+                                    crate::codex::ThreadSummary {
+                                        id: self.thread.clone().unwrap(),
+                                        title: "New thread".into(),
+                                        updated_at: 0,
+                                        state: ThreadWorkState::Idle,
+                                    },
+                                );
+                            }
+                        } else {
+                            self.history_loading =
+                                self.send_request(CodexRequest::LoadHistory { cursor: None });
+                        }
+                        self.refresh_threads(None);
+                    }
                 }
-                CodexEvent::TurnStarted { thread, turn } => {
-                    self.thread = Some(thread);
-                    self.starting = false;
-                    self.active_turn = Some(turn);
-                    self.status = "Streaming…".into();
-                }
+                CodexEvent::TurnAccepted { thread, .. } => self.accept_turn(&thread),
+                CodexEvent::TurnStarted { thread, turn } => self.start_turn(thread, turn),
                 CodexEvent::Delta {
                     thread,
                     turn,
@@ -2137,6 +3753,7 @@ impl ConversationPanel {
                     turn,
                     status,
                 } => {
+                    self.retire_activity(Some(&thread), Some(&turn), "ended");
                     if self.thread.as_ref() == Some(&thread)
                         && self.active_turn.as_ref() == Some(&turn)
                     {
@@ -2144,6 +3761,16 @@ impl ConversationPanel {
                         self.active_turn = None;
                         self.approvals.clear();
                         self.status = format!("Turn {status}");
+                        if let Some(summary) = self.threads.iter_mut().find(|t| t.id == thread) {
+                            summary.state = if status == "failed" {
+                                ThreadWorkState::Error
+                            } else {
+                                ThreadWorkState::Idle
+                            };
+                        }
+                        if self.project_ready {
+                            self.refresh_threads(None);
+                        }
                     }
                 }
                 CodexEvent::Approval {
@@ -2180,15 +3807,33 @@ impl ConversationPanel {
                     .approvals
                     .retain(|approval| approval.id != id || approval.thread != thread),
                 CodexEvent::Error(error) => {
+                    self.models_loading = false;
                     self.error = Some(error);
-                    if self.active_turn.is_none() {
+                    self.threads_loading = false;
+                    self.history_loading = false;
+                    if self.active_turn.is_none() && self.pending_thread.is_none() {
                         self.starting = false;
                     }
                 }
                 CodexEvent::Disconnected(error) => {
+                    self.retire_activity(None, None, "stopped");
+                    self.context.goal_loaded = false;
                     // The worker reports this only after its child has been killed/reaped.
                     self.adapter = None;
+                    self.context_submit_pending = false;
+                    self.pending_thread = None;
+                    self.pending_thread_action = None;
                     self.ready = false;
+                    self.project_ready = false;
+                    self.models_loading = false;
+                    self.models.clear();
+                    self.models_cursor = None;
+                    self.context.skills.clear();
+                    self.context.connections.clear();
+                    self.context.capabilities_loaded = false;
+                    self.context_goal_pending = None;
+                    self.threads_loading = false;
+                    self.history_loading = false;
                     self.starting = false;
                     self.active_turn = None;
                     self.approvals.clear();
@@ -2206,75 +3851,1296 @@ impl ConversationPanel {
         }
         ctx.request_repaint();
     }
-    fn show(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.heading("Codex");
-        ui.label(&self.status);
-        if let Some(thread) = &self.thread {
-            ui.label("Thread (resume ID)");
-            ui.add(egui::Label::new(thread).selectable(true).wrap());
+    fn send_request(&mut self, request: CodexRequest) -> bool {
+        match self
+            .adapter
+            .as_ref()
+            .ok_or_else(|| "Connect to Codex first".to_owned())
+            .and_then(|a| a.try_send(request))
+        {
+            Ok(()) => true,
+            Err(error) => {
+                self.error = Some(error);
+                false
+            }
         }
-        ui.horizontal_wrapped(|ui| {
-            if self.adapter.is_none()
-                && ui
-                    .button(if self.config.resume_thread.is_some() {
-                        "Reconnect / resume"
-                    } else {
-                        "Connect"
-                    })
-                    .clicked()
+    }
+    fn refresh_threads(&mut self, cursor: Option<String>) {
+        if self.threads_loading {
+            return;
+        }
+        self.threads_append = cursor.is_some();
+        self.threads_loading = self.send_request(CodexRequest::ListThreads { cursor });
+    }
+    fn select_thread(&mut self, id: Option<String>) {
+        if self.busy() || self.history_loading || !self.binding_durable || !self.project_ready {
+            return;
+        }
+        if id.is_some() && self.thread == id && self.ready {
+            return;
+        }
+        if id.is_none() && self.fresh_thread && self.ready {
+            return;
+        }
+        if self
+            .thread
+            .as_ref()
+            .is_some_and(|id| self.unavailable_threads.contains(id))
+            && (!self.prompt.is_empty() || self.context.has_draft())
+        {
+            self.error = Some(
+                "Copy or clear this recovered draft before leaving the removed conversation."
+                    .into(),
+            );
+            return;
+        }
+        if self.fresh_thread
+            && id.is_some()
+            && (!self.prompt.trim().is_empty() || self.context.has_draft())
+        {
+            self.error = Some(
+                "Send or clear this new thread's draft before opening another conversation.".into(),
+            );
+            return;
+        }
+        let request = id.as_ref().map_or(CodexRequest::CreateThread, |id| {
+            CodexRequest::ResumeThread(id.clone())
+        });
+        if self.bytes() + self.prompt.len() > Self::BYTE_LIMIT || self.prompt_drafts.len() >= 256 {
+            self.error = Some(
+                "Conversation drafts limit reached; clear a draft before switching threads.".into(),
+            );
+            return;
+        }
+        if let Some(target) = id
+            .as_ref()
+            .filter(|id| self.unavailable_threads.contains(*id))
+        {
+            let target = target.clone();
+            self.begin_thread_open(Some(target.clone()));
+            self.commit_thread_open(target);
+            self.ready = false;
+            self.config.resume_thread = None;
+            self.status = "Recovered draft — copy or clear before leaving".into();
+            return;
+        }
+        if self.send_request(request) {
+            self.begin_thread_open(id);
+        }
+    }
+    fn begin_thread_open(&mut self, id: Option<String>) {
+        // The old conversation owns its draft until the server confirms a new one.
+        self.pending_thread = Some(id);
+        self.resume_requested = false;
+        self.ready = false;
+        self.starting = true;
+        self.error = None;
+        self.status = "Opening conversation…".into();
+    }
+    fn commit_thread_open(&mut self, thread: String) {
+        if let Some(target) = self.pending_thread.take() {
+            let carry_prompt = self.fresh_thread && target.is_none();
+            self.context.switch(
+                self.thread.as_deref().unwrap_or_default(),
+                &thread,
+                carry_prompt,
+            );
+            if !carry_prompt {
+                self.prompt_drafts.insert(
+                    self.thread.clone().unwrap_or_default(),
+                    std::mem::take(&mut self.prompt),
+                );
+                self.prompt = self.prompt_drafts.remove(&thread).unwrap_or_default();
+            }
+            self.fresh_thread = target.is_none();
+            self.messages.clear();
+            self.markdown = Default::default();
+            self.history_cursor = None;
+        }
+        self.thread = Some(thread.clone());
+        self.config.resume_thread = Some(thread);
+        self.ready = true;
+        self.starting = false;
+        self.status = "Ready".into();
+    }
+    fn can_thread_action(&self, id: &str, action: &ThreadAction) -> Result<(), &'static str> {
+        if !self.project_ready
+            || !self.binding_durable
+            || self.disconnecting
+            || self.busy()
+            || self.history_loading
+            || self.threads_loading
+        {
+            return Err("Wait for the Codex connection and pending operation.");
+        }
+        if self.unavailable_threads.contains(id) {
+            return Err("This thread is unavailable; copy or clear its recovered draft.");
+        }
+        if !self.threads.iter().any(|t| t.id == id) {
+            return Err("Thread is no longer listed in this vault project.");
+        }
+        if self.fresh_thread && self.thread.as_deref() == Some(id) {
+            return Err("Send the first message before managing this new thread.");
+        }
+        if !matches!(action, ThreadAction::Rename(_)) {
+            // These service operations also affect descendants. Preserve all local drafts.
+            if !self.prompt.is_empty()
+                || self.context.any_drafts()
+                || self.prompt_drafts.values().any(|draft| !draft.is_empty())
             {
-                if self.bytes() >= Self::BYTE_LIMIT {
-                    self.error = Some("Clear the conversation before connecting.".into());
-                } else {
-                    let context = ctx.clone();
-                    match CodexAdapter::spawn(self.config.clone(), move || {
-                        context.request_repaint()
-                    }) {
-                        Ok(adapter) => {
-                            self.adapter = Some(adapter);
-                            self.status = "Connecting…".into();
-                            self.ready = false;
-                            self.disconnecting = false;
-                            self.error = None;
-                        }
-                        Err(error) => self.error = Some(error.to_string()),
-                    }
+                return Err(
+                    "Send or clear conversation drafts before archiving or removing a thread.",
+                );
+            }
+            if self.threads.iter().any(|t| {
+                matches!(
+                    self.thread_state(t),
+                    ThreadWorkState::Working
+                        | ThreadWorkState::WaitingOnApproval
+                        | ThreadWorkState::WaitingOnInput
+                )
+            }) {
+                return Err("Finish active conversations before archiving or removing a thread.");
+            }
+        }
+        Ok(())
+    }
+    fn finish_thread_action(&mut self, id: &str, action: &ThreadAction) {
+        if self.pending_thread_action.as_deref() == Some(id) {
+            self.pending_thread_action = None;
+        }
+        if self
+            .thread_action_dialog
+            .as_ref()
+            .is_some_and(|d| d.thread == id)
+        {
+            self.thread_action_dialog = None;
+        }
+        match action {
+            ThreadAction::Rename(name) => {
+                if let Some(thread) = self.threads.iter_mut().find(|t| t.id == id) {
+                    thread.title = name.clone();
                 }
             }
-            if self.adapter.is_some()
-                && ui
-                    .add_enabled(!self.disconnecting, egui::Button::new("Disconnect"))
-                    .clicked()
-            {
-                self.disconnect();
+            ThreadAction::Archive | ThreadAction::Remove => {
+                let current = self.thread.as_deref() == Some(id);
+                let has_draft = (current && (!self.prompt.is_empty() || self.context.has_draft()))
+                    || self.context.cached_draft(id)
+                    || self.prompt_drafts.get(id).is_some_and(|p| !p.is_empty());
+                if has_draft {
+                    self.unavailable_threads.insert(id.into());
+                    if let Some(row) = self.threads.iter_mut().find(|t| t.id == id) {
+                        if !row.title.starts_with("Draft — ") {
+                            row.title = format!("Draft — {}", row.title);
+                        }
+                        row.state = ThreadWorkState::Error;
+                    } else {
+                        // At most 256 ordinary rows plus one row per bounded cached draft.
+                        self.threads.push(crate::codex::ThreadSummary {
+                            id: id.into(),
+                            title: "Draft — unavailable conversation".into(),
+                            state: ThreadWorkState::Error,
+                            updated_at: 0,
+                        });
+                    }
+                } else {
+                    self.threads.retain(|t| t.id != id);
+                    self.prompt_drafts.remove(id);
+                    self.unavailable_threads.remove(id);
+                }
+                self.context.retire(id, current);
+                if current {
+                    if !has_draft {
+                        self.thread = None;
+                        self.messages.clear();
+                        self.markdown = Default::default();
+                    }
+                    self.config.resume_thread = None;
+                    self.resume_requested = false;
+                    self.ready = false;
+                    self.fresh_thread = false;
+                    self.active_turn = None;
+                    if self.pending_thread.is_none() {
+                        self.starting = false;
+                    }
+                    self.approvals.clear();
+                    self.history_loading = false;
+                    self.history_cursor = None;
+                    self.status = if has_draft {
+                        "Recovered draft — copy or clear before leaving"
+                    } else {
+                        "Connected"
+                    }
+                    .into();
+                }
             }
-            if !self.busy()
-                && self.approvals.is_empty()
-                && ui.button("Clear displayed messages").clicked()
-            {
-                self.messages.clear();
-                self.error = None;
+        }
+    }
+    fn thread_menu(
+        ui: &mut egui::Ui,
+        enabled: bool,
+        destructive: bool,
+        reason: Option<&str>,
+    ) -> Option<ThreadAction> {
+        let mut action = None;
+        for (label, candidate) in [
+            ("Rename…", ThreadAction::Rename(String::new())),
+            ("Archive…", ThreadAction::Archive),
+            ("Remove…", ThreadAction::Remove),
+        ] {
+            let allowed = enabled && (matches!(candidate, ThreadAction::Rename(_)) || destructive);
+            let response = ui.add_enabled(allowed, egui::Button::new(label));
+            let response = if !allowed {
+                response
+                    .on_disabled_hover_text(reason.unwrap_or("Finish the pending operation first."))
+            } else {
+                response
+            };
+            if response.clicked() {
+                action = Some(candidate);
+                ui.close();
             }
-            if self.adapter.is_none() && ui.button("New thread").clicked() {
-                self.config.resume_thread = None;
-                self.thread = None;
-                self.messages.clear();
-                self.error = None;
-                self.status = "Disconnected — new thread on Connect".into();
+        }
+        action
+    }
+    fn thread_action_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.thread_action_dialog.take() else {
+            return;
+        };
+        let mut close = false;
+        let mut submit = false;
+        let response=egui::Modal::new(egui::Id::new("codex-thread-action")).show(ctx,|ui| {
+            ui.set_width(360.0);
+            let (heading,button)=match dialog.action {ThreadAction::Rename(_)=>("Rename thread","Rename"),ThreadAction::Archive=>("Archive thread?","Archive"),ThreadAction::Remove=>("Remove thread permanently?","Remove")};
+            ui.heading(heading);
+            ui.add_space(8.0);
+            if let ThreadAction::Rename(name)=&mut dialog.action {
+                let field=ui.add(egui::TextEdit::singleline(name).desired_width(f32::INFINITY).char_limit(256));
+                if dialog.focus {field.request_focus();dialog.focus=false;}
+            } else {
+                ui.label(&dialog.title);
+                ui.add_space(8.0);
+                ui.label(if matches!(dialog.action,ThreadAction::Remove) {"This permanently deletes this conversation and its spawned child threads from Codex. It cannot be undone."} else {"This archives the conversation and attempts to archive its spawned child threads. You can restore archived conversations through Codex."});
+            }
+            let available=self.can_thread_action(&dialog.thread,&dialog.action);
+            if let Err(reason)=available {ui.weak(reason);}
+            let valid_name=match &dialog.action {ThreadAction::Rename(name)=>!name.trim().is_empty() && name.len()<=256 && !name.chars().any(char::is_control),_=>true};
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {close=true;}
+                if ui.add_enabled(available.is_ok() && valid_name,egui::Button::new(button)).clicked() {submit=true;}
+            });
+        });
+        if response.should_close() {
+            close = true;
+        }
+        if submit
+            && self.send_request(CodexRequest::ThreadAction {
+                thread: dialog.thread.clone(),
+                action: dialog.action.clone(),
+            })
+        {
+            self.pending_thread_action = Some(dialog.thread.clone());
+            self.error = None;
+        }
+        if !close {
+            self.thread_action_dialog = Some(dialog);
+        }
+    }
+    fn state_label(state: ThreadWorkState) -> &'static str {
+        match state {
+            ThreadWorkState::Working => "Working",
+            ThreadWorkState::WaitingOnApproval => "Waiting for approval",
+            ThreadWorkState::WaitingOnInput => "Waiting for input",
+            ThreadWorkState::Idle => "Idle",
+            ThreadWorkState::Error => "Error",
+            ThreadWorkState::NotLoaded => "Not loaded",
+            ThreadWorkState::Unknown => "Status unknown",
+        }
+    }
+    fn thread_state(&self, thread: &crate::codex::ThreadSummary) -> ThreadWorkState {
+        if !self.project_ready || self.disconnecting {
+            return ThreadWorkState::Unknown;
+        }
+        if self.thread.as_deref() == Some(&thread.id) {
+            if !self.approvals.is_empty() {
+                return ThreadWorkState::WaitingOnApproval;
+            }
+            if (self.active_turn.is_some() || (self.starting && self.pending_thread.is_none()))
+                && matches!(
+                    thread.state,
+                    ThreadWorkState::Idle | ThreadWorkState::NotLoaded | ThreadWorkState::Unknown
+                )
+            {
+                return ThreadWorkState::Working;
+            }
+        }
+        thread.state
+    }
+    fn state_indicator(ui: &egui::Ui, center: egui::Pos2, state: ThreadWorkState) {
+        let muted = theme::muted(ui);
+        match state {
+            ThreadWorkState::Working => {
+                let colour = egui::Color32::from_rgb(100, 170, 230);
+                ui.painter().circle_filled(center, 3.0, colour);
+                ui.painter()
+                    .circle_stroke(center, 5.0, egui::Stroke::new(1.0, colour));
+            }
+            ThreadWorkState::WaitingOnApproval | ThreadWorkState::WaitingOnInput => {
+                let points = vec![
+                    center + egui::vec2(0.0, -5.0),
+                    center + egui::vec2(5.0, 0.0),
+                    center + egui::vec2(0.0, 5.0),
+                    center + egui::vec2(-5.0, 0.0),
+                ];
+                let colour = egui::Color32::from_rgb(214, 168, 79);
+                let fill = if state == ThreadWorkState::WaitingOnApproval {
+                    colour
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+                ui.painter().add(egui::Shape::convex_polygon(
+                    points,
+                    fill,
+                    egui::Stroke::new(1.0, colour),
+                ));
+            }
+            ThreadWorkState::Idle => {
+                ui.painter()
+                    .circle_stroke(center, 3.5, egui::Stroke::new(1.0, muted));
+            }
+            ThreadWorkState::Error => {
+                let stroke = egui::Stroke::new(1.5, ui.visuals().error_fg_color);
+                for direction in [-1.0, 1.0] {
+                    ui.painter().line_segment(
+                        [
+                            center + egui::vec2(-3.5, -3.5 * direction),
+                            center + egui::vec2(3.5, 3.5 * direction),
+                        ],
+                        stroke,
+                    );
+                }
+            }
+            ThreadWorkState::NotLoaded => {
+                ui.painter().line_segment(
+                    [center - egui::vec2(3.5, 0.0), center + egui::vec2(3.5, 0.0)],
+                    egui::Stroke::new(1.0, muted),
+                );
+            }
+            ThreadWorkState::Unknown => {
+                ui.painter().text(
+                    center,
+                    egui::Align2::CENTER_CENTER,
+                    "?",
+                    egui::FontId::proportional(12.0),
+                    muted,
+                );
+            }
+        }
+    }
+    fn sidebar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal(|ui| {
+            ui.strong("Codex");
+            ui.add_space(
+                (ui.available_width() - 68.0 - 3.0 * ui.spacing().item_spacing.x).max(0.0),
+            );
+            let connected = self.adapter.is_some();
+            let label = if self.disconnecting {
+                "Disconnecting…"
+            } else if connected {
+                "Disconnect Codex"
+            } else {
+                "Connect Codex"
+            };
+            if theme::selected_button(
+                ui,
+                theme::Icon::Links,
+                label,
+                !self.disconnecting && (connected || self.binding_durable),
+                connected,
+            )
+            .clicked()
+            {
+                if connected {
+                    self.disconnect();
+                } else {
+                    self.connect(ctx);
+                }
+            }
+            if theme::button(
+                ui,
+                theme::Icon::New,
+                "New thread",
+                self.project_ready && self.binding_durable && !self.busy() && !self.history_loading,
+            )
+            .clicked()
+            {
+                self.select_thread(None);
             }
         });
+        ui.add_space(18.0);
+        ui.horizontal(|ui| {
+            ui.add(theme::image(ui, theme::Icon::Folder));
+            let width = (ui.available_width() - 42.0).max(1.0);
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 34.0), egui::Sense::hover());
+            let mut job = egui::text::LayoutJob::simple(
+                self.project_name.clone(),
+                egui::FontId::proportional(14.0),
+                ui.visuals().text_color(),
+                width,
+            );
+            job.wrap.max_rows = 1;
+            let galley = ui.fonts_mut(|f| f.layout_job(job));
+            let pos = rect.left_center() - egui::vec2(0.0, galley.size().y * 0.5);
+            ui.painter().galley(pos, galley, ui.visuals().text_color());
+            let more = theme::button(ui, theme::Icon::More, "Project actions", true);
+            egui::Popup::menu(&more).show(|ui| {
+                if ui
+                    .add_enabled(
+                        self.project_ready && self.binding_durable && !self.busy(),
+                        egui::Button::new("Rename project…"),
+                    )
+                    .clicked()
+                {
+                    self.renaming = true;
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        self.project_ready && !self.threads_loading,
+                        egui::Button::new("Refresh threads"),
+                    )
+                    .clicked()
+                {
+                    self.refresh_threads(None);
+                    ui.close();
+                }
+            });
+        });
+        if self.renaming {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.project_name)
+                    .hint_text("Project name")
+                    .char_limit(256),
+            );
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        !self.project_name.trim().is_empty(),
+                        egui::Button::new("Rename"),
+                    )
+                    .clicked()
+                    && self.send_request(CodexRequest::RenameProject(
+                        self.project_name.trim().to_owned(),
+                    ))
+                {
+                    self.renaming = false;
+                }
+                if ui.button("Cancel").clicked() {
+                    self.renaming = false;
+                    self.project_name = self
+                        .config
+                        .project
+                        .as_ref()
+                        .map(|p| p.name.clone())
+                        .unwrap_or_default();
+                }
+            });
+        }
+        let mut selected = None;
+        let mut menu_action = None;
+        let scroll = egui::ScrollArea::vertical()
+            .id_salt("codex-threads")
+            .show(ui, |ui| {
+                for thread in &self.threads {
+                    let current = self.thread.as_deref() == Some(&thread.id);
+                    let state = self.thread_state(thread);
+                    let label = if self.unavailable_threads.contains(&thread.id) {
+                        "Recovered draft: conversation archived or removed"
+                    } else if !self.project_ready {
+                        "Disconnected"
+                    } else {
+                        Self::state_label(state)
+                    };
+                    let enabled = self
+                        .can_thread_action(&thread.id, &ThreadAction::Rename(thread.title.clone()));
+                    let destructive = self.can_thread_action(&thread.id, &ThreadAction::Archive);
+                    ui.push_id(&thread.id, |ui| {
+                        ui.horizontal(|ui| {
+                            let row = ui
+                                .add_enabled(
+                                    !self.busy() && !self.history_loading && self.binding_durable,
+                                    egui::Button::new("")
+                                        .selected(current)
+                                        .frame(true)
+                                        .frame_when_inactive(current)
+                                        .corner_radius(6)
+                                        .min_size(egui::vec2(
+                                            (ui.available_width() - 42.0).max(1.0),
+                                            34.0,
+                                        )),
+                                )
+                                .on_hover_text(label);
+                            row.widget_info(|| {
+                                egui::WidgetInfo::labeled(
+                                    egui::WidgetType::Button,
+                                    true,
+                                    format!("{} — {}", thread.title, label),
+                                )
+                            });
+                            let mut job = egui::text::LayoutJob::simple(
+                                thread.title.clone(),
+                                egui::FontId::proportional(14.0),
+                                ui.visuals().text_color(),
+                                (row.rect.width() - 40.0).max(1.0),
+                            );
+                            job.wrap.max_rows = 1;
+                            let galley = ui.fonts_mut(|f| f.layout_job(job));
+                            let pos =
+                                row.rect.left_center() + egui::vec2(10.0, -galley.size().y * 0.5);
+                            ui.painter().galley(pos, galley, ui.visuals().text_color());
+                            Self::state_indicator(
+                                ui,
+                                row.rect.right_center() - egui::vec2(13.0, 0.0),
+                                state,
+                            );
+                            row.context_menu(|ui| {
+                                if let Some(action) = Self::thread_menu(
+                                    ui,
+                                    enabled.is_ok(),
+                                    destructive.is_ok(),
+                                    enabled.err().or(destructive.err()),
+                                ) {
+                                    menu_action =
+                                        Some((thread.id.clone(), thread.title.clone(), action));
+                                }
+                            });
+                            if row.clicked() {
+                                selected = Some(thread.id.clone());
+                            }
+                            let more = theme::button(ui, theme::Icon::More, "Thread actions", true);
+                            egui::Popup::menu(&more).show(|ui| {
+                                if let Some(action) = Self::thread_menu(
+                                    ui,
+                                    enabled.is_ok(),
+                                    destructive.is_ok(),
+                                    enabled.err().or(destructive.err()),
+                                ) {
+                                    menu_action =
+                                        Some((thread.id.clone(), thread.title.clone(), action));
+                                }
+                            });
+                        });
+                    });
+                }
+                if self.threads_loading {
+                    ui.weak("Loading…");
+                }
+                if self.project_ready && !self.threads_loading && self.threads.is_empty() {
+                    ui.weak("No threads yet");
+                }
+            });
+        navigation::scroll_focus(ui.ctx(), &scroll);
+        if let Some((thread, title, mut action)) = menu_action {
+            if let ThreadAction::Rename(name) = &mut action {
+                *name = title.clone();
+            }
+            self.thread_action_dialog = Some(ThreadActionDialog {
+                thread,
+                title,
+                action,
+                focus: true,
+            });
+        }
+        if let Some(id) = selected {
+            self.select_thread(Some(id));
+        }
+        if self.threads_cursor.is_some()
+            && ui
+                .add_enabled(
+                    !self.threads_loading && self.threads.len() < 256,
+                    egui::Button::new("More threads"),
+                )
+                .clicked()
+        {
+            self.refresh_threads(self.threads_cursor.clone());
+        }
+    }
+    fn connect(&mut self, ctx: &egui::Context) {
+        if !self.binding_durable {
+            return;
+        }
+        self.resume_requested = self.config.resume_thread.is_some() && !self.fresh_thread;
+        if self.bytes() >= Self::BYTE_LIMIT {
+            self.error = Some("Clear the conversation before connecting.".into());
+        } else {
+            let context = ctx.clone();
+            match CodexAdapter::spawn(self.config.clone(), move || context.request_repaint()) {
+                Ok(adapter) => {
+                    self.adapter = Some(adapter);
+                    self.status = "Connecting…".into();
+                    self.ready = false;
+                    self.disconnecting = false;
+                    self.error = None;
+                }
+                Err(error) => self.error = Some(error.to_string()),
+            }
+        }
+    }
+    fn effort_label(effort: &str) -> &str {
+        match effort {
+            "none" => "None",
+            "minimal" => "Minimal",
+            "low" => "Low",
+            "medium" => "Medium",
+            "high" => "High",
+            "xhigh" => "Extra high",
+            "max" => "Max",
+            "ultra" => "Ultra",
+            other => other,
+        }
+    }
+    fn choose_model(&mut self, model: &str) {
+        if let Some(choice) = self.models.iter().find(|m| m.model == model) {
+            self.selected_model = Some(choice.model.clone());
+            self.selected_effort = choice
+                .efforts
+                .iter()
+                .any(|(id, _)| id == &choice.default_effort)
+                .then(|| choice.default_effort.clone());
+            self.model_override = true;
+        }
+    }
+    fn model_picker(&mut self, ui: &mut egui::Ui) {
+        let choice = self
+            .models
+            .iter()
+            .find(|m| Some(&m.model) == self.selected_model.as_ref());
+        let title = choice
+            .map(|m| m.name.as_str())
+            .or(self.selected_model.as_deref())
+            .unwrap_or("Model");
+        let effort = self
+            .selected_effort
+            .as_deref()
+            .map(Self::effort_label)
+            .unwrap_or("Default");
+        let label = format!("{title}  {effort}  ⌄");
+        let picker = ui
+            .add_enabled(
+                self.project_ready && self.ready && !self.busy() && !self.disconnecting,
+                egui::Button::new(label).frame(false).corner_radius(8),
+            )
+            .on_hover_text("Choose model and reasoning effort for the next message");
+        let mut chosen = None;
+        let mut effort_choice = None;
+        let mut list_models = false;
+        egui::Popup::menu(&picker)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
+                ui.set_min_width(270.0);
+                ui.set_max_width(300.0);
+                ui.spacing_mut().slider_width = 240.0;
+                ui.menu_button(title, |ui| {
+                    ui.set_min_width(240.0);
+                    egui::ScrollArea::vertical()
+                        .max_height(320.0)
+                        .show(ui, |ui| {
+                            for model in &self.models {
+                                if ui
+                                    .selectable_label(
+                                        self.selected_model.as_ref() == Some(&model.model),
+                                        &model.name,
+                                    )
+                                    .on_hover_text(&model.description)
+                                    .clicked()
+                                {
+                                    chosen = Some(model.model.clone());
+                                    ui.close();
+                                }
+                            }
+                        });
+                    if self.models_loading {
+                        ui.spinner();
+                    }
+                    if (self.models_cursor.is_some() || self.models.is_empty())
+                        && ui
+                            .add_enabled(
+                                !self.models_loading && self.models.len() < 128,
+                                egui::Button::new(if self.models_cursor.is_some() {
+                                    "More models…"
+                                } else {
+                                    "Load models"
+                                }),
+                            )
+                            .clicked()
+                    {
+                        list_models = true;
+                    }
+                });
+                if let Some(model) = choice {
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("Reasoning effort");
+                        if ui
+                            .small_button("↺")
+                            .on_hover_text("Reset to this model's default effort")
+                            .clicked()
+                        {
+                            effort_choice = model
+                                .efforts
+                                .iter()
+                                .any(|(id, _)| id == &model.default_effort)
+                                .then(|| model.default_effort.clone());
+                        }
+                    });
+                    if !model.efforts.is_empty() {
+                        let mut index = model
+                            .efforts
+                            .iter()
+                            .position(|(id, _)| Some(id) == self.selected_effort.as_ref())
+                            .or_else(|| {
+                                model
+                                    .efforts
+                                    .iter()
+                                    .position(|(id, _)| id == &model.default_effort)
+                            })
+                            .unwrap_or(0);
+                        ui.label(Self::effort_label(&model.efforts[index].0));
+                        if ui
+                            .add(
+                                egui::Slider::new(&mut index, 0..=model.efforts.len() - 1)
+                                    .show_value(false)
+                                    .handle_shape(egui::style::HandleShape::Circle),
+                            )
+                            .on_hover_text(&model.efforts[index].1)
+                            .changed()
+                        {
+                            effort_choice = Some(model.efforts[index].0.clone());
+                        }
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(&model.efforts[index].1).weak())
+                                .wrap(),
+                        );
+                    } else {
+                        ui.weak("This model does not offer reasoning choices.");
+                    }
+                } else {
+                    ui.weak(if self.models_loading {
+                        "Loading available models…"
+                    } else {
+                        "Choose a model to see supported reasoning efforts."
+                    });
+                }
+            });
+        if let Some(model) = chosen {
+            self.choose_model(&model);
+        }
+        if let Some(effort) = effort_choice {
+            self.selected_effort = Some(effort);
+            self.model_override = true;
+        }
+        if list_models {
+            self.models_loading = self.send_request(CodexRequest::ListModels {
+                cursor: self.models_cursor.clone(),
+            });
+        }
+    }
+    fn context_action(&mut self, action: codex_context::Action) {
+        let request = match action {
+            codex_context::Action::Refresh => CodexRequest::RefreshContext,
+            codex_context::Action::SetGoal(objective) => {
+                if !self.ready
+                    || self.busy()
+                    || self.history_loading
+                    || self.context_goal_pending.is_some()
+                {
+                    return;
+                }
+                self.context_goal_pending = self.thread.clone();
+                CodexRequest::SetGoal { objective }
+            }
+            codex_context::Action::PauseGoal => {
+                if !self.ready
+                    || self.history_loading
+                    || self.pending_thread.is_some()
+                    || self.pending_thread_action.is_some()
+                    || self.context_goal_pending.is_some()
+                {
+                    return;
+                }
+                self.context_goal_pending = self.thread.clone();
+                CodexRequest::PauseGoal
+            }
+            codex_context::Action::ClearGoal => {
+                if !self.ready
+                    || self.history_loading
+                    || self.pending_thread.is_some()
+                    || self.pending_thread_action.is_some()
+                    || self.context_goal_pending.is_some()
+                {
+                    return;
+                }
+                self.context_goal_pending = self.thread.clone();
+                CodexRequest::ClearGoal
+            }
+            codex_context::Action::DraftSketch => {
+                let request = "Create a visual sketch/mockup of the idea below. Use available image/visualization capabilities, and include the result or its saved file path.\n\n";
+                self.prompt.insert_str(0, request);
+                return;
+            }
+            codex_context::Action::DraftPlan => {
+                if self.prompt.is_empty() {
+                    self.prompt =
+                        "Please propose a plan for this task before implementing it.\n\n".into();
+                } else {
+                    self.prompt
+                        .push_str("\n\nPlease propose a plan before implementing this task.");
+                }
+                return;
+            }
+        };
+        let setting_goal = matches!(&request, CodexRequest::SetGoal { .. });
+        let leaving_goal = matches!(&request, CodexRequest::PauseGoal | CodexRequest::ClearGoal);
+        if self.send_request(request) {
+            if setting_goal {
+                self.controls.mode = WorkMode::Goal;
+                self.controls.network_access = false;
+            } else if leaving_goal && self.controls.mode == WorkMode::Goal {
+                self.controls.mode = WorkMode::Work;
+            }
+        } else {
+            self.context_goal_pending = None;
+        }
+    }
+    fn accept_goal(&mut self, goal: Option<crate::codex::GoalInfo>) {
+        if goal.as_ref().is_some_and(|g| g.status == "active") {
+            self.controls.mode = WorkMode::Goal;
+        } else if self.controls.mode == WorkMode::Goal {
+            self.controls.mode = WorkMode::Work;
+        }
+        self.context.goal = goal;
+        self.context.goal_loaded = true;
+    }
+    fn mode_consistent(&self) -> bool {
+        let active = self
+            .context
+            .goal
+            .as_ref()
+            .is_some_and(|g| g.status == "active");
+        self.context.goal_loaded && (active == (self.controls.mode == WorkMode::Goal))
+    }
+    fn select_mode(&mut self, mode: WorkMode) {
+        if !self.ready || self.busy() || self.history_loading || !self.context.goal_loaded {
+            return;
+        }
+        if mode == WorkMode::Goal {
+            if let Some(goal) = &self.context.goal {
+                if goal.status == "active" {
+                    self.controls.mode = mode;
+                    self.controls.network_access = false;
+                } else if goal.status != "complete" {
+                    self.context_action(codex_context::Action::SetGoal(goal.objective.clone()));
+                } else {
+                    self.context.open_goal_dialog(self.prompt.clone());
+                }
+            } else {
+                self.context.open_goal_dialog(self.prompt.clone());
+            }
+        } else {
+            self.controls.mode = mode;
+            self.controls.network_access = mode == WorkMode::Research;
+            if self
+                .context
+                .goal
+                .as_ref()
+                .is_some_and(|g| g.status == "active")
+            {
+                self.context_action(codex_context::Action::PauseGoal);
+            }
+        }
+    }
+    fn turn_pickers(&mut self, ui: &mut egui::Ui) {
+        let enabled = self.ready && !self.busy() && !self.history_loading && !self.disconnecting;
+        let approval = ui
+            .add_enabled(
+                enabled,
+                egui::Button::new(match self.controls.approval {
+                    ApprovalMode::Ask => "Ask approval ⌄",
+                    ApprovalMode::AutoReview => "Approve for me ⌄",
+                    ApprovalMode::NoPrompts => "No prompts ⌄",
+                    ApprovalMode::FullAccess => "Full access ⌄",
+                })
+                .frame(false)
+                .corner_radius(8),
+            )
+            .on_hover_text(
+                "Command approval mode for the next message; MCP tool approvals are separate",
+            );
+        egui::Popup::menu(&approval).show(|ui| {
+            ui.set_max_width(320.0);
+            for (mode, label, description) in [
+                (ApprovalMode::Ask, "Ask for approval", "Send command and tool approval requests to you."),
+                (ApprovalMode::AutoReview, "Approve for me", "Route eligible approvals to Codex automatic review; retain the sandbox."),
+                (ApprovalMode::NoPrompts, "No prompts", "Never ask for command approval. Keep the sandbox/network limits; blocked actions can fail. MCP tools retain their separate approval policy."),
+                (ApprovalMode::FullAccess, "Full access", "Remove the command sandbox and command approval prompts. File/network access is unrestricted. MCP tools may still request approval under their separate policy."),
+            ] {
+                if ui.selectable_label(self.controls.approval == mode, label).on_hover_text(description).clicked() {
+                    self.controls.approval = mode; ui.close();
+                }
+            }
+        });
+        let access = ui.add_enabled(
+            enabled,
+            egui::Button::new(if self.controls.approval == ApprovalMode::FullAccess {
+                "Access · unrestricted ⌄"
+            } else if self.controls.network_access {
+                "Access · online ⌄"
+            } else {
+                "Access ⌄"
+            })
+            .frame(false)
+            .corner_radius(8),
+        );
+        egui::Popup::menu(&access).show(|ui| {
+            ui.set_max_width(320.0);
+            ui.strong("Execution access");
+            if self.controls.approval == ApprovalMode::FullAccess {
+                ui.label("Full access: commands can read/write files and use the network without sandbox restrictions.");
+                let mut enabled=true;
+                ui.add_enabled(false,egui::Checkbox::new(&mut enabled,"Network included in Full access"));
+            } else {
+                ui.label("Commands can run inside the read-only sandbox.");
+                ui.weak(if self.controls.approval==ApprovalMode::NoPrompts {"Requests needing broader access are rejected instead of prompting."} else {"Commands that need broader access can request approval. Allow once grants the requested command."});
+                ui.checkbox(&mut self.controls.network_access,"Allow network access").on_hover_text("Applies to commands in subsequent messages in this conversation. Managed restrictions may still apply.");
+            }
+            ui.weak("Vault tools use the owner's independent MCP permissions. Attached files remain explicit snapshots.");
+        });
+        // Keep profile and model together when the context panel narrows the composer.
+        let remaining = ui.available_rect_before_wrap().width();
+        if remaining < 350.0 {
+            ui.allocate_space(egui::vec2(remaining.max(0.0), 0.0));
+        }
+        let mode = ui
+            .add_enabled(
+                enabled && self.context.goal_loaded,
+                egui::Button::new(match self.controls.mode {
+                    WorkMode::Work => "Work ⌄",
+                    WorkMode::Plan => "Plan ⌄",
+                    WorkMode::Research => "Research ⌄",
+                    WorkMode::Goal => "Goal ⌄",
+                })
+                .frame(false)
+                .corner_radius(8),
+            )
+            .on_hover_text("Work, plan, research, or work toward a saved goal");
+        let mut selected = None;
+        egui::Popup::menu(&mode).show(|ui| {
+            for (mode, label) in [
+                (WorkMode::Work, "Work"),
+                (WorkMode::Plan, "Plan"),
+                (WorkMode::Research, "Research"),
+                (WorkMode::Goal, "Goal"),
+            ] {
+                if ui
+                    .selectable_label(self.controls.mode == mode, label)
+                    .clicked()
+                {
+                    selected = Some(mode);
+                    ui.close();
+                }
+            }
+        });
+        if let Some(mode) = selected {
+            self.select_mode(mode);
+        }
+    }
+    fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        app: &App,
+        selected: Option<NoteId>,
+    ) {
+        self.show_surface(ui, ctx, app, selected, false);
+    }
+    fn show_surface(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        app: &App,
+        selected: Option<NoteId>,
+        research: bool,
+    ) {
+        let title = self
+            .thread
+            .as_ref()
+            .and_then(|id| self.threads.iter().find(|t| &t.id == id))
+            .map(|t| t.title.as_str())
+            .unwrap_or("Codex")
+            .to_owned();
+        if !research {
+            ui.horizontal(|ui| {
+                let width = (ui.available_width() - 92.0).max(40.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(width, 28.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.add(egui::Label::new(egui::RichText::new(&title).size(18.0)).truncate())
+                            .on_hover_text(&title);
+                    },
+                );
+                if ui
+                    .add(
+                        egui::Button::new("Context")
+                            .selected(self.context.open)
+                            .corner_radius(6),
+                    )
+                    .on_hover_text("Show goal, plan, files and plugins")
+                    .clicked()
+                {
+                    self.context.open = !self.context.open;
+                }
+            });
+        }
+        if !research || self.busy() || self.history_loading {
+            ui.weak(&self.status);
+        }
+        if let Some(error) = &self.metadata_error {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!("Project metadata could not be saved: {error}"),
+            );
+            if ui.button("Retry saving project association").clicked() {
+                self.persist_project = true;
+            }
+        }
+        if self.adapter.is_some() || research || self.vault_write_enabled.is_some() {
+            ui.horizontal(|ui| {
+                if research {
+                    ui.label(egui::RichText::new(&title).small().color(theme::muted(ui)));
+                }
+                let more = theme::button(ui, theme::Icon::More, "Conversation actions", true);
+                egui::Popup::menu(&more).show(|ui| {
+                    ui.set_max_width(340.0);
+                    if let Some(allowed) = self.vault_write_enabled {
+                        ui.menu_button(
+                            if allowed {
+                                "Vault updates · Allowed"
+                            } else {
+                                "Vault updates · Read only"
+                            },
+                            |ui| {
+                                ui.set_max_width(320.0);
+                                if let Some(enabled) = agent_permission_controls(ui, app, allowed) {
+                                    self.vault_permission_requested = Some(enabled);
+                                }
+                            },
+                        );
+                        ui.separator();
+                    }
+                    if research {
+                        ui.weak(&title);
+                        if ui.button("Conversation context…").clicked() {
+                            self.context.open = !self.context.open;
+                            ui.close();
+                        }
+                    } else if ui
+                        .add_enabled(
+                            self.research_capture().current.is_some()
+                                && !self.busy()
+                                && !self.history_loading,
+                            egui::Button::new("Start research from discussion…"),
+                        )
+                        .clicked()
+                    {
+                        self.research_requested = true;
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.busy() && !self.history_loading && self.approvals.is_empty(),
+                            egui::Button::new("Clear displayed messages"),
+                        )
+                        .clicked()
+                    {
+                        self.messages.clear();
+                        self.markdown = Default::default();
+                        self.error = None;
+                        ui.close();
+                    }
+                });
+            });
+        }
         if let Some(error) = &self.error {
             ui.colored_label(egui::Color32::LIGHT_RED, error);
+        }
+        if self.history_cursor.is_some()
+            && ui
+                .add_enabled(
+                    !self.history_loading && !self.busy(),
+                    egui::Button::new("Earlier messages"),
+                )
+                .clicked()
+        {
+            self.history_loading = self.send_request(CodexRequest::LoadHistory {
+                cursor: self.history_cursor.clone(),
+            });
         }
         egui::ScrollArea::vertical()
             .id_salt("codex-transcript")
             .stick_to_bottom(true)
-            .max_height((ui.available_height() - 230.0).max(100.0))
+            .auto_shrink([false, false])
+            .max_height(
+                (ui.available_height()
+                    - self.composer_height
+                    - if self.context.goal.is_some() {
+                        44.0
+                    } else {
+                        0.0
+                    }
+                    - self.approvals.len() as f32 * 160.0)
+                    .max(100.0),
+            )
             .show(ui, |ui| {
-                for message in &self.messages {
-                    ui.strong(message.role);
-                    ui.add(egui::Label::new(&message.text).selectable(true).wrap());
-                    ui.separator();
+                for (index, message) in self.messages.iter().enumerate() {
+                    if let Some(activity) = &message.activity {
+                        let running = self.active_turn.is_some()
+                            && self.active_turn.as_deref()
+                                == message.key.as_ref().map(|(_, turn, _)| turn.as_str())
+                            && matches!(
+                                activity.status.as_str(),
+                                "inProgress" | "started" | "running"
+                            );
+                        let title = egui::RichText::new(&activity.title)
+                            .size(13.0)
+                            .color(theme::muted(ui));
+                        let header =
+                            egui::CollapsingHeader::new(title).id_salt(("activity", &message.key));
+                        let header = if running {
+                            header.icon(|ui, _, response| {
+                                egui::Spinner::new()
+                                    .size(12.0)
+                                    .color(theme::muted(ui))
+                                    .paint_at(ui, response.rect.shrink(3.0))
+                            })
+                        } else {
+                            header
+                        };
+                        header.show(ui, |ui| {
+                            ui.weak(&activity.status);
+                            egui::ScrollArea::both()
+                                .id_salt(("activity-details", &message.key))
+                                .max_height(200.0)
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&message.text)
+                                                .monospace()
+                                                .size(12.0),
+                                        )
+                                        .selectable(true),
+                                    );
+                                });
+                            if activity.truncated {
+                                ui.weak("Details truncated at 8 KiB.");
+                            }
+                        });
+                    } else if let Some(command) = &message.command {
+                        let symbol = if command.status == "inProgress" {
+                            "◌"
+                        } else if command.exit_code == Some(0) {
+                            "✓"
+                        } else {
+                            "·"
+                        };
+                        egui::CollapsingHeader::new(
+                            egui::RichText::new(format!("{symbol}  {}", command.command))
+                                .size(13.0)
+                                .color(theme::muted(ui)),
+                        )
+                        .id_salt(("command", &message.key))
+                        .show(ui, |ui| {
+                            ui.weak(format!(
+                                "{} · {}{}",
+                                command.cwd,
+                                command.status,
+                                command
+                                    .exit_code
+                                    .map(|c| format!(" · exit {c}"))
+                                    .unwrap_or_default()
+                            ));
+                            egui::ScrollArea::both()
+                                .id_salt(("command-output", &message.key))
+                                .max_height(240.0)
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&message.text).monospace(),
+                                        )
+                                        .selectable(true),
+                                    );
+                                });
+                            if command.truncated {
+                                ui.weak("Output truncated at 64 KiB.");
+                            }
+                        });
+                    } else if message.role == "You" {
+                        egui::Frame::new()
+                            .fill(ui.visuals().widgets.inactive.bg_fill)
+                            .corner_radius(14)
+                            .inner_margin(12)
+                            .show(ui, |ui| {
+                                ui.add(egui::Label::new(&message.text).selectable(true).wrap());
+                            });
+                    } else {
+                        self.markdown
+                            .show(ui, (&self.thread, &message.key, index), &message.text);
+                        let copy =
+                            theme::button(ui, theme::Icon::Copy, "Copy response Markdown", true);
+                        copy.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Button,
+                                true,
+                                "Copy response Markdown",
+                            )
+                        });
+                        if copy.on_hover_text("Copy response Markdown").clicked() {
+                            ui.ctx().copy_text(message.text.clone());
+                        }
+                        let candidates = crate::research_desktop::references(&message.text);
+                        if !candidates.is_empty()
+                            && ui
+                                .add(
+                                    egui::Button::new(format!("Sources · {}", candidates.len()))
+                                        .frame(false)
+                                        .small(),
+                                )
+                                .on_hover_text("Review references from this answer")
+                                .clicked()
+                        {
+                            self.collect_references = Some((
+                                message.text.clone(),
+                                message.key.as_ref().map(|(_, turn, _)| turn.clone()),
+                            ));
+                        }
+                    }
+                    ui.add_space(if message.command.is_some() || message.activity.is_some() {
+                        6.0
+                    } else {
+                        20.0
+                    });
+                }
+                self.plan_rows(ui);
+                if self.starting || self.active_turn.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().size(12.0));
+                        ui.weak(if self.starting {
+                            "Starting…"
+                        } else {
+                            "Working…"
+                        });
+                    });
                 }
             });
         let mut answer = None;
@@ -2325,63 +5191,295 @@ impl ConversationPanel {
                 }
             }
         }
-        ui.separator();
-        ui.add(
-            egui::TextEdit::multiline(&mut self.prompt)
-                .hint_text("Message Codex")
-                .desired_rows(4)
-                .desired_width(f32::INFINITY)
-                .char_limit(256 * 1024),
-        );
-        if self.prompt.len() > 256 * 1024 {
+        if let Some(action) = self.context.goal_banner(
+            ui,
+            self.ready
+                && self.context.goal_loaded
+                && self.context_goal_pending.is_none()
+                && !self.history_loading
+                && self.pending_thread.is_none(),
+        ) {
+            self.context_action(action);
+        }
+        let composer = egui::Frame::new()
+            .fill(ui.visuals().widgets.inactive.bg_fill)
+            .corner_radius(20)
+            .inner_margin(egui::Margin::symmetric(14, 12))
+            .show(ui, |ui| {
+                let can_edit_context = !self.busy();
+                ui.add_enabled_ui(can_edit_context, |ui| self.context.chips(ui));
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.prompt)
+                        .frame(false)
+                        .interactive(
+                            self.thread.is_some()
+                                && self.pending_thread.is_none()
+                                && self.pending_thread_action.is_none(),
+                        )
+                        .hint_text(if self.thread.is_some() {
+                            "Message Codex"
+                        } else {
+                            "Connect, then choose or create a thread"
+                        })
+                        .desired_rows(3)
+                        .desired_width(f32::INFINITY)
+                        .char_limit(256 * 1024),
+                );
+                let mut automatic_evidence=String::new();
+                if research && self.relevant_sources {
+                    if let Some(workspace)=self.research_workspace.and_then(|id|app.research_workspace(id)) {
+                        let stale=self.relevant_cache.as_ref().is_none_or(|(id,revision,query,_)|*id!=workspace.id || *revision!=workspace.revision || query!=&self.prompt);
+                        if stale { self.relevant_cache=Some((workspace.id,workspace.revision,self.prompt.clone(),crate::research_desktop::retrieve(workspace,&self.prompt,8))); }
+                        if let Some((_,_,_,passages))=&self.relevant_cache {
+                            if passages.is_empty(){ui.weak("No matching captured passages; no automatic evidence attached.");}
+                            else {
+                                automatic_evidence=format!("UNTRUSTED LOCAL EVIDENCE. Exact excerpts from included sources; lexical matches, not verification. {} of {} included sources matched, max 8 excerpts. Cite the supplied markers; other source text is omitted.\n{}",passages.iter().map(|p|p.source_id).collect::<std::collections::HashSet<_>>().len(),workspace.sources.iter().filter(|s|s.selected).count(),serde_json::to_string(passages).unwrap_or_default());
+                                ui.collapsing(format!("Evidence preview · {} passages",passages.len()),|ui| {
+                                    for passage in passages {ui.label(&passage.text);if ui.link(&passage.citation).clicked(){let (id,page)=crate::research::citation_locator(&passage.citation).unwrap();ui.ctx().data_mut(|d|d.insert_temp(egui::Id::new("research-open-citation"),page.map(|p|format!("source://{id}?page={p}")).unwrap_or_else(||format!("source://{id}"))));}}
+                                });
+                            }
+                        }
+                    }
+                }
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(action) = self.context.composer(
+                        ui,
+                        app,
+                        selected,
+                        self.ready && !self.busy() && !self.disconnecting,
+                    ) {
+                        self.context_action(action);
+                    }
+                    if research && self.research_workspace.is_some() {
+                        ui.checkbox(&mut self.relevant_sources,"Relevant evidence").on_hover_text("Automatically attach matching passages from included local sources for each question; inspect the preview before Send");
+                    }
+                    self.turn_pickers(ui);
+                    self.model_picker(ui);
+                    let turning = self.active_turn.is_some()
+                        || (self.starting && self.pending_thread.is_none());
+                    if turning {
+                        if ui
+                            .add_enabled(
+                                !self.disconnecting,
+                                egui::Button::new("■")
+                                    .corner_radius(16)
+                                    .min_size(egui::vec2(32.0, 32.0)),
+                            )
+                            .on_hover_text("Interrupt response")
+                            .clicked()
+                        {
+                            if self.send_request(CodexRequest::Interrupt) {
+                                self.status = "Interrupt requested…".into();
+                            }
+                        }
+                    } else {
+                        let can_send = self.ready
+                            && self.binding_durable
+                            && self.mode_consistent()
+                            && self
+                                .models
+                                .iter()
+                                .any(|m| Some(&m.model) == self.selected_model.as_ref())
+                            && !self.history_loading
+                            && !self.busy()
+                            && !self.disconnecting
+                            && !self.prompt.trim().is_empty()
+                            && self.prompt.len() + self.context.total_input_bytes() + automatic_evidence.len() <= 256 * 1024
+                            && self.context.skills_valid();
+                        if ui
+                            .add_enabled(
+                                can_send,
+                                egui::Button::new("↑")
+                                    .corner_radius(16)
+                                    .min_size(egui::vec2(32.0, 32.0)),
+                            )
+                            .on_hover_text("Send message")
+                            .clicked()
+                        {
+                            if self.bytes() + self.prompt.len() > Self::BYTE_LIMIT
+                                || self.messages.len() >= 256
+                            {
+                                self.limit_exceeded();
+                            } else {
+                                let request = CodexRequest::SendPromptWithControls {
+                                    text: self.prompt.clone(),
+                                    model: self.selected_model.clone(),
+                                    effort: self.selected_effort.clone(),
+                                    attachments: {
+                                        let mut attachments=self.context.draft.attachments.clone();
+                                        if !automatic_evidence.is_empty(){attachments.push(crate::codex::PromptAttachment {name:"Relevant local evidence".into(),text:automatic_evidence.clone()});}
+                                        attachments
+                                    },
+                                    skills: self.context.draft.skills.clone(),
+                                    controls: self.controls,
+                                };
+                                if self.send_request(request) {
+                                    self.context_submit_pending = true;
+                                    self.messages.push(ConversationMessage {
+                                        role: "You",
+                                        key: None,
+                                        text: std::mem::take(&mut self.prompt),
+                                        command: None,
+                                        activity: None,
+                                    });
+                                    self.starting = true;
+                                    self.status = "Starting turn…".into();
+                                    self.error = None;
+                                }
+                            }
+                        }
+                    }
+                });
+            });
+        self.composer_height = composer.response.rect.height() + ui.spacing().item_spacing.y;
+        if self.prompt.len() + self.context.total_input_bytes() > 256 * 1024 {
             ui.colored_label(
                 egui::Color32::YELLOW,
-                "Prompt exceeds 256 KiB; shorten it before sending.",
+                "Message and attached context exceed 256 KiB; shorten or detach before sending.",
             );
         }
-        ui.horizontal_wrapped(|ui| {
-            let can_send = self.ready
-                && !self.busy()
-                && !self.disconnecting
-                && !self.prompt.trim().is_empty()
-                && self.prompt.len() <= 256 * 1024;
-            if ui
-                .add_enabled(can_send, egui::Button::new("Send"))
-                .clicked()
-            {
-                if self.bytes() + self.prompt.len() > Self::BYTE_LIMIT || self.messages.len() >= 256
-                {
-                    self.limit_exceeded();
-                } else if let Some(adapter) = &self.adapter {
-                    match adapter.try_send(CodexRequest::SendPrompt(self.prompt.clone())) {
-                        Ok(()) => {
-                            self.messages.push(ConversationMessage {
-                                role: "You",
-                                key: None,
-                                text: std::mem::take(&mut self.prompt),
-                            });
-                            self.starting = true;
-                            self.status = "Starting turn…".into();
-                            self.error = None;
-                        }
-                        Err(error) => self.error = Some(error),
-                    }
-                }
-            }
-            if ui
-                .add_enabled(
-                    self.busy() && !self.disconnecting,
-                    egui::Button::new("Interrupt"),
-                )
-                .clicked()
-            {
-                if let Some(adapter) = &self.adapter {
-                    match adapter.try_send(CodexRequest::Interrupt) {
-                        Ok(()) => self.status = "Interrupt requested…".into(),
-                        Err(error) => self.error = Some(error),
-                    }
-                }
-            }
-        });
+        if let Some(action) = self.context.dialogs(
+            ctx,
+            self.ready && !self.busy() && self.context_goal_pending.is_none(),
+        ) {
+            self.context_action(action);
+        }
+        self.thread_action_modal(ctx);
     }
+}
+
+/// Developer-only native preview with deterministic content and no agent runtime.
+#[cfg(all(target_os = "linux", feature = "codex", debug_assertions))]
+pub fn run_transcript_preview() -> eframe::Result {
+    struct Preview {
+        app: App,
+        panel: ConversationPanel,
+    }
+    impl eframe::App for Preview {
+        fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+            if self.panel.context.open {
+                egui::SidePanel::right("preview-context")
+                    .default_width(300.0)
+                    .show(ctx, |ui| {
+                        let _ = self
+                            .panel
+                            .context
+                            .panel(ui, ctx, &self.panel.config.cwd, false);
+                    });
+            }
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::central_panel(&ctx.style())
+                        .inner_margin(egui::Margin::symmetric(32, 20)),
+                )
+                .show(ctx, |ui| {
+                    self.panel.show(ui, ctx, &self.app, None);
+                });
+        }
+    }
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_inner_size([1000.0, 850.0]),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "Tanglewood · conversation preview",
+        options,
+        Box::new(|cc| {
+            theme::install(&cc.egui_ctx);
+            theme::palette(&cc.egui_ctx);
+            let mut panel = ConversationPanel::new(CodexConfig {
+                executable: "codex".into(),
+                cwd: std::env::temp_dir(),
+                mcp_bridge: "unused".into(),
+                socket: "unused".into(),
+                resume_thread: None,
+                project: None,
+            });
+            panel.thread = Some("local-preview".into());
+            panel.status = "Local presentation fixture · no agent connected".into();
+            panel.messages.push(ConversationMessage {
+                role: "You",
+                key: None,
+                text: "Show a readable research report with code, sources and a checklist.".into(),
+                command: None,
+                activity: None,
+            });
+            panel.activity_card(
+                "local-preview".into(),
+                "fixture".into(),
+                crate::codex::Activity {
+                    item: "sources".into(),
+                    kind: "webSearch".into(),
+                    title: "Compared the reference sources".into(),
+                    status: "completed".into(),
+                    details: "Local example activity; no search was performed.".into(),
+                    truncated: false,
+                },
+            );
+            panel.messages.push(ConversationMessage {
+                role: "Codex",
+                key: Some(("local-preview".into(), "fixture".into(), "reply".into())),
+                text: include_str!("../docs/fixtures/mvp-2/codex-response.md").into(),
+                command: None,
+                activity: None,
+            });
+            panel.context.plan = vec![
+                crate::codex::PlanStep {
+                    text: "Compare sources".into(),
+                    status: "completed".into(),
+                },
+                crate::codex::PlanStep {
+                    text: "Review the report".into(),
+                    status: "pending".into(),
+                },
+            ];
+            Ok(Box::new(Preview {
+                app: App::new(),
+                panel,
+            }))
+        }),
+    )
+}
+
+/// Developer-only research layout fixture using a disposable vault and no agent runtime.
+#[cfg(all(target_os = "linux", feature = "codex", debug_assertions))]
+pub fn run_research_preview(vault: std::path::PathBuf) -> eframe::Result {
+    let mut ui = TanglewoodUi::new(App::open(&vault).expect("open disposable preview vault"));
+    ui.sidebar_view = SidebarView::Research;
+    let mut panel = ConversationPanel::new(CodexConfig {
+        executable: "codex".into(),
+        cwd: vault,
+        mcp_bridge: "unused".into(),
+        socket: "unused".into(),
+        resume_thread: None,
+        project: None,
+    });
+    panel.thread = Some("local-research-preview".into());
+    panel.messages.push(ConversationMessage {
+        role: "You",
+        key: None,
+        text: "How should we compare the collected material before writing a report?".into(),
+        command: None,
+        activity: None,
+    });
+    panel.messages.push(ConversationMessage {
+        role: "Codex", key: None,
+        text: "## Start with the question\n\nCompare what each source contributes to the investigation, then separate documented observations from proposed ideas.\n\n- Identify the claims supported by the collected material.\n- Keep conflicting evidence and limitations visible.\n- Note the questions we still need to investigate.\n\nWhen you are ready, we can turn the discussion and selected sources into a report.\n\n*Local layout fixture; no research or agent call was performed.*".into(),
+        command: None, activity: None,
+    });
+    if let Some(workspace) = ui.app.research_workspaces().first() {
+        if let Some(source) = workspace.sources.first() {
+            panel.messages.push(ConversationMessage {role:"Codex",key:None,text:format!("### Retained evidence\n\nOpen the retained source [source:{} page:1] to inspect the original page.\n\nReference collection fixture: [First reference](https://example.org/research/one), [Second reference](https://example.org/research/two). These are interface test references, not research findings.",source.id),command:None,activity:None});
+        }
+    }
+    ui.conversation = Some(panel);
+    eframe::run_native(
+        "Tanglewood · research preview",
+        eframe::NativeOptions {
+            viewport: egui::ViewportBuilder::default().with_inner_size([1360.0, 920.0]),
+            ..Default::default()
+        },
+        Box::new(move |_| Ok(Box::new(ui))),
+    )
 }

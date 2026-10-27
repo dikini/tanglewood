@@ -6,7 +6,10 @@ use crate::store::{
 };
 use crate::{
     commands::{Caller, Command, CommandError, CommandResult, ImportDestination},
-    notes::{NoteId, NoteRecord, NoteView, Revision, SaveState, TextEdit, edited_text, valid_path},
+    notes::{
+        CodexProjectBinding, NoteId, NoteRecord, NoteView, Revision, SaveState, TextEdit,
+        edited_text, valid_path,
+    },
 };
 use bevy_ecs::prelude::{Entity, World};
 use std::collections::{HashMap, VecDeque};
@@ -32,6 +35,20 @@ pub struct SyncStatus {
     pub error: Option<String>,
 }
 enum PendingIo {
+    Research(Uuid),
+    ResearchAsset {
+        workspace: Uuid,
+        expected: Revision,
+        title: String,
+        thread: Option<crate::research::ThreadRef>,
+        round_id: Option<Uuid>,
+        source_id: Option<Uuid>,
+        ocr: bool,
+        role: crate::research::ArtifactRole,
+        source_ids: Vec<Uuid>,
+    },
+    CodexProject,
+    AutomationPermission,
     #[cfg(feature = "lan")]
     Lan,
     Configure,
@@ -67,9 +84,65 @@ struct JoinCommit {
     replica: crate::sync::Replica,
     notes: Vec<NoteRecord>,
 }
+#[derive(Clone)]
+struct PaperReceipt {
+    ocr: bool,
+    source_id: Uuid,
+    pages: Vec<crate::research::SourcePage>,
+    extraction_error: Option<String>,
+}
+impl PaperReceipt {
+    fn attach(
+        &self,
+        workspace: &mut crate::research::ResearchWorkspace,
+        artifact: &crate::research::ResearchArtifact,
+    ) -> Result<(), CommandError> {
+        let source = workspace
+            .sources
+            .iter_mut()
+            .find(|s| s.id == self.source_id)
+            .ok_or(CommandError::NotFound)?;
+        if source.paper.is_some() && !self.ocr {
+            return Err(CommandError::InvalidResearch(
+                "source already has a retained paper".into(),
+            ));
+        }
+        // An unsuccessful OCR attempt must never replace already-readable evidence.
+        if self.ocr && self.extraction_error.is_some() && crate::research::source_has_text(source) {
+            return Ok(());
+        }
+        source.paper = Some(crate::research::PaperContent {
+            artifact_id: artifact.id,
+            extraction_error: self.extraction_error.clone(),
+            ocr: self.ocr,
+        });
+        source.kind = if artifact.kind == crate::research::ArtifactKind::Pdf {
+            crate::research::SourceKind::Pdf
+        } else {
+            crate::research::SourceKind::Text
+        };
+        source.pages = self.pages.clone();
+        Ok(())
+    }
+}
 /// The application thread exclusively owns the ECS World.
 #[derive(Default)]
 pub struct App {
+    automation_write_preference: Option<bool>,
+    automation_permission_dirty: bool,
+    automation_permission_error: Option<String>,
+    research: HashMap<Uuid, crate::research::ResearchWorkspace>,
+    research_error: Option<String>,
+    research_requests: HashMap<Uuid, Uuid>,
+    research_assets: Option<crate::research_assets::ResearchAssetWorker>,
+    research_receipts: HashMap<Uuid, (Uuid, crate::research::ResearchArtifact)>,
+    research_paper_receipts: HashMap<Uuid, PaperReceipt>,
+    acquisition_armed: std::collections::HashSet<Uuid>,
+    acquisition_cancelled: std::collections::HashSet<Uuid>,
+    acquisition_requests: HashMap<Uuid, (Uuid, Uuid)>,
+    codex_project: Option<CodexProjectBinding>,
+    codex_project_persisted: Option<CodexProjectBinding>,
+    codex_project_error: Option<String>,
     #[cfg(feature = "lan")]
     lan_state: crate::lan_owner::LanState,
     #[cfg(feature = "lan")]
@@ -122,6 +195,18 @@ impl App {
         let history = state.history.clone();
         let mut app = Self {
             store: Some(store),
+            automation_write_preference: state.automation_write_enabled,
+            research_assets: Some(
+                crate::research_assets::ResearchAssetWorker::open(directory)
+                    .map_err(StoreError::Storage)?,
+            ),
+            research: state
+                .research
+                .into_iter()
+                .map(|workspace| (workspace.id, workspace))
+                .collect(),
+            codex_project: state.codex_project.clone(),
+            codex_project_persisted: state.codex_project,
             vault_directory: Some(directory.to_path_buf()),
             #[cfg(feature = "lan")]
             lan_state: crate::lan_owner::LanState::with_preparation(state.preparation),
@@ -637,6 +722,80 @@ impl App {
             self.control_inflight = self.control_inflight.saturating_sub(1);
         }
         match event {
+            StoreEvent::AutomationWriteSaved {
+                request_id,
+                enabled,
+                result,
+            } => {
+                self.io_pending.remove(&request_id);
+                match result {
+                    Ok(()) => {
+                        self.automation_write_preference = Some(enabled);
+                        self.automation_permission_dirty = false;
+                        self.automation_permission_error = None;
+                        self.io_status.insert(request_id, IoStatus::Completed);
+                    }
+                    Err(error) => {
+                        self.automation_write_preference = Some(false);
+                        self.automation_permission_error = Some(error.clone());
+                        self.io_status.insert(request_id, IoStatus::Failed(error));
+                    }
+                }
+            }
+            StoreEvent::ResearchSaved {
+                request_id,
+                workspace,
+                result,
+            } => {
+                self.io_pending.remove(&request_id);
+                self.research_requests.insert(request_id, workspace.id);
+                match result {
+                    Ok(()) => {
+                        self.research_receipts.retain(|_, (id, artifact)| {
+                            *id != workspace.id
+                                || !workspace.artifacts.iter().any(|a| a.id == artifact.id)
+                        });
+                        self.research_paper_receipts
+                            .retain(|request, _| self.research_receipts.contains_key(request));
+                        self.acquisition_requests.retain(|_, (id, job)| {
+                            *id != workspace.id
+                                || !workspace.acquisitions.iter().any(|j| {
+                                    j.id == *job
+                                        && matches!(
+                                            j.status,
+                                            crate::research::AcquisitionStatus::Ready
+                                                | crate::research::AcquisitionStatus::Failed
+                                                | crate::research::AcquisitionStatus::Cancelled
+                                        )
+                                })
+                        });
+                        self.research.insert(workspace.id, workspace);
+                        self.io_status.insert(request_id, IoStatus::Completed);
+                    }
+                    Err(error) => {
+                        self.research_error = Some(error.clone());
+                        self.io_status.insert(request_id, IoStatus::Failed(error));
+                    }
+                }
+            }
+            StoreEvent::CodexProjectSaved {
+                request_id,
+                project,
+                result,
+            } => {
+                self.io_pending.remove(&request_id);
+                match result {
+                    Ok(()) => {
+                        self.codex_project_persisted = Some(project);
+                        self.codex_project_error = None;
+                        self.io_status.insert(request_id, IoStatus::Completed);
+                    }
+                    Err(error) => {
+                        self.codex_project_error = Some(error.clone());
+                        self.io_status.insert(request_id, IoStatus::Failed(error));
+                    }
+                }
+            }
             #[cfg(feature = "lan")]
             StoreEvent::Prepared {
                 request_id,
@@ -1079,7 +1238,14 @@ impl App {
                     break;
                 }
                 Err(TrySendError::Disconnected(request)) => {
-                    self.storage_jobs.push_front(request);
+                    if let StoreRequest::SetAutomationWriteEnabled { request_id, .. } = request {
+                        let error = "persistence worker disconnected".to_owned();
+                        self.io_pending.remove(&request_id);
+                        self.automation_permission_error = Some(error.clone());
+                        self.io_status.insert(request_id, IoStatus::Failed(error));
+                    } else {
+                        self.storage_jobs.push_front(request);
+                    }
                     break;
                 }
             }
@@ -1234,6 +1400,30 @@ impl App {
             .insert(ParsedDocument(document.clone()));
         Ok(document)
     }
+    /// Effective permission; absence preserves the startup compatibility default.
+    /// Grants become visible only after durable acknowledgement.
+    pub fn automation_write_preference(&self) -> Option<bool> {
+        self.automation_write_preference
+    }
+    pub fn automation_permission_pending(&self) -> bool {
+        self.automation_permission_dirty
+    }
+    pub fn automation_permission_error(&self) -> Option<&str> {
+        self.automation_permission_error.as_deref()
+    }
+    pub fn codex_project(&self) -> Option<&CodexProjectBinding> {
+        self.codex_project.as_ref()
+    }
+    pub fn codex_project_pending(&self) -> bool {
+        self.codex_project != self.codex_project_persisted
+            || self
+                .io_pending
+                .values()
+                .any(|job| matches!(job, PendingIo::CodexProject))
+    }
+    pub fn codex_project_error(&self) -> Option<&str> {
+        self.codex_project_error.as_deref()
+    }
     pub fn vault_directory(&self) -> Option<&Path> {
         self.vault_directory.as_deref()
     }
@@ -1258,6 +1448,8 @@ impl App {
         #[cfg(feature = "lan")]
         self.tick_lan();
         self.tick_files();
+        self.tick_research_assets();
+        self.tick_research_acquisitions();
         #[cfg(feature = "sync")]
         {
             self.tick_migration();
@@ -1357,7 +1549,24 @@ impl App {
             if let Some(error) = &self.history_error {
                 return Err(StoreError::Storage(error.clone()));
             }
-            let source_idle = self.pending.is_empty() && self.inflight.is_empty();
+            if let Some(error) = &self.automation_permission_error {
+                return Err(StoreError::Storage(error.clone()));
+            }
+            if let Some(error) = &self.codex_project_error {
+                return Err(StoreError::Storage(error.clone()));
+            }
+            if let Some(error) = &self.research_error {
+                return Err(StoreError::Storage(error.clone()));
+            }
+            let source_idle = !self.io_pending.values().any(|pending| {
+                matches!(
+                    pending,
+                    PendingIo::Research(_) | PendingIo::ResearchAsset { .. }
+                )
+            }) && self.pending.is_empty()
+                && self.inflight.is_empty()
+                && !self.codex_project_pending()
+                && !self.automation_permission_pending();
             #[cfg(feature = "sync")]
             let source_idle = source_idle
                 && self.migration.is_none()
@@ -1383,6 +1592,7 @@ impl App {
         #[cfg(feature = "lan")]
         self.lan_state.pause();
         self.files.take();
+        self.research_assets.take();
         self.store.take();
         Ok(())
     }
@@ -1403,6 +1613,7 @@ impl App {
                 .map(|(id, _)| *id)
             {
                 self.io_status.remove(&id);
+                self.research_requests.remove(&id);
             }
         }
         let request_id = Uuid::new_v4();
@@ -1419,6 +1630,32 @@ impl App {
         }
         if !command.descriptor().allowed(caller) {
             return Err(CommandError::Unauthorized);
+        }
+        if caller != Caller::Local {
+            if let Command::Research(research) = &command {
+                let target = match research {
+                    crate::research::ResearchCommand::RetryAcquisition { id, job_id, .. } => {
+                        Some((*id, vec![*job_id]))
+                    }
+                    crate::research::ResearchCommand::RetryAcquisitions { id, job_ids, .. } => {
+                        Some((*id, job_ids.clone()))
+                    }
+                    _ => None,
+                };
+                if let Some((id, jobs)) = target {
+                    if self.research.get(&id).is_some_and(|w| {
+                        w.acquisitions.iter().any(|j| {
+                            jobs.contains(&j.id)
+                                && matches!(
+                                    j.input,
+                                    crate::research::ArtifactInput::LocalFile { .. }
+                                )
+                        })
+                    }) {
+                        return Err(CommandError::Unauthorized);
+                    }
+                }
+            }
         }
         #[cfg(feature = "lan")]
         {
@@ -1457,6 +1694,75 @@ impl App {
             return Err(CommandError::Busy);
         }
         match command {
+            Command::SetAutomationWriteEnabled { enabled } => {
+                if self
+                    .io_pending
+                    .values()
+                    .any(|job| matches!(job, PendingIo::AutomationPermission))
+                {
+                    return Err(CommandError::Busy);
+                }
+                let request_id = if self.store.is_some() {
+                    self.accept_io()?
+                } else {
+                    Uuid::new_v4()
+                };
+                self.automation_permission_error = None;
+                if self.store.is_some() {
+                    // Disable legacy startup grants as soon as any preference is requested.
+                    self.automation_write_preference = Some(false);
+                    self.automation_permission_dirty = true;
+                    self.io_pending
+                        .insert(request_id, PendingIo::AutomationPermission);
+                    self.storage_jobs
+                        .push_back(StoreRequest::SetAutomationWriteEnabled {
+                            request_id,
+                            enabled,
+                        });
+                } else {
+                    self.automation_write_preference = Some(enabled);
+                    self.io_status.insert(request_id, IoStatus::Completed);
+                }
+                Ok(CommandResult::Accepted { request_id })
+            }
+            Command::Research(command) => self.execute_research(command),
+            Command::GetCodexProject => Ok(CommandResult::CodexProject(self.codex_project.clone())),
+            Command::SetCodexProject { expected, project } => {
+                if self
+                    .io_pending
+                    .values()
+                    .any(|job| matches!(job, PendingIo::CodexProject))
+                {
+                    return Err(CommandError::Busy);
+                }
+                if self.codex_project != expected {
+                    return Err(CommandError::CodexProjectChanged);
+                }
+                if !project.valid() {
+                    return Err(CommandError::InvalidCodexProject(
+                        "name, id and creation key must be nonempty bounded text".into(),
+                    ));
+                }
+                if let Some(current) = &self.codex_project {
+                    if current.creation_key != project.creation_key
+                        || (current.project_id.is_some()
+                            && current.project_id != project.project_id)
+                    {
+                        return Err(CommandError::InvalidCodexProject(
+                            "project identity cannot change".into(),
+                        ));
+                    }
+                }
+                let request_id = self.accept_io()?;
+                self.codex_project = Some(project.clone());
+                self.codex_project_error = None;
+                self.io_pending.insert(request_id, PendingIo::CodexProject);
+                self.storage_jobs.push_back(StoreRequest::SetCodexProject {
+                    request_id,
+                    project,
+                });
+                Ok(CommandResult::Accepted { request_id })
+            }
             Command::EnableSync => {
                 #[cfg(feature = "sync")]
                 {
@@ -1712,6 +2018,1187 @@ impl App {
     }
 }
 
+impl App {
+    pub fn research_workspaces(&self) -> Vec<crate::research::ResearchWorkspace> {
+        let mut workspaces: Vec<_> = self.research.values().cloned().collect();
+        workspaces.sort_by(|a, b| a.title.cmp(&b.title).then(a.id.cmp(&b.id)));
+        workspaces
+    }
+    pub fn research_workspace(&self, id: Uuid) -> Option<&crate::research::ResearchWorkspace> {
+        self.research.get(&id)
+    }
+    pub fn research_pending(&self, id: Uuid) -> bool {
+        self.io_pending.values().any(|pending| match pending {
+            PendingIo::Research(workspace) | PendingIo::ResearchAsset { workspace, .. } => {
+                *workspace == id
+            }
+            _ => false,
+        })
+    }
+    /// The exact workspace acknowledged for this request; inspect io_status for success.
+    pub fn research_created_workspace(&self, request_id: Uuid) -> Option<Uuid> {
+        self.research_requests.get(&request_id).copied()
+    }
+    /// A retained result remains available if metadata registration failed.
+    pub fn research_artifact_receipt(
+        &self,
+        request_id: Uuid,
+    ) -> Option<&crate::research::ResearchArtifact> {
+        self.research_receipts
+            .get(&request_id)
+            .map(|(_, artifact)| artifact)
+    }
+    pub fn research_artifact_receipts(
+        &self,
+    ) -> Vec<(Uuid, Uuid, crate::research::ResearchArtifact)> {
+        self.research_receipts
+            .iter()
+            .map(|(request, (workspace, artifact))| (*request, *workspace, artifact.clone()))
+            .collect()
+    }
+    pub fn cancel_research_artifact(&self, request_id: Uuid) {
+        if matches!(
+            self.io_pending.get(&request_id),
+            Some(PendingIo::ResearchAsset { .. })
+        ) {
+            if let Some(worker) = &self.research_assets {
+                worker.cancel(request_id);
+            }
+        }
+    }
+    fn append_imports(
+        workspace: &mut crate::research::ResearchWorkspace,
+        paths: Vec<String>,
+    ) -> Result<(), CommandError> {
+        use crate::research::{ResearchSource, SourceKind, SourceMetadata, SourceOrigin};
+        if paths.len() > 64 {
+            return Err(CommandError::InvalidResearch(
+                "choose at most 64 files".into(),
+            ));
+        }
+        for path in paths {
+            if path.is_empty() || path.len() > 16384 {
+                return Err(CommandError::InvalidPath);
+            }
+            let source_id = Uuid::new_v4();
+            let title = std::path::Path::new(&path)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            if workspace
+                .sources
+                .iter()
+                .any(|s| s.metadata.origin_label.as_deref() == Some(&path))
+            {
+                continue;
+            }
+            workspace.sources.push(ResearchSource {
+                id: source_id,
+                title,
+                kind: SourceKind::Text,
+                origin: SourceOrigin::Imported,
+                metadata: SourceMetadata {
+                    origin_label: Some(path.clone()),
+                    ..Default::default()
+                },
+                pages: vec![],
+                selected: true,
+                human_assessment: None,
+                agent_assessment: None,
+                paper: None,
+            });
+            workspace.acquisitions.push(crate::research::Acquisition {
+                id: Uuid::new_v4(),
+                source_id,
+                input: crate::research::ArtifactInput::LocalFile { path },
+                ocr: false,
+                status: crate::research::AcquisitionStatus::Queued,
+                error: None,
+            });
+        }
+        Ok(())
+    }
+    /// Validated managed originals only; no arbitrary user-supplied viewer path.
+    pub fn research_asset_path(&self, relative: &str) -> Result<std::path::PathBuf, CommandError> {
+        let vault = self
+            .vault_directory
+            .as_ref()
+            .ok_or(CommandError::NotFound)?;
+        if !relative.starts_with("research-assets/")
+            || std::path::Path::new(relative).components().count() != 2
+            || !std::path::Path::new(relative)
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err(CommandError::InvalidPath);
+        }
+        let path = vault
+            .join(relative)
+            .canonicalize()
+            .map_err(|_| CommandError::NotFound)?;
+        let directory = vault
+            .join("research-assets")
+            .canonicalize()
+            .map_err(|_| CommandError::NotFound)?;
+        if path.parent() != Some(directory.as_path()) || !path.is_file() {
+            return Err(CommandError::InvalidPath);
+        }
+        Ok(path)
+    }
+    fn stage_research(
+        &mut self,
+        mut workspace: crate::research::ResearchWorkspace,
+    ) -> Result<Uuid, CommandError> {
+        crate::research::validate(&workspace)?;
+        let expected = workspace.revision;
+        workspace.revision = Revision::fresh();
+        self.research_error = None;
+        let request_id = self.accept_io()?;
+        self.io_pending
+            .insert(request_id, PendingIo::Research(workspace.id));
+        self.storage_jobs.push_back(StoreRequest::SaveResearch {
+            request_id,
+            expected: Some(expected),
+            workspace,
+        });
+        Ok(request_id)
+    }
+    pub fn research_jobs_active(&self) -> bool {
+        self.research_error.is_none()
+            && (self.research.values().any(|w| {
+                w.acquisitions.iter().any(|j| {
+                    matches!(
+                        j.status,
+                        crate::research::AcquisitionStatus::Queued
+                            | crate::research::AcquisitionStatus::Running
+                    )
+                })
+            }) || self
+                .io_pending
+                .values()
+                .any(|p| matches!(p, PendingIo::Research(_) | PendingIo::ResearchAsset { .. })))
+    }
+    pub fn research_error(&self) -> Option<&str> {
+        self.research_error.as_deref()
+    }
+    fn tick_research_acquisitions(&mut self) {
+        if self.research_error.is_some() {
+            return;
+        }
+        use crate::research::{AcquisitionStatus as S, ResearchCommand as R};
+        let workspaces = self.research_workspaces();
+        for mut workspace in workspaces {
+            if self.research_pending(workspace.id) {
+                continue;
+            }
+            // Finish failed transient requests durably before retrying another job.
+            let failed = self
+                .acquisition_requests
+                .iter()
+                .find_map(|(request, (id, job))| {
+                    if *id == workspace.id {
+                        match self.io_status.get(request) {
+                            Some(IoStatus::Failed(error)) => Some((*request, *job, error.clone())),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                });
+            if let Some((request, job_id, error)) = failed {
+                if let Some(job) = workspace.acquisitions.iter_mut().find(|j| j.id == job_id) {
+                    job.status = if self.acquisition_cancelled.remove(&job_id) {
+                        S::Cancelled
+                    } else {
+                        S::Failed
+                    };
+                    job.error = Some(error.chars().take(4000).collect());
+                }
+                if self.stage_research(workspace).is_ok() {
+                    self.acquisition_requests.remove(&request);
+                }
+                continue;
+            }
+            let Some(job) = workspace
+                .acquisitions
+                .iter()
+                .find(|j| matches!(j.status, S::Running | S::Queued))
+                .cloned()
+            else {
+                continue;
+            };
+            if job.status == S::Queued {
+                workspace
+                    .acquisitions
+                    .iter_mut()
+                    .find(|j| j.id == job.id)
+                    .unwrap()
+                    .status = S::Running;
+                if self.stage_research(workspace).is_ok() {
+                    self.acquisition_armed.insert(job.id);
+                }
+            } else if self.acquisition_armed.remove(&job.id) {
+                let result = self.execute_research(R::SavePaper {
+                    id: workspace.id,
+                    expected: workspace.revision,
+                    source_id: job.source_id,
+                    input: job.input,
+                    ocr: job.ocr,
+                });
+                match result {
+                    Ok(CommandResult::Accepted { request_id }) => {
+                        self.acquisition_requests
+                            .insert(request_id, (workspace.id, job.id));
+                    }
+                    Err(error) => {
+                        workspace
+                            .acquisitions
+                            .iter_mut()
+                            .find(|j| j.id == job.id)
+                            .unwrap()
+                            .status = S::Failed;
+                        workspace
+                            .acquisitions
+                            .iter_mut()
+                            .find(|j| j.id == job.id)
+                            .unwrap()
+                            .error = Some(error.to_string());
+                        let _ = self.stage_research(workspace);
+                    }
+                    _ => {}
+                }
+            } else {
+                // A previous process stopped after arming a worker; do not silently rerun network I/O.
+                workspace
+                    .acquisitions
+                    .iter_mut()
+                    .find(|j| j.id == job.id)
+                    .unwrap()
+                    .status = S::Failed;
+                workspace
+                    .acquisitions
+                    .iter_mut()
+                    .find(|j| j.id == job.id)
+                    .unwrap()
+                    .error = Some("Interrupted before completion; retry this source".into());
+                let _ = self.stage_research(workspace);
+            }
+        }
+    }
+    fn tick_research_assets(&mut self) {
+        for _ in 0..16 {
+            let Some(completion) = self
+                .research_assets
+                .as_ref()
+                .and_then(crate::research_assets::ResearchAssetWorker::try_recv)
+            else {
+                break;
+            };
+            let request_id = completion.request_id;
+            let Some(PendingIo::ResearchAsset {
+                workspace: id,
+                expected,
+                title,
+                thread,
+                round_id,
+                source_id,
+                ocr,
+                role,
+                source_ids,
+            }) = self.io_pending.remove(&request_id)
+            else {
+                continue;
+            };
+            let result = completion
+                .result
+                .map_err(CommandError::Unavailable)
+                .and_then(|asset| {
+                    let artifact = crate::research::ResearchArtifact {
+                        id: Uuid::new_v4(),
+                        title,
+                        kind: asset.kind,
+                        url: asset.url,
+                        final_url: asset.final_url,
+                        managed_path: asset.managed_path,
+                        markdown: asset.markdown,
+                        captured_at: asset.captured_at,
+                        thread,
+                        round_id,
+                        role,
+                        source_ids,
+                    };
+                    self.research_receipts
+                        .insert(request_id, (id, artifact.clone()));
+                    if let Some(source_id) = source_id {
+                        self.research_paper_receipts.insert(
+                            request_id,
+                            PaperReceipt {
+                                ocr,
+                                source_id,
+                                pages: asset.pages.unwrap_or_default(),
+                                extraction_error: asset.extraction_error,
+                            },
+                        );
+                    }
+                    let mut workspace = self
+                        .research
+                        .get(&id)
+                        .ok_or(CommandError::NotFound)?
+                        .clone();
+                    if workspace.revision != expected {
+                        return Err(CommandError::StaleRevision {
+                            current: workspace.revision,
+                        });
+                    }
+                    crate::research::validate_provenance(
+                        &workspace,
+                        artifact.thread.as_ref(),
+                        artifact.round_id,
+                    )?;
+                    if let Some(paper) = self.research_paper_receipts.get(&request_id) {
+                        paper.attach(&mut workspace, &artifact)?;
+                    }
+                    if let Some((_, job_id)) = self.acquisition_requests.get(&request_id) {
+                        if let Some(job) =
+                            workspace.acquisitions.iter_mut().find(|j| j.id == *job_id)
+                        {
+                            job.status = if ocr
+                                && self
+                                    .research_paper_receipts
+                                    .get(&request_id)
+                                    .is_some_and(|p| p.extraction_error.is_some())
+                            {
+                                crate::research::AcquisitionStatus::Failed
+                            } else {
+                                crate::research::AcquisitionStatus::Ready
+                            };
+                            job.error = self
+                                .research_paper_receipts
+                                .get(&request_id)
+                                .and_then(|paper| paper.extraction_error.clone());
+                        }
+                    }
+                    workspace.artifacts.push(artifact);
+                    crate::research::validate(&workspace)?;
+                    workspace.revision = Revision::fresh();
+                    self.io_pending.insert(request_id, PendingIo::Research(id));
+                    self.storage_jobs.push_back(StoreRequest::SaveResearch {
+                        request_id,
+                        expected: Some(expected),
+                        workspace,
+                    });
+                    Ok(())
+                });
+            if let Err(error) = result {
+                let error = error.to_string();
+                if !self.acquisition_requests.contains_key(&request_id) {
+                    self.research_error = Some(error.clone());
+                }
+                self.io_status.insert(request_id, IoStatus::Failed(error));
+            }
+        }
+    }
+    fn execute_research(
+        &mut self,
+        command: crate::research::ResearchCommand,
+    ) -> Result<CommandResult, CommandError> {
+        use crate::research::{
+            ResearchCommand as R, ResearchResult, ResearchSource, ResearchWorkspace, SourceKind,
+            SourceMetadata, SourceOrigin, SourcePage,
+        };
+        if let R::CancelAcquisition {
+            id,
+            expected,
+            job_id,
+        } = &command
+        {
+            let current = self.research.get(id).ok_or(CommandError::NotFound)?;
+            if current.revision != *expected {
+                return Err(CommandError::StaleRevision {
+                    current: current.revision,
+                });
+            }
+            if let Some(request) =
+                self.acquisition_requests
+                    .iter()
+                    .find_map(|(request, (workspace, job))| {
+                        (*workspace == *id && *job == *job_id).then_some(*request)
+                    })
+            {
+                if matches!(
+                    self.io_pending.get(&request),
+                    Some(PendingIo::ResearchAsset { .. })
+                ) {
+                    self.acquisition_cancelled.insert(*job_id);
+                    self.cancel_research_artifact(request);
+                    return Ok(CommandResult::Accepted {
+                        request_id: request,
+                    });
+                }
+            }
+        }
+        let target = command.target();
+        let mut workspace = match &command {
+            R::List => {
+                return Ok(CommandResult::Research(ResearchResult::Workspaces(
+                    self.research_workspaces(),
+                )));
+            }
+            R::FindPassages { id, query, limit } => {
+                return Ok(CommandResult::Research(ResearchResult::Passages(
+                    crate::research_desktop::retrieve(
+                        self.research.get(id).ok_or(CommandError::NotFound)?,
+                        query,
+                        *limit,
+                    ),
+                )));
+            }
+            R::EvidenceGaps { id } => {
+                return Ok(CommandResult::Research(ResearchResult::Suggestions(
+                    crate::research_desktop::evidence_gaps(
+                        self.research.get(id).ok_or(CommandError::NotFound)?,
+                    ),
+                )));
+            }
+            R::Read { id } => {
+                return self
+                    .research
+                    .get(id)
+                    .cloned()
+                    .map(|workspace| CommandResult::Research(ResearchResult::Workspace(workspace)))
+                    .ok_or(CommandError::NotFound);
+            }
+            R::ReadSource {
+                id,
+                source_id,
+                page,
+                offset,
+                limit,
+            } => {
+                let source = self
+                    .research
+                    .get(id)
+                    .ok_or(CommandError::NotFound)?
+                    .sources
+                    .iter()
+                    .find(|s| s.id == *source_id)
+                    .ok_or(CommandError::NotFound)?;
+                return crate::research::read_source(source, *page, *offset, *limit)
+                    .map(|excerpt| CommandResult::Research(ResearchResult::Source(excerpt)));
+            }
+            R::ReadIndex { id } => {
+                let workspace = self.research.get(id).ok_or(CommandError::NotFound)?;
+                return Ok(CommandResult::Research(ResearchResult::Index(
+                    crate::research::research_index(workspace),
+                )));
+            }
+            R::ReadRound { id, round_id } => {
+                return self
+                    .research
+                    .get(id)
+                    .ok_or(CommandError::NotFound)?
+                    .rounds
+                    .iter()
+                    .find(|round| round.id == *round_id)
+                    .cloned()
+                    .map(|round| CommandResult::Research(ResearchResult::Round(round)))
+                    .ok_or(CommandError::NotFound);
+            }
+            R::ReadArtifact {
+                id,
+                artifact_id,
+                offset,
+                limit,
+            } => {
+                let artifact = self
+                    .research
+                    .get(id)
+                    .ok_or(CommandError::NotFound)?
+                    .artifacts
+                    .iter()
+                    .find(|artifact| artifact.id == *artifact_id)
+                    .ok_or(CommandError::NotFound)?;
+                return crate::research::read_artifact(artifact, *offset, *limit)
+                    .map(|excerpt| CommandResult::Research(ResearchResult::Artifact(excerpt)));
+            }
+            R::BuildContext { id, mode, scope } => {
+                return crate::research::build_context(
+                    self.research.get(id).ok_or(CommandError::NotFound)?,
+                    *mode,
+                    *scope,
+                )
+                .map(|prompt| CommandResult::Research(ResearchResult::Prompt(prompt)));
+            }
+            R::BuildReport { id } => {
+                return crate::research::report_markdown(
+                    self.research.get(id).ok_or(CommandError::NotFound)?,
+                )
+                .map(|report| CommandResult::Research(ResearchResult::Report(report)));
+            }
+            R::BuildPrompt { id } => {
+                return crate::research::build_prompt(
+                    self.research.get(id).ok_or(CommandError::NotFound)?,
+                )
+                .map(|prompt| CommandResult::Research(ResearchResult::Prompt(prompt)));
+            }
+            R::Discover { .. } => {
+                return Err(CommandError::Unavailable(
+                    "research discovery provider is not configured".into(),
+                ));
+            }
+            R::Create { title, question } => ResearchWorkspace {
+                id: Uuid::new_v4(),
+                revision: Revision::fresh(),
+                title: title.clone(),
+                question: question.clone(),
+                sources: Vec::new(),
+                research_notes: Vec::new(),
+                brief: Default::default(),
+                threads: Vec::new(),
+                rounds: Vec::new(),
+                artifacts: Vec::new(),
+                acquisitions: Vec::new(),
+                assessment_history: Vec::new(),
+            },
+            _ => {
+                let (id, expected) =
+                    target.ok_or(CommandError::InvalidResearch("missing workspace".into()))?;
+                if self.research_pending(id) {
+                    return Err(CommandError::Busy);
+                }
+                let workspace = self.research.get(&id).ok_or(CommandError::NotFound)?;
+                if workspace.revision != expected {
+                    return Err(CommandError::StaleRevision {
+                        current: workspace.revision,
+                    });
+                }
+                workspace.clone()
+            }
+        };
+        match command {
+            R::CollectReferences {
+                candidates,
+                thread,
+                turn_id,
+                ..
+            } => {
+                if thread
+                    .as_ref()
+                    .is_some_and(|thread| !crate::research::valid_thread(thread))
+                    || turn_id.as_ref().is_some_and(|id| id.len() > 1024)
+                {
+                    return Err(CommandError::InvalidResearch(
+                        "invalid reference provenance".into(),
+                    ));
+                }
+                if candidates.len() > 64 {
+                    return Err(CommandError::InvalidResearch(
+                        "collect at most 64 candidates".into(),
+                    ));
+                }
+                for candidate in candidates {
+                    let url = crate::research_desktop::normalize_url(&candidate.url).ok_or(
+                        CommandError::InvalidResearch("reference requires an HTTP(S) URL".into()),
+                    )?;
+                    if workspace.sources.iter().any(|source| {
+                        source
+                            .metadata
+                            .url
+                            .as_ref()
+                            .and_then(|u| crate::research_desktop::normalize_url(u))
+                            .as_ref()
+                            == Some(&url)
+                    }) {
+                        continue;
+                    }
+                    workspace.sources.push(ResearchSource {
+                        id: Uuid::new_v4(),
+                        title: candidate.title,
+                        kind: SourceKind::Text,
+                        origin: SourceOrigin::Imported,
+                        metadata: SourceMetadata {
+                            author: candidate.author,
+                            date: candidate.date,
+                            url: Some(url.clone()),
+                            origin_label: Some(format!(
+                                "Reference only{}{}",
+                                thread
+                                    .as_ref()
+                                    .map(|t| format!("; conversation {}", t.thread_id))
+                                    .unwrap_or_default(),
+                                turn_id
+                                    .as_ref()
+                                    .map(|t| format!("; turn {t}"))
+                                    .unwrap_or_default()
+                            )),
+                        },
+                        pages: vec![],
+                        selected: true,
+                        human_assessment: None,
+                        agent_assessment: None,
+                        paper: None,
+                    });
+                }
+            }
+            R::ImportSource { path, .. } => Self::append_imports(&mut workspace, vec![path])?,
+            R::ImportSources { paths, .. } => Self::append_imports(&mut workspace, paths)?,
+            R::AcquireSources { source_ids, .. } => {
+                if source_ids.len() > 128 {
+                    return Err(CommandError::InvalidResearch(
+                        "choose at most 128 sources".into(),
+                    ));
+                }
+                for source_id in source_ids {
+                    let source = workspace
+                        .sources
+                        .iter()
+                        .find(|s| s.id == source_id)
+                        .ok_or(CommandError::NotFound)?;
+                    if source.paper.is_some()
+                        || workspace.acquisitions.iter().any(|j| {
+                            j.source_id == source_id
+                                && matches!(
+                                    j.status,
+                                    crate::research::AcquisitionStatus::Queued
+                                        | crate::research::AcquisitionStatus::Running
+                                )
+                        })
+                    {
+                        continue;
+                    }
+                    let Some(url) = source.metadata.url.clone() else {
+                        continue;
+                    };
+                    workspace.acquisitions.push(crate::research::Acquisition {
+                        id: Uuid::new_v4(),
+                        source_id,
+                        input: crate::research::ArtifactInput::Url { url, archive: true },
+                        ocr: false,
+                        status: crate::research::AcquisitionStatus::Queued,
+                        error: None,
+                    });
+                }
+            }
+            R::RetryAcquisitions { job_ids, .. } => {
+                if job_ids.len() > 256 {
+                    return Err(CommandError::InvalidResearch("too many jobs".into()));
+                }
+                self.acquisition_requests
+                    .retain(|_, (_, job)| !job_ids.contains(job));
+                let mut retry_sources: Vec<_> = workspace
+                    .acquisitions
+                    .iter()
+                    .filter(|j| {
+                        !job_ids.contains(&j.id)
+                            && matches!(
+                                j.status,
+                                crate::research::AcquisitionStatus::Queued
+                                    | crate::research::AcquisitionStatus::Running
+                            )
+                    })
+                    .map(|j| j.source_id)
+                    .collect();
+                for job in workspace
+                    .acquisitions
+                    .iter_mut()
+                    .filter(|j| job_ids.contains(&j.id))
+                {
+                    if job.status == crate::research::AcquisitionStatus::Ready
+                        || retry_sources.contains(&job.source_id)
+                    {
+                        continue;
+                    }
+                    retry_sources.push(job.source_id);
+                    self.acquisition_armed.remove(&job.id);
+                    job.status = crate::research::AcquisitionStatus::Queued;
+                    job.error = None;
+                }
+            }
+            R::AcquireSource {
+                source_id,
+                input,
+                ocr,
+                ..
+            } => {
+                let source = workspace
+                    .sources
+                    .iter()
+                    .find(|s| s.id == source_id)
+                    .ok_or(CommandError::NotFound)?;
+                if source.paper.is_some() && !ocr {
+                    return Err(CommandError::InvalidResearch(
+                        "source already retained".into(),
+                    ));
+                }
+                if !matches!(
+                    &input,
+                    crate::research::ArtifactInput::Url { archive: true, .. }
+                        | crate::research::ArtifactInput::LocalFile { .. }
+                ) {
+                    return Err(CommandError::InvalidResearch(
+                        "choose a URL or file to acquire".into(),
+                    ));
+                }
+                if workspace.acquisitions.iter().any(|j| {
+                    j.source_id == source_id
+                        && matches!(
+                            j.status,
+                            crate::research::AcquisitionStatus::Queued
+                                | crate::research::AcquisitionStatus::Running
+                        )
+                }) {
+                    return Err(CommandError::Busy);
+                }
+                workspace.acquisitions.push(crate::research::Acquisition {
+                    id: Uuid::new_v4(),
+                    source_id,
+                    input,
+                    ocr,
+                    status: crate::research::AcquisitionStatus::Queued,
+                    error: None,
+                });
+            }
+            R::RetryAcquisition { job_id, .. } => {
+                let source_id = workspace
+                    .acquisitions
+                    .iter()
+                    .find(|j| j.id == job_id)
+                    .ok_or(CommandError::NotFound)?
+                    .source_id;
+                if workspace.acquisitions.iter().any(|j| {
+                    j.id != job_id
+                        && j.source_id == source_id
+                        && matches!(
+                            j.status,
+                            crate::research::AcquisitionStatus::Queued
+                                | crate::research::AcquisitionStatus::Running
+                        )
+                }) {
+                    return Err(CommandError::Busy);
+                }
+                let job = workspace
+                    .acquisitions
+                    .iter_mut()
+                    .find(|j| j.id == job_id)
+                    .ok_or(CommandError::NotFound)?;
+                if !matches!(
+                    job.status,
+                    crate::research::AcquisitionStatus::Failed
+                        | crate::research::AcquisitionStatus::Cancelled
+                ) {
+                    return Err(CommandError::InvalidResearch(
+                        "only failed or cancelled acquisitions can be retried".into(),
+                    ));
+                }
+                job.status = crate::research::AcquisitionStatus::Queued;
+                job.error = None;
+            }
+            R::CancelAcquisition { job_id, .. } => {
+                let job = workspace
+                    .acquisitions
+                    .iter_mut()
+                    .find(|j| j.id == job_id)
+                    .ok_or(CommandError::NotFound)?;
+                job.status = crate::research::AcquisitionStatus::Cancelled;
+                job.error = None;
+            }
+            R::SetArtifactRole {
+                artifact_id, role, ..
+            } => {
+                workspace
+                    .artifacts
+                    .iter_mut()
+                    .find(|a| a.id == artifact_id)
+                    .ok_or(CommandError::NotFound)?
+                    .role = role;
+            }
+            R::CreateOutput {
+                id,
+                expected,
+                mut spec,
+            } => {
+                spec.source_urls.clear();
+                crate::research_desktop::render_output(&spec)
+                    .map_err(CommandError::InvalidResearch)?;
+                let title = spec.title.clone();
+                let mut source_ids = Vec::new();
+                for marker in spec.cards.iter().flat_map(|card| &card.citations) {
+                    let (source_id, page) =
+                        crate::research::citation_locator(marker).ok_or_else(|| {
+                            CommandError::InvalidResearch(
+                                "output citation must name a retained source/page".into(),
+                            )
+                        })?;
+                    let source = workspace
+                        .sources
+                        .iter()
+                        .find(|s| s.id == source_id)
+                        .ok_or(CommandError::NotFound)?;
+                    if !crate::research::source_has_text(source)
+                        || page.is_some_and(|page| {
+                            !source.pages.iter().any(|p| p.number == Some(page))
+                        })
+                    {
+                        return Err(CommandError::InvalidResearch(
+                            "output citation has no captured evidence at this location".into(),
+                        ));
+                    }
+                    if !source_ids.contains(&source_id) {
+                        source_ids.push(source_id);
+                        let original = source
+                            .paper
+                            .as_ref()
+                            .and_then(|paper| {
+                                workspace
+                                    .artifacts
+                                    .iter()
+                                    .find(|a| a.id == paper.artifact_id)
+                            })
+                            .and_then(|a| a.managed_path.as_ref())
+                            .and_then(|p| std::path::Path::new(p).file_name())
+                            .map(|p| p.to_string_lossy().into_owned());
+                        if let Some(url) = original.or_else(|| source.metadata.url.clone()) {
+                            spec.source_urls.insert(source_id, url);
+                        }
+                    }
+                }
+                crate::research_desktop::render_output(&spec)
+                    .map_err(CommandError::InvalidResearch)?;
+                let request_id = self.accept_io()?;
+                let Some(worker) = self.research_assets.as_ref() else {
+                    self.io_status.remove(&request_id);
+                    return Err(CommandError::Unavailable("open a vault first".into()));
+                };
+                if let Err(error) = worker.try_submit(crate::research_assets::AssetJob {
+                    request_id,
+                    input: crate::research::ArtifactInput::Generated { spec },
+                    extract_text: false,
+                    ocr: false,
+                }) {
+                    self.io_status.remove(&request_id);
+                    return Err(CommandError::Unavailable(error));
+                }
+                self.io_pending.insert(
+                    request_id,
+                    PendingIo::ResearchAsset {
+                        workspace: id,
+                        expected,
+                        title,
+                        thread: None,
+                        round_id: None,
+                        source_id: None,
+                        ocr: false,
+                        role: crate::research::ArtifactRole::Output,
+                        source_ids,
+                    },
+                );
+                return Ok(CommandResult::Accepted { request_id });
+            }
+            R::SetBrief { brief, .. } => workspace.brief = brief,
+            R::AssociateThread { thread, .. } => {
+                if let Some(existing) = workspace
+                    .threads
+                    .iter_mut()
+                    .find(|t| t.same_identity(&thread))
+                {
+                    *existing = thread;
+                } else {
+                    workspace.threads.push(thread);
+                }
+            }
+            R::RemoveThread { thread, .. } => {
+                let index = workspace
+                    .threads
+                    .iter()
+                    .position(|t| t.same_identity(&thread))
+                    .ok_or(CommandError::NotFound)?;
+                // Historical checkpoint provenance remains immutable after unlinking.
+                workspace.threads.remove(index);
+            }
+            R::AddRound { round, .. } => {
+                crate::research::validate_provenance(&workspace, round.thread.as_ref(), None)?;
+                workspace.rounds.push(round);
+            }
+            R::CollectArtifact {
+                id,
+                expected,
+                title,
+                input,
+                thread,
+                round_id,
+            } => {
+                crate::research::validate_provenance(&workspace, thread.as_ref(), round_id)?;
+                if title.trim().is_empty() || title.len() > 1024 || workspace.artifacts.len() >= 512
+                {
+                    return Err(CommandError::InvalidResearch(
+                        "invalid artifact title or artifact limit reached".into(),
+                    ));
+                }
+                if self.research_receipts.len() >= 512 {
+                    return Err(CommandError::Busy);
+                }
+                if self.research_assets.is_none() {
+                    return Err(CommandError::Unavailable("open a vault first".into()));
+                }
+                let request_id = self.accept_io()?;
+                let result = self
+                    .research_assets
+                    .as_ref()
+                    .ok_or_else(|| CommandError::Unavailable("open a vault first".into()))?
+                    .try_submit(crate::research_assets::AssetJob {
+                        request_id,
+                        input,
+                        extract_text: false,
+                        ocr: false,
+                    });
+                if let Err(error) = result {
+                    self.io_status.remove(&request_id);
+                    return Err(CommandError::Unavailable(error));
+                }
+                self.research_error = None;
+                self.io_pending.insert(
+                    request_id,
+                    PendingIo::ResearchAsset {
+                        workspace: id,
+                        expected,
+                        title,
+                        thread,
+                        round_id,
+                        source_id: None,
+                        ocr: false,
+                        role: crate::research::ArtifactRole::Input,
+                        source_ids: vec![],
+                    },
+                );
+                return Ok(CommandResult::Accepted { request_id });
+            }
+            R::SavePaper {
+                id,
+                expected,
+                source_id,
+                input,
+                ocr,
+            } => {
+                if !matches!(
+                    &input,
+                    crate::research::ArtifactInput::Url { archive: true, .. }
+                        | crate::research::ArtifactInput::LocalFile { .. }
+                ) {
+                    return Err(CommandError::InvalidResearch(
+                        "SavePaper requires an archived direct PDF URL or locally authorized file"
+                            .into(),
+                    ));
+                }
+                let source = workspace
+                    .sources
+                    .iter()
+                    .find(|s| s.id == source_id)
+                    .ok_or(CommandError::NotFound)?;
+                if source.paper.is_some() && !ocr {
+                    return Err(CommandError::InvalidResearch(
+                        "source already has a retained paper; read it with ReadSource".into(),
+                    ));
+                }
+                if workspace.artifacts.len() >= 512 || self.research_receipts.len() >= 512 {
+                    return Err(CommandError::Busy);
+                }
+                let title = source.title.clone();
+                let worker = self
+                    .research_assets
+                    .as_ref()
+                    .ok_or_else(|| CommandError::Unavailable("open a vault first".into()))?;
+                // Reserve only after confirming a worker exists, undo if submission fails.
+                let _ = worker;
+                let request_id = self.accept_io()?;
+                if let Err(error) = self.research_assets.as_ref().unwrap().try_submit(
+                    crate::research_assets::AssetJob {
+                        request_id,
+                        input,
+                        extract_text: true,
+                        ocr,
+                    },
+                ) {
+                    self.io_status.remove(&request_id);
+                    return Err(CommandError::Unavailable(error));
+                }
+                self.research_error = None;
+                self.io_pending.insert(
+                    request_id,
+                    PendingIo::ResearchAsset {
+                        workspace: id,
+                        expected,
+                        title,
+                        thread: None,
+                        round_id: None,
+                        source_id: Some(source_id),
+                        ocr,
+                        role: crate::research::ArtifactRole::Input,
+                        source_ids: vec![source_id],
+                    },
+                );
+                return Ok(CommandResult::Accepted { request_id });
+            }
+            R::RetryArtifact { id, receipt_id, .. } => {
+                let (target, artifact) = self
+                    .research_receipts
+                    .get(&receipt_id)
+                    .ok_or(CommandError::NotFound)?;
+                if *target != id {
+                    return Err(CommandError::InvalidResearch(
+                        "receipt belongs to another workspace".into(),
+                    ));
+                }
+                crate::research::validate_provenance(
+                    &workspace,
+                    artifact.thread.as_ref(),
+                    artifact.round_id,
+                )?;
+                if workspace.artifacts.iter().any(|a| a.id == artifact.id) {
+                    return Err(CommandError::InvalidResearch(
+                        "artifact already registered".into(),
+                    ));
+                }
+                if let Some(paper) = self.research_paper_receipts.get(&receipt_id) {
+                    paper.attach(&mut workspace, &artifact)?;
+                }
+                workspace.artifacts.push(artifact.clone());
+            }
+            R::Update {
+                title, question, ..
+            } => {
+                workspace.title = title;
+                workspace.question = question;
+            }
+            R::AddNote { note_id, .. } => {
+                let note = self.note(note_id)?.note;
+                if note.trashed {
+                    return Err(CommandError::Trashed);
+                }
+                workspace.sources.push(ResearchSource {
+                    id: Uuid::new_v4(),
+                    title: note.path.clone(),
+                    kind: SourceKind::Note,
+                    origin: SourceOrigin::NoteSnapshot {
+                        id: note.id,
+                        revision: note.revision,
+                    },
+                    metadata: SourceMetadata {
+                        origin_label: Some(note.path),
+                        ..Default::default()
+                    },
+                    pages: vec![SourcePage {
+                        number: None,
+                        text: note.text,
+                    }],
+                    selected: true,
+                    human_assessment: None,
+                    agent_assessment: None,
+                    paper: None,
+                });
+            }
+            R::AddImported { source, .. } => {
+                if !matches!(source.kind, SourceKind::Text | SourceKind::Pdf) {
+                    return Err(CommandError::InvalidResearch(
+                        "only local text and PDF imports are supported".into(),
+                    ));
+                }
+                workspace.sources.push(ResearchSource {
+                    id: Uuid::new_v4(),
+                    title: source.title,
+                    kind: source.kind,
+                    origin: SourceOrigin::Imported,
+                    metadata: source.metadata,
+                    pages: source.pages,
+                    selected: true,
+                    human_assessment: None,
+                    agent_assessment: None,
+                    paper: None,
+                });
+            }
+            R::RemoveSource { source_id, .. } => {
+                workspace
+                    .acquisitions
+                    .retain(|job| job.source_id != source_id);
+                let index = workspace
+                    .sources
+                    .iter()
+                    .position(|source| source.id == source_id)
+                    .ok_or(CommandError::NotFound)?;
+                workspace.sources.remove(index);
+            }
+            R::SelectSource {
+                source_id,
+                selected,
+                ..
+            } => {
+                workspace
+                    .sources
+                    .iter_mut()
+                    .find(|source| source.id == source_id)
+                    .ok_or(CommandError::NotFound)?
+                    .selected = selected
+            }
+            R::AssessSource {
+                source_id,
+                human,
+                assessment,
+                ..
+            } => {
+                workspace
+                    .assessment_history
+                    .push(crate::research::AssessmentEvent {
+                        source_id,
+                        human,
+                        assessment: assessment.clone(),
+                    });
+                let source = workspace
+                    .sources
+                    .iter_mut()
+                    .find(|source| source.id == source_id)
+                    .ok_or(CommandError::NotFound)?;
+                if human {
+                    source.human_assessment = Some(assessment);
+                } else {
+                    source.agent_assessment = Some(assessment);
+                }
+            }
+            R::LinkNote { note_id, .. } => {
+                let note = self.note(note_id)?;
+                if note.note.trashed {
+                    return Err(CommandError::Trashed);
+                }
+                if note.save.persisted != Some(note.note.revision) {
+                    return Err(CommandError::InvalidResearch(
+                        "save the note before linking it to research".into(),
+                    ));
+                }
+                if !workspace.research_notes.contains(&note_id) {
+                    workspace.research_notes.push(note_id);
+                }
+            }
+            R::Create { .. } => {}
+            _ => {
+                return Err(CommandError::InvalidResearch(
+                    "invalid workspace mutation".into(),
+                ));
+            }
+        }
+        crate::research::validate(&workspace)?;
+        workspace.revision = Revision::fresh();
+        let request_id = self.accept_io()?;
+        self.research_error = None;
+        self.io_pending
+            .insert(request_id, PendingIo::Research(workspace.id));
+        self.storage_jobs.push_back(StoreRequest::SaveResearch {
+            request_id,
+            expected: target.map(|(_, revision)| revision),
+            workspace,
+        });
+        Ok(CommandResult::Accepted { request_id })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1739,6 +3226,876 @@ mod tests {
             assert!(Instant::now() < deadline, "I/O request stuck");
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+    #[test]
+    fn desktop_batch_intents_are_durable_and_invalid_jobs_never_persist() {
+        use crate::research::{AcquisitionStatus as S, ResearchCommand as R};
+        let directory = std::env::temp_dir().join(format!("tanglewood-batch-{}", Uuid::new_v4()));
+        let mut app = App::open(&directory).unwrap();
+        let create = request(
+            &mut app,
+            Command::Research(R::Create {
+                title: "Batch".into(),
+                question: String::new(),
+            }),
+        );
+        assert_eq!(wait_io(&mut app, create), IoStatus::Completed);
+        let id = app.research_created_workspace(create).unwrap();
+        let expected = app.research_workspace(id).unwrap().revision;
+        let refs = crate::research_desktop::references(
+            "[A](https://example.org/a) [B](https://example.org/b)",
+        );
+        let collect = request(
+            &mut app,
+            Command::Research(R::CollectReferences {
+                id,
+                expected,
+                candidates: refs.clone(),
+                thread: None,
+                turn_id: Some("actual-answer".into()),
+            }),
+        );
+        assert_eq!(wait_io(&mut app, collect), IoStatus::Completed);
+        let w = app.research_workspace(id).unwrap().clone();
+        assert_eq!(w.sources.len(), 2);
+        assert!(
+            w.sources
+                .iter()
+                .all(|s| !crate::research::source_has_text(s))
+        );
+        assert!(
+            app.execute(
+                Command::Research(R::AcquireSource {
+                    id,
+                    expected: w.revision,
+                    source_id: w.sources[0].id,
+                    input: crate::research::ArtifactInput::Url {
+                        url: "https://user:secret@example.org/x".into(),
+                        archive: true
+                    },
+                    ocr: false
+                }),
+                Caller::AutomationReadWrite
+            )
+            .is_err()
+        );
+        let queue = request(
+            &mut app,
+            Command::Research(R::AcquireSources {
+                id,
+                expected: w.revision,
+                source_ids: w.sources.iter().map(|s| s.id).collect(),
+            }),
+        );
+        assert_eq!(wait_io(&mut app, queue), IoStatus::Completed);
+        // Queue acknowledgement precedes starting any network worker. Dropping here simulates restart at that boundary.
+        assert_eq!(app.research_workspace(id).unwrap().acquisitions.len(), 2);
+        drop(app);
+        let reopened = App::open(&directory).unwrap();
+        let loaded = reopened.research_workspace(id).unwrap();
+        assert_eq!(loaded.acquisitions.len(), 2);
+        assert!(
+            loaded
+                .acquisitions
+                .iter()
+                .all(|j| matches!(j.status, S::Queued | S::Running))
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn desktop_research_queue_outputs_and_legacy_roles_survive_restart() {
+        use crate::research::{AcquisitionStatus as S, ArtifactRole, ResearchCommand as R};
+        use crate::research_desktop::{OutputCard, OutputKind, OutputSpec};
+        let directory = std::env::temp_dir().join(format!("tanglewood-desktop-{}", Uuid::new_v4()));
+        let mut app = App::open(&directory).unwrap();
+        let create = request(
+            &mut app,
+            Command::Research(R::Create {
+                title: "Research".into(),
+                question: "Which boats?".into(),
+            }),
+        );
+        assert_eq!(wait_io(&mut app, create), IoStatus::Completed);
+        let id = app.research_created_workspace(create).unwrap();
+        let file = directory.join("evidence.md");
+        std::fs::write(&file, "# Boats\nSails use wind. Engine boats use fuel.\n").unwrap();
+        let expected = app.research_workspace(id).unwrap().revision;
+        let importing = request(
+            &mut app,
+            Command::Research(R::ImportSource {
+                id,
+                expected,
+                path: file.to_string_lossy().into(),
+            }),
+        );
+        assert_eq!(wait_io(&mut app, importing), IoStatus::Completed);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            app.tick();
+            let w = app.research_workspace(id).unwrap();
+            if w.acquisitions.iter().all(|job| job.status == S::Ready) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "queue failed: {:?}",
+                w.acquisitions
+            );
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        let w = app.research_workspace(id).unwrap().clone();
+        assert_eq!(w.sources.len(), 1);
+        assert!(crate::research::source_has_text(&w.sources[0]));
+        assert_eq!(
+            std::fs::read_to_string(
+                app.research_asset_path(w.artifacts[0].managed_path.as_deref().unwrap())
+                    .unwrap()
+            )
+            .unwrap(),
+            "# Boats\nSails use wind. Engine boats use fuel.\n"
+        );
+        let source_id = w.sources[0].id;
+        let mut failed_ocr = w.clone();
+        PaperReceipt {
+            ocr: true,
+            source_id,
+            pages: vec![],
+            extraction_error: Some("OCR unavailable".into()),
+        }
+        .attach(&mut failed_ocr, &w.artifacts[0])
+        .unwrap();
+        assert_eq!(failed_ocr.sources[0], w.sources[0]);
+        for kind in [
+            OutputKind::Slides,
+            OutputKind::Infographic,
+            OutputKind::MindMap,
+        ] {
+            let expected = app.research_workspace(id).unwrap().revision;
+            let output = request(
+                &mut app,
+                Command::Research(R::CreateOutput {
+                    id,
+                    expected,
+                    spec: OutputSpec {
+                        source_urls: Default::default(),
+                        title: "Boat evidence".into(),
+                        kind,
+                        cards: vec![OutputCard {
+                            heading: "Wind".into(),
+                            body: "Sails use wind.".into(),
+                            citations: vec![format!("[source:{source_id}]")],
+                        }],
+                    },
+                }),
+            );
+            assert_eq!(wait_io(&mut app, output), IoStatus::Completed);
+        }
+        let w = app.research_workspace(id).unwrap().clone();
+        assert_eq!(
+            w.artifacts
+                .iter()
+                .filter(|a| a.role == ArtifactRole::Output)
+                .count(),
+            3
+        );
+        for artifact in w
+            .artifacts
+            .iter()
+            .filter(|a| a.role == ArtifactRole::Output)
+        {
+            assert_eq!(artifact.source_ids, vec![source_id]);
+            assert!(
+                std::fs::read_to_string(
+                    app.research_asset_path(artifact.managed_path.as_deref().unwrap())
+                        .unwrap()
+                )
+                .unwrap()
+                .contains("Boat evidence")
+            );
+        }
+        if let Some(output) = std::env::var_os("TANGLEWOOD_DESKTOP_OUTPUT_EVIDENCE") {
+            let output = std::path::PathBuf::from(output);
+            std::fs::create_dir_all(&output).unwrap();
+            for artifact in &w.artifacts {
+                let path = app
+                    .research_asset_path(artifact.managed_path.as_deref().unwrap())
+                    .unwrap();
+                std::fs::copy(&path, output.join(path.file_name().unwrap())).unwrap();
+            }
+            std::fs::write(
+                output.join("workspace.json"),
+                serde_json::to_vec_pretty(&w).unwrap(),
+            )
+            .unwrap();
+        }
+        let mut legacy = serde_json::to_value(&w).unwrap();
+        legacy["artifacts"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("role");
+        let old: crate::research::ResearchWorkspace = serde_json::from_value(legacy).unwrap();
+        assert_eq!(old.artifacts[0].role, ArtifactRole::Unclassified);
+        app.shutdown().unwrap();
+        drop(app);
+        let reopened = App::open(&directory).unwrap();
+        assert_eq!(reopened.research_workspace(id).unwrap(), &w);
+        drop(reopened);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn paper_save_keeps_reference_identity_and_failed_extraction_after_restart() {
+        use crate::research::{
+            ArtifactInput, ImportedSource, ResearchCommand as R, SourceKind, SourceMetadata,
+            SourcePage,
+        };
+        let directory =
+            std::env::temp_dir().join(format!("tanglewood-paper-owner-{}", Uuid::new_v4()));
+        let mut app = App::open(&directory).unwrap();
+        let created = request(
+            &mut app,
+            Command::Research(R::Create {
+                title: "Papers".into(),
+                question: String::new(),
+            }),
+        );
+        assert_eq!(wait_io(&mut app, created), IoStatus::Completed);
+        let id = app.research_created_workspace(created).unwrap();
+        let expected = app.research_workspace(id).unwrap().revision;
+        let add = request(
+            &mut app,
+            Command::Research(R::AddImported {
+                id,
+                expected,
+                source: ImportedSource {
+                    title: "Reference".into(),
+                    kind: SourceKind::Text,
+                    metadata: SourceMetadata {
+                        url: Some("https://example.org/paper".into()),
+                        ..Default::default()
+                    },
+                    pages: vec![SourcePage {
+                        number: None,
+                        text: "Reference only".into(),
+                    }],
+                },
+            }),
+        );
+        assert_eq!(wait_io(&mut app, add), IoStatus::Completed);
+        let source_id = app.research_workspace(id).unwrap().sources[0].id;
+        let expected = app.research_workspace(id).unwrap().revision;
+        let file = directory.join("malformed.pdf");
+        std::fs::write(&file, b"%PDF-1.7\nbad PDF").unwrap();
+        let db = rusqlite::Connection::open(directory.join("notes.sqlite3")).unwrap();
+        db.execute_batch("CREATE TRIGGER reject_paper BEFORE UPDATE ON research_workspaces BEGIN SELECT RAISE(FAIL,'paper disk failure'); END;").unwrap();
+        let saving = request(
+            &mut app,
+            Command::Research(R::SavePaper {
+                ocr: false,
+                id,
+                expected,
+                source_id,
+                input: ArtifactInput::LocalFile {
+                    path: file.to_string_lossy().into(),
+                },
+            }),
+        );
+        assert!(app.research_pending(id));
+        assert!(matches!(wait_io(&mut app, saving), IoStatus::Failed(_)));
+        assert!(
+            app.research_workspace(id).unwrap().sources[0]
+                .paper
+                .is_none()
+        );
+        assert!(app.research_artifact_receipt(saving).is_some());
+        db.execute_batch("DROP TRIGGER reject_paper").unwrap();
+        drop(db);
+        let expected = app.research_workspace(id).unwrap().revision;
+        let retry = request(
+            &mut app,
+            Command::Research(R::RetryArtifact {
+                id,
+                expected,
+                receipt_id: saving,
+            }),
+        );
+        assert_eq!(wait_io(&mut app, retry), IoStatus::Completed);
+        let workspace = app.research_workspace(id).unwrap().clone();
+        assert_eq!(workspace.sources.len(), 1);
+        assert_eq!(workspace.sources[0].id, source_id);
+        assert_eq!(
+            workspace.sources[0].metadata.url.as_deref(),
+            Some("https://example.org/paper")
+        );
+        assert!(workspace.sources[0].pages.is_empty());
+        let paper = workspace.sources[0].paper.as_ref().unwrap();
+        assert!(paper.extraction_error.is_some());
+        assert_eq!(workspace.artifacts.len(), 1);
+        assert_eq!(workspace.artifacts[0].id, paper.artifact_id);
+        let retained = directory.join(workspace.artifacts[0].managed_path.as_ref().unwrap());
+        assert_eq!(std::fs::read(retained).unwrap(), b"%PDF-1.7\nbad PDF");
+        assert!(
+            app.execute(
+                Command::Research(R::ReadSource {
+                    id,
+                    source_id,
+                    page: 0,
+                    offset: 0,
+                    limit: 32768
+                }),
+                Caller::AutomationReadOnly
+            )
+            .is_err()
+        );
+        assert!(
+            app.execute(
+                Command::Research(R::SavePaper {
+                    ocr: false,
+                    id,
+                    expected: workspace.revision,
+                    source_id,
+                    input: ArtifactInput::LocalFile {
+                        path: file.to_string_lossy().into()
+                    }
+                }),
+                Caller::Local
+            )
+            .is_err()
+        );
+        app.shutdown().unwrap();
+        drop(app);
+        let reopened = App::open(&directory).unwrap();
+        assert_eq!(reopened.research_workspace(id).unwrap(), &workspace);
+        drop(reopened);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn research_flow_records_restart_context_and_retained_receipt() {
+        use crate::research::{
+            ArtifactInput, ContextMode, ResearchBrief, ResearchCommand as R, ResearchRound,
+            SourceScope, ThreadRef,
+        };
+        let directory = std::env::temp_dir().join(format!("tanglewood-flow-{}", Uuid::new_v4()));
+        let mut app = App::open(&directory).unwrap();
+        let create = request(
+            &mut app,
+            Command::Research(R::Create {
+                title: "Investigation".into(),
+                question: "Which design?".into(),
+            }),
+        );
+        assert_eq!(wait_io(&mut app, create), IoStatus::Completed);
+        let id = app.research_created_workspace(create).unwrap();
+        let brief = ResearchBrief {
+            purpose: "Compare boats".into(),
+            scope: "Coastal".into(),
+            assumptions: "Small crew".into(),
+            open_questions: "Hull?".into(),
+        };
+        let mutate = |app: &mut App, command| {
+            let request = request(app, Command::Research(command));
+            assert_eq!(wait_io(app, request), IoStatus::Completed);
+        };
+        let revision = app.research_workspace(id).unwrap().revision;
+        mutate(
+            &mut app,
+            R::SetBrief {
+                id,
+                expected: revision,
+                brief: brief.clone(),
+            },
+        );
+        let thread = ThreadRef {
+            provider: "codex".into(),
+            project_id: Some("project".into()),
+            thread_id: "thread-a".into(),
+            title: "Hull design".into(),
+        };
+        for name in ["thread-a", "thread-b"] {
+            let revision = app.research_workspace(id).unwrap().revision;
+            mutate(
+                &mut app,
+                R::AssociateThread {
+                    id,
+                    expected: revision,
+                    thread: ThreadRef {
+                        thread_id: name.into(),
+                        ..thread.clone()
+                    },
+                },
+            );
+        }
+        let round = ResearchRound {
+            id: Uuid::new_v4(),
+            captured_at: 1,
+            question: "Compare hulls".into(),
+            summary: "Need further evidence".into(),
+            open_questions: "Weather limits".into(),
+            discussion: "User prefers a small crew".into(),
+            thread: Some(thread.clone()),
+            turn_id: Some("turn-1".into()),
+            artifact_ids: vec![],
+        };
+        let revision = app.research_workspace(id).unwrap().revision;
+        mutate(
+            &mut app,
+            R::AddRound {
+                id,
+                expected: revision,
+                round: round.clone(),
+            },
+        );
+        assert!(matches!(
+            app.execute(
+                Command::Research(R::SetBrief {
+                    id,
+                    expected: revision,
+                    brief: brief.clone()
+                }),
+                Caller::Local
+            ),
+            Err(CommandError::StaleRevision { .. })
+        ));
+        let revision = app.research_workspace(id).unwrap().revision;
+        let local = R::CollectArtifact {
+            id,
+            expected: revision,
+            title: "Private file".into(),
+            input: ArtifactInput::LocalFile {
+                path: "/tmp/private".into(),
+            },
+            thread: None,
+            round_id: None,
+        };
+        assert_eq!(
+            app.execute(Command::Research(local), Caller::AutomationReadWrite)
+                .unwrap_err(),
+            CommandError::Unauthorized
+        );
+        let capture = R::CollectArtifact {
+            id,
+            expected: revision,
+            title: "Notes".into(),
+            input: ArtifactInput::Markdown {
+                markdown: "# Comparison".into(),
+                url: Some("https://example.com/evidence".into()),
+            },
+            thread: Some(thread.clone()),
+            round_id: Some(round.id),
+        };
+        let request_id = request(&mut app, Command::Research(capture));
+        assert!(app.research_pending(id));
+        assert_eq!(wait_io(&mut app, request_id), IoStatus::Completed);
+        // A retained original survives failed SQLite registration and can be retried.
+        let connection = rusqlite::Connection::open(directory.join("notes.sqlite3")).unwrap();
+        connection.execute_batch("CREATE TRIGGER fail_capture BEFORE UPDATE ON research_workspaces BEGIN SELECT RAISE(FAIL,'capture registration failure'); END;").unwrap();
+        let source_file = directory.join("original.png");
+        std::fs::write(&source_file, b"retained original bytes").unwrap();
+        let revision = app.research_workspace(id).unwrap().revision;
+        let failed = request(
+            &mut app,
+            Command::Research(R::CollectArtifact {
+                id,
+                expected: revision,
+                title: "Original image".into(),
+                input: ArtifactInput::LocalFile {
+                    path: source_file.to_string_lossy().into_owned(),
+                },
+                thread: None,
+                round_id: None,
+            }),
+        );
+        assert!(matches!(wait_io(&mut app, failed), IoStatus::Failed(_)));
+        let receipt = app.research_artifact_receipt(failed).unwrap();
+        assert_eq!(
+            std::fs::read(directory.join(receipt.managed_path.as_ref().unwrap())).unwrap(),
+            b"retained original bytes"
+        );
+        assert_eq!(app.research_workspace(id).unwrap().artifacts.len(), 1);
+        connection
+            .execute_batch("DROP TRIGGER fail_capture")
+            .unwrap();
+        drop(connection);
+        mutate(
+            &mut app,
+            R::RetryArtifact {
+                id,
+                expected: revision,
+                receipt_id: failed,
+            },
+        );
+        assert!(app.research_artifact_receipt(failed).is_none());
+        let workspace = app.research_workspace(id).unwrap().clone();
+        assert_eq!(workspace.rounds, vec![round]);
+        assert!(workspace.artifacts[0].managed_path.is_some());
+        assert!(crate::research::build_prompt(&workspace).is_err());
+        let context = crate::research::build_context(
+            &workspace,
+            ContextMode::Report,
+            SourceScope::ExistingOnly,
+        )
+        .unwrap();
+        assert!(
+            context.contains("thread-a")
+                && context.contains("thread-b")
+                && context.contains("Need further evidence")
+                && context.contains("NEW ordinary Markdown note")
+        );
+        let report = crate::research::report_markdown(&workspace).unwrap();
+        assert!(report.contains("Need further evidence") && report.contains("retained local copy"));
+        app.shutdown().unwrap();
+        drop(app);
+        let mut reopened = App::open(&directory).unwrap();
+        assert_eq!(reopened.research_workspace(id).unwrap(), &workspace);
+        reopened.shutdown().unwrap();
+        drop(reopened);
+        // Older JSON rows default the new records without a schema migration.
+        let connection = rusqlite::Connection::open(directory.join("notes.sqlite3")).unwrap();
+        let mut old = serde_json::to_value(&workspace).unwrap();
+        for field in ["brief", "threads", "rounds", "artifacts"] {
+            old.as_object_mut().unwrap().remove(field);
+        }
+        connection
+            .execute(
+                "UPDATE research_workspaces SET payload=?1 WHERE id=?2",
+                rusqlite::params![old.to_string(), id.to_string()],
+            )
+            .unwrap();
+        drop(connection);
+        let mut reopened = App::open(&directory).unwrap();
+        let loaded = reopened.research_workspace(id).unwrap();
+        assert_eq!(loaded.brief, ResearchBrief::default());
+        assert!(
+            loaded.threads.is_empty() && loaded.rounds.is_empty() && loaded.artifacts.is_empty()
+        );
+        reopened.shutdown().unwrap();
+        drop(reopened);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn research_snapshot_restart_cas_policy_and_storage_failure() {
+        use crate::research::{ResearchCommand as R, SourceOrigin};
+        let directory =
+            std::env::temp_dir().join(format!("tanglewood-research-{}", Uuid::new_v4()));
+        let mut app = App::open(&directory).unwrap();
+        let source = note(
+            app.execute(
+                Command::CreateNote {
+                    path: "evidence.md".into(),
+                    text: "original evidence".into(),
+                },
+                Caller::Local,
+            )
+            .unwrap(),
+        )
+        .note;
+        let create = R::Create {
+            title: "Research".into(),
+            question: "What is supported?".into(),
+        };
+        assert_eq!(
+            app.execute(
+                Command::Research(create.clone()),
+                Caller::AutomationReadOnly
+            )
+            .unwrap_err(),
+            CommandError::Unauthorized
+        );
+        let id = request(&mut app, Command::Research(create));
+        assert!(app.research_workspaces().is_empty());
+        assert_eq!(wait_io(&mut app, id), IoStatus::Completed);
+        let workspace = app.research_workspaces().remove(0);
+        let linked = note(
+            app.execute(
+                Command::CreateNote {
+                    path: "research-note.md".into(),
+                    text: "Research observations".into(),
+                },
+                Caller::Local,
+            )
+            .unwrap(),
+        )
+        .note;
+        let link = R::LinkNote {
+            id: workspace.id,
+            expected: workspace.revision,
+            note_id: linked.id,
+        };
+        assert!(matches!(
+            app.execute(Command::Research(link.clone()), Caller::Local),
+            Err(CommandError::InvalidResearch(_))
+        ));
+        assert!(
+            app.research_workspace(workspace.id)
+                .unwrap()
+                .research_notes
+                .is_empty()
+        );
+        app.flush().unwrap();
+        let link_request = request(&mut app, Command::Research(link));
+        assert_eq!(wait_io(&mut app, link_request), IoStatus::Completed);
+        let workspace = app.research_workspace(workspace.id).unwrap().clone();
+        assert_eq!(workspace.research_notes, vec![linked.id]);
+        let capture = request(
+            &mut app,
+            Command::Research(R::AddNote {
+                id: workspace.id,
+                expected: workspace.revision,
+                note_id: source.id,
+            }),
+        );
+        assert!(app.research_pending(workspace.id));
+        assert_eq!(wait_io(&mut app, capture), IoStatus::Completed);
+        let captured = app.research_workspace(workspace.id).unwrap().clone();
+        assert!(
+            matches!(captured.sources[0].origin,SourceOrigin::NoteSnapshot{id,revision} if id==source.id && revision==source.revision)
+        );
+        assert!(matches!(
+            app.execute(
+                Command::Research(R::Update {
+                    id: workspace.id,
+                    expected: workspace.revision,
+                    title: "stale".into(),
+                    question: String::new()
+                }),
+                Caller::Local
+            ),
+            Err(CommandError::StaleRevision { .. })
+        ));
+        app.execute(
+            Command::EditNote {
+                id: source.id,
+                expected: source.revision,
+                edits: vec![TextEdit {
+                    start: 0,
+                    end: source.text.len(),
+                    replacement: "changed".into(),
+                }],
+            },
+            Caller::Local,
+        )
+        .unwrap();
+        app.flush().unwrap();
+        drop(app);
+        let mut app = App::open(&directory).unwrap();
+        assert_eq!(app.research_workspace(workspace.id).unwrap(), &captured);
+        assert_eq!(captured.sources[0].pages[0].text, "original evidence");
+        let prompt = crate::research::build_prompt(&captured).unwrap();
+        assert!(prompt.contains(&format!("[source:{}]", captured.sources[0].id)));
+        assert!(prompt.contains("original evidence"));
+        let db = rusqlite::Connection::open(directory.join("notes.sqlite3")).unwrap();
+        db.execute_batch("CREATE TRIGGER reject_research BEFORE UPDATE ON research_workspaces BEGIN SELECT RAISE(FAIL,'test full disk'); END;").unwrap();
+        let failed = request(
+            &mut app,
+            Command::Research(R::Update {
+                id: captured.id,
+                expected: captured.revision,
+                title: "not durable".into(),
+                question: String::new(),
+            }),
+        );
+        assert!(matches!(wait_io(&mut app, failed), IoStatus::Failed(_)));
+        assert_eq!(app.research_workspace(captured.id).unwrap(), &captured);
+        assert!(app.flush().is_err());
+        drop(db);
+        drop(app);
+        let app = App::open(&directory).unwrap();
+        assert_eq!(app.research_workspace(captured.id).unwrap(), &captured);
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn automation_permission_requires_local_durable_grant_and_revokes_immediately() {
+        let directory = std::env::temp_dir().join(format!(
+            "tanglewood-automation-permission-{}",
+            Uuid::new_v4()
+        ));
+        let mut app = App::open(&directory).unwrap();
+        assert_eq!(app.automation_write_preference(), None);
+        for caller in [Caller::AutomationReadOnly, Caller::AutomationReadWrite] {
+            assert!(matches!(
+                app.execute(Command::SetAutomationWriteEnabled { enabled: true }, caller),
+                Err(CommandError::Unauthorized)
+            ));
+        }
+        let grant = request(
+            &mut app,
+            Command::SetAutomationWriteEnabled { enabled: true },
+        );
+        assert_eq!(app.automation_write_preference(), Some(false));
+        assert!(app.automation_permission_pending());
+        assert!(matches!(
+            app.execute(
+                Command::SetAutomationWriteEnabled { enabled: false },
+                Caller::Local
+            ),
+            Err(CommandError::Busy)
+        ));
+        assert_eq!(wait_io(&mut app, grant), IoStatus::Completed);
+        assert_eq!(app.automation_write_preference(), Some(true));
+        app.shutdown().unwrap();
+        drop(app);
+        let mut app = App::open(&directory).unwrap();
+        assert_eq!(app.automation_write_preference(), Some(true));
+        // A real SQLite failure must never restore runtime write access.
+        let db = rusqlite::Connection::open(directory.join("notes.sqlite3")).unwrap();
+        db.execute_batch("CREATE TRIGGER reject_automation BEFORE UPDATE ON settings WHEN OLD.key='automation_write_enabled' BEGIN SELECT RAISE(ABORT, 'test disk failure'); END;").unwrap();
+        let revoke = request(
+            &mut app,
+            Command::SetAutomationWriteEnabled { enabled: false },
+        );
+        assert_eq!(app.automation_write_preference(), Some(false));
+        assert!(matches!(wait_io(&mut app, revoke), IoStatus::Failed(_)));
+        assert_eq!(app.automation_write_preference(), Some(false));
+        assert!(app.automation_permission_pending());
+        assert!(app.automation_permission_error().is_some());
+        assert!(app.shutdown().is_err());
+        let grant = request(
+            &mut app,
+            Command::SetAutomationWriteEnabled { enabled: true },
+        );
+        assert!(matches!(wait_io(&mut app, grant), IoStatus::Failed(_)));
+        assert_eq!(app.automation_write_preference(), Some(false));
+        db.execute_batch("DROP TRIGGER reject_automation").unwrap();
+        let retry = request(
+            &mut app,
+            Command::SetAutomationWriteEnabled { enabled: false },
+        );
+        assert_eq!(wait_io(&mut app, retry), IoStatus::Completed);
+        assert!(!app.automation_permission_pending());
+        assert!(app.automation_permission_error().is_none());
+        app.shutdown().unwrap();
+        drop(app);
+        drop(db);
+        let mut app = App::open(&directory).unwrap();
+        assert_eq!(app.automation_write_preference(), Some(false));
+        app.shutdown().unwrap();
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
+        let mut memory = App::new();
+        request(
+            &mut memory,
+            Command::SetAutomationWriteEnabled { enabled: true },
+        );
+        assert_eq!(memory.automation_write_preference(), Some(true));
+        assert!(!memory.automation_permission_pending());
+    }
+    #[test]
+    fn codex_project_cas_survives_restart_and_rejects_identity_changes() {
+        let directory =
+            std::env::temp_dir().join(format!("tanglewood-codex-project-{}", Uuid::new_v4()));
+        let mut app = App::open(&directory).unwrap();
+        let pending = CodexProjectBinding {
+            project_id: None,
+            name: "My vault".into(),
+            creation_key: Uuid::new_v4().to_string(),
+        };
+        assert!(matches!(
+            app.execute(
+                Command::SetCodexProject {
+                    expected: None,
+                    project: pending.clone()
+                },
+                Caller::AutomationReadWrite
+            ),
+            Err(CommandError::Unauthorized)
+        ));
+        let id = request(
+            &mut app,
+            Command::SetCodexProject {
+                expected: None,
+                project: pending.clone(),
+            },
+        );
+        assert!(app.codex_project_pending());
+        assert_eq!(wait_io(&mut app, id), IoStatus::Completed);
+        assert!(!app.codex_project_pending());
+        assert!(matches!(
+            app.execute(
+                Command::SetCodexProject {
+                    expected: None,
+                    project: pending.clone()
+                },
+                Caller::Local
+            ),
+            Err(CommandError::CodexProjectChanged)
+        ));
+        let associated = CodexProjectBinding {
+            project_id: Some("project-123".into()),
+            ..pending.clone()
+        };
+        let id = request(
+            &mut app,
+            Command::SetCodexProject {
+                expected: Some(pending),
+                project: associated.clone(),
+            },
+        );
+        assert_eq!(wait_io(&mut app, id), IoStatus::Completed);
+        app.shutdown().unwrap();
+        drop(app);
+        let mut app = App::open(&directory).unwrap();
+        assert_eq!(app.codex_project(), Some(&associated));
+        let renamed = CodexProjectBinding {
+            name: "Renamed vault".into(),
+            ..associated.clone()
+        };
+        let id = request(
+            &mut app,
+            Command::SetCodexProject {
+                expected: Some(associated.clone()),
+                project: renamed.clone(),
+            },
+        );
+        assert_eq!(wait_io(&mut app, id), IoStatus::Completed);
+        let changed = CodexProjectBinding {
+            project_id: Some("another-project".into()),
+            ..renamed.clone()
+        };
+        assert!(matches!(
+            app.execute(
+                Command::SetCodexProject {
+                    expected: Some(renamed.clone()),
+                    project: changed
+                },
+                Caller::Local
+            ),
+            Err(CommandError::InvalidCodexProject(_))
+        ));
+        app.shutdown().unwrap();
+        drop(app);
+        let mut app = App::open(&directory).unwrap();
+        assert_eq!(app.codex_project(), Some(&renamed));
+        app.shutdown().unwrap();
+        drop(app);
+        // Inject a real SQLite failure while no application owns the vault.
+        let db = rusqlite::Connection::open(directory.join("notes.sqlite3")).unwrap();
+        db.execute_batch("CREATE TRIGGER reject_project BEFORE UPDATE ON codex_project BEGIN SELECT RAISE(ABORT, 'test disk failure'); END;").unwrap();
+        drop(db);
+        let mut app = App::open(&directory).unwrap();
+        let unsaved = CodexProjectBinding {
+            name: "Unsaved rename".into(),
+            ..renamed.clone()
+        };
+        let id = request(
+            &mut app,
+            Command::SetCodexProject {
+                expected: Some(renamed.clone()),
+                project: unsaved.clone(),
+            },
+        );
+        assert!(matches!(wait_io(&mut app, id), IoStatus::Failed(_)));
+        assert_eq!(app.codex_project(), Some(&unsaved));
+        assert!(app.codex_project_pending());
+        assert!(app.codex_project_error().is_some());
+        assert!(app.shutdown().is_err());
+        drop(app);
+        let mut app = App::open(&directory).unwrap();
+        assert_eq!(app.codex_project(), Some(&renamed));
+        assert!(!app.codex_project_pending());
+        app.shutdown().unwrap();
+        drop(app);
+        std::fs::remove_dir_all(directory).unwrap();
     }
     #[cfg(feature = "lan")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

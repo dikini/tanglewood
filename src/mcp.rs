@@ -163,6 +163,16 @@ impl OwnerSocket {
         })
     }
 
+    /// The saved vault preference overrides the startup policy immediately.
+    /// A missing preference preserves the explicit `--mcp-write` fallback.
+    pub fn policy(&self, app: &App) -> AccessPolicy {
+        match app.automation_write_preference() {
+            Some(true) => AccessPolicy::ReadWrite,
+            Some(false) => AccessPolicy::ReadOnly,
+            None => self.policy,
+        }
+    }
+
     /// Bounded owner-thread dispatch and acknowledgement polling; never waits for I/O.
     pub fn poll(&mut self, app: &mut App) {
         app.tick();
@@ -193,6 +203,18 @@ impl OwnerSocket {
                         "accepted note no longer available".into(),
                     )),
                     _ => None,
+                },
+                CommandResult::Accepted { request_id } => match app.io_status(*request_id) {
+                    Some(crate::app::IoStatus::Completed) => {
+                        Some(Outcome::Result(waiting.result.clone()))
+                    }
+                    Some(crate::app::IoStatus::Failed(error)) => Some(Outcome::UnknownOutcome(
+                        format!("accepted but storage failed: {error}; inspect state before retry"),
+                    )),
+                    Some(crate::app::IoStatus::Conflict(id)) => Some(Outcome::UnknownOutcome(
+                        format!("accepted request has conflict {id}; inspect state before retry"),
+                    )),
+                    Some(crate::app::IoStatus::Pending) | None => None,
                 },
                 _ => Some(Outcome::UnknownOutcome(
                     "unsupported mutation acknowledgement".into(),
@@ -233,20 +255,21 @@ impl OwnerSocket {
                 );
                 continue;
             }
+            let policy = self.policy(app);
             let Some(command) = pending.request.command.clone() else {
                 reply(
                     &pending,
                     Outcome::Capabilities {
-                        commands: allowed_variants(self.policy)
+                        commands: allowed_variants(policy)
                             .iter()
                             .map(|(_, name)| (*name).to_owned())
                             .collect(),
-                        policy: self.policy,
+                        policy,
                     },
                 );
                 continue;
             };
-            if !allowed_variants(self.policy)
+            if !allowed_variants(policy)
                 .iter()
                 .any(|(_, name)| *name == command.descriptor().name)
             {
@@ -254,7 +277,7 @@ impl OwnerSocket {
                 continue;
             }
             let mutation = command.is_mutation();
-            match app.execute(command, self.policy.caller()) {
+            match app.execute(command, policy.caller()) {
                 Ok(result) if mutation => self.waiting.push(Waiting { pending, result }),
                 Ok(result) => reply(&pending, Outcome::Result(result)),
                 Err(error) => reply(&pending, Outcome::Error(error)),
@@ -566,7 +589,7 @@ use rmcp::{
     ErrorData, RoleServer, ServerHandler,
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
-        PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
+        PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool, ToolAnnotations,
     },
     service::RequestContext,
 };
@@ -626,6 +649,15 @@ impl McpBridge {
     async fn capabilities(&self) -> io::Result<ResponseEnvelope> {
         self.request(None).await
     }
+    async fn read(&self, command: Command) -> io::Result<ResponseEnvelope> {
+        if !command.descriptor().allowed(Caller::AutomationReadOnly) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "read only accepts authorized non-mutating commands",
+            ));
+        }
+        self.request(Some(command)).await
+    }
     async fn execute(&self, command: Command) -> io::Result<ResponseEnvelope> {
         self.request(Some(command)).await
     }
@@ -640,7 +672,19 @@ fn execute_schema(policy: AccessPolicy) -> serde_json::Map<String, serde_json::V
         .pointer_mut("/$defs/Command/oneOf")
         .and_then(serde_json::Value::as_array_mut)
     {
-        variants.retain(|variant| {
+        variants.retain_mut(|variant| {
+            // Schemars groups unit variants into a string enum, while variants
+            // carrying fields use object properties. Filter both representations.
+            if let Some(units) = variant
+                .get_mut("enum")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                units.retain(|unit| {
+                    unit.as_str()
+                        .is_some_and(|wire| allowed.iter().any(|(name, _)| *name == wire))
+                });
+                return !units.is_empty();
+            }
             variant
                 .get("properties")
                 .and_then(serde_json::Value::as_object)
@@ -660,10 +704,34 @@ fn execute_schema(policy: AccessPolicy) -> serde_json::Map<String, serde_json::V
     schema.as_object().expect("schema root is object").clone()
 }
 
+fn tool_annotations(read_only: bool) -> ToolAnnotations {
+    ToolAnnotations::from_raw(
+        None,
+        Some(read_only),
+        Some(!read_only),
+        Some(read_only),
+        Some(false),
+    )
+}
+
+// Codex can cache tools/list for the lifetime of a thread. Keep execute's shape
+// and mutation annotations stable; discovery does not grant authority. The owner
+// evaluates its current local policy when each command is actually dispatched.
+fn bridge_tools(_policy: AccessPolicy) -> Vec<Tool> {
+    vec![
+        Tool::new("read", "Query vault notes and research workspaces, sources, indexes, and archived artifacts without modifying them. Use Research List and ReadIndex to discover current research state, and ReadSource for bounded page-numbered paper text.", execute_schema(AccessPolicy::ReadOnly))
+            .with_annotations(tool_annotations(true)),
+        Tool::new("execute", "Dispatch shared revision-checked note and research commands. This stable schema includes mutations, but grants no write permission: the owner checks its current local policy on every call. Use capabilities for current authorization and read for queries. For an existing source use Research SavePaper with a direct PDF URL to retain original bytes and extract text; then read via ReadSource. DOI is optional. Inspect paper.extraction_error before claiming full-text success. Local-file inputs require local authorization. Mutation success requires durable confirmation.", execute_schema(AccessPolicy::ReadWrite))
+            .with_annotations(tool_annotations(false)),
+        Tool::new("capabilities", "List commands allowed by the running app's local MCP policy.", serde_json::json!({"type":"object","properties":{},"additionalProperties":false}).as_object().unwrap().clone())
+            .with_annotations(tool_annotations(true)),
+    ]
+}
+
 impl ServerHandler for McpBridge {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions("Execute authorized shared Tanglewood commands in the existing running app. Read capabilities first. A timeout or UnknownOutcome may follow a committed mutation; re-read state and never blindly retry.".to_owned())
+            .with_instructions("Read vault notes and research workspaces and dispatch authorized shared Tanglewood commands in the existing running app. Read capabilities for current authorization, then use read for queries and execute for authorized mutations. The execute schema is stable across permission changes; exposed commands do not grant writes. The owner enforces current local permission on every call. A timeout or UnknownOutcome may follow a committed mutation; re-read state and never blindly retry.".to_owned())
     }
     async fn list_tools(
         &self,
@@ -680,23 +748,30 @@ impl ServerHandler for McpBridge {
                 None,
             ));
         };
-        Ok(ListToolsResult { tools: vec![
-            Tool::new("execute", "Dispatch a shared revision-checked note command. Mutation success requires exact persisted revision confirmation.", execute_schema(policy)),
-            Tool::new("capabilities", "List commands allowed by the running app's local MCP policy.", serde_json::json!({"type":"object","properties":{},"additionalProperties":false}).as_object().unwrap().clone()),
-        ], ..Default::default() })
+        Ok(ListToolsResult {
+            tools: bridge_tools(policy),
+            ..Default::default()
+        })
     }
+
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let response = match request.name.as_ref() {
-            "execute" => {
+            "execute" | "read" => {
                 let parsed = serde_json::from_value::<ExecuteRequest>(serde_json::Value::Object(
                     request.arguments.unwrap_or_default(),
                 ));
                 match parsed {
-                    Ok(request) => self.execute(request.command).await,
+                    Ok(parsed) => {
+                        if request.name.as_ref() == "read" {
+                            self.read(parsed.command).await
+                        } else {
+                            self.execute(parsed.command).await
+                        }
+                    }
                     Err(error) => {
                         return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                             "invalid command arguments: {error}"
@@ -724,9 +799,18 @@ impl ServerHandler for McpBridge {
                     CallToolResult::success(content)
                 }
             }
-            Err(error) => CallToolResult::error(vec![ContentBlock::text(format!(
-                "application transport failed; mutation outcome may be unknown, do not blindly retry: {error}"
-            ))]),
+            Err(error) => {
+                let message = if request.name.as_ref() == "read"
+                    || request.name.as_ref() == "capabilities"
+                {
+                    format!("read request failed: {error}")
+                } else {
+                    format!(
+                        "application transport failed; mutation outcome may be unknown, do not blindly retry: {error}"
+                    )
+                };
+                CallToolResult::error(vec![ContentBlock::text(message)])
+            }
         };
         Ok(result.into())
     }
@@ -766,6 +850,176 @@ mod tests {
     }
 
     #[test]
+    fn read_tool_is_annotated_and_rejects_forged_mutations_before_forwarding() {
+        for policy in [AccessPolicy::ReadOnly, AccessPolicy::ReadWrite] {
+            let tools = bridge_tools(policy);
+            for tool in &tools {
+                let metadata = serde_json::to_value(tool).unwrap();
+                let read_only = tool.name != "execute";
+                assert_eq!(metadata["annotations"]["readOnlyHint"], read_only);
+                assert_eq!(metadata["annotations"]["destructiveHint"], !read_only);
+                assert_eq!(metadata["annotations"]["idempotentHint"], read_only);
+                assert_eq!(metadata["annotations"]["openWorldHint"], false);
+            }
+            let read = &tools[0];
+            let schema_value = serde_json::Value::Object((*read.input_schema).clone());
+            let schema = schema_value
+                .pointer("/$defs/Command/oneOf")
+                .unwrap()
+                .to_string();
+            assert!(schema.contains("ReadNote"));
+            assert!(schema.contains("SearchNotes"));
+            assert!(!schema.contains("CreateNote"));
+            assert!(!schema.contains("ExportMarkdown"));
+        }
+        // No socket exists: PermissionDenied proves rejection happened before transport.
+        let bridge = McpBridge::new(PathBuf::from("/nonexistent/tanglewood-read-test.sock"));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for command in [
+            Command::CreateNote {
+                path: "forged.md".into(),
+                text: "no".into(),
+            },
+            Command::ExportMarkdown {
+                id: crate::notes::NoteId(Uuid::new_v4()),
+                path: "/tmp/forged-export".into(),
+            },
+        ] {
+            let error = runtime.block_on(bridge.read(command)).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        }
+    }
+
+    #[test]
+    fn cached_execute_schema_stays_usable_across_policy_changes() {
+        let cached = bridge_tools(AccessPolicy::ReadOnly).remove(1);
+        let granted = bridge_tools(AccessPolicy::ReadWrite).remove(1);
+        assert_eq!(cached.input_schema, granted.input_schema);
+        let schema = serde_json::Value::Object((*cached.input_schema).clone()).to_string();
+        assert!(schema.contains("CreateNote"));
+        assert!(schema.contains("Research"));
+        assert!(!schema.contains("SetAutomationWriteEnabled"));
+        assert!(!schema.contains("SetCodexProject"));
+        assert_eq!(
+            serde_json::to_value(cached).unwrap()["annotations"]["readOnlyHint"],
+            false
+        );
+    }
+
+    #[test]
+    fn same_socket_grants_and_revokes_before_queued_dispatch() {
+        let directory = std::env::temp_dir().join(format!("tw-mcp-live-{}", Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("app.sock");
+        let mut app = App::open(&directory.join("vault")).unwrap();
+        let mut owner = OwnerSocket::bind(&path, AccessPolicy::ReadOnly).unwrap();
+        let create = Command::CreateNote {
+            path: "live.md".into(),
+            text: "accepted".into(),
+        };
+        assert!(matches!(
+            round_trip(&mut owner, &mut app, &path, Some(create.clone())),
+            Outcome::Error(CommandError::Unauthorized)
+        ));
+        app.execute(
+            Command::SetAutomationWriteEnabled { enabled: true },
+            Caller::Local,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while app.automation_write_preference() != Some(true) {
+            app.tick();
+            assert!(Instant::now() < deadline, "grant was not persisted");
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(matches!(
+            round_trip(&mut owner, &mut app, &path, None),
+            Outcome::Capabilities {
+                policy: AccessPolicy::ReadWrite,
+                ..
+            }
+        ));
+        assert!(matches!(
+            round_trip(
+                &mut owner,
+                &mut app,
+                &path,
+                Some(Command::SetAutomationWriteEnabled { enabled: true })
+            ),
+            Outcome::Error(CommandError::Unauthorized)
+        ));
+        // Dispatch once so accepted durable work is awaiting acknowledgement.
+        let (accepted_send, requests) = mpsc::sync_channel(1);
+        owner.requests = requests;
+        let (reply, accepted_response) = mpsc::sync_channel(1);
+        accepted_send
+            .send(Pending {
+                request: RequestEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Uuid::new_v4(),
+                    command: Some(create),
+                },
+                deadline: Instant::now() + TIMEOUT,
+                reply,
+            })
+            .unwrap();
+        owner.poll(&mut app);
+        assert_eq!(owner.waiting.len(), 1);
+        // Queue a mutation without dispatching, then revoke locally.
+        let (send, requests) = mpsc::sync_channel(1);
+        owner.requests = requests;
+        let (reply, response) = mpsc::sync_channel(1);
+        send.send(Pending {
+            request: RequestEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: Uuid::new_v4(),
+                command: Some(Command::CreateNote {
+                    path: "denied.md".into(),
+                    text: "no".into(),
+                }),
+            },
+            deadline: Instant::now() + TIMEOUT,
+            reply,
+        })
+        .unwrap();
+        app.execute(
+            Command::SetAutomationWriteEnabled { enabled: false },
+            Caller::Local,
+        )
+        .unwrap();
+        owner.poll(&mut app);
+        assert!(matches!(
+            response.try_recv().unwrap().outcome,
+            Outcome::Error(CommandError::Unauthorized)
+        ));
+        assert_eq!(app.notes().len(), 1);
+        assert_eq!(owner.policy(&app), AccessPolicy::ReadOnly);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            owner.poll(&mut app);
+            if let Ok(response) = accepted_response.try_recv() {
+                assert!(matches!(
+                    response.outcome,
+                    Outcome::Result(CommandResult::Note(_))
+                ));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "accepted mutation did not complete after revoke"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        drop(owner);
+        app.shutdown().unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn owner_socket_routes_policy_revision_and_durable_mutations() {
         let directory = std::env::temp_dir().join(format!("tw-mcp-{}", Uuid::new_v4()));
         fs::create_dir(&directory).unwrap();
@@ -787,18 +1041,30 @@ mod tests {
         else {
             panic!("capabilities missing")
         };
-        assert_eq!(commands.len(), 2);
+        assert_eq!(
+            commands.len(),
+            allowed_variants(AccessPolicy::ReadOnly).len()
+        );
+        assert!(commands.iter().any(|name| name == "research.execute"));
         let schema = serde_json::Value::Object(execute_schema(AccessPolicy::ReadOnly));
         let variants = schema
             .pointer("/$defs/Command/oneOf")
             .unwrap()
             .as_array()
             .unwrap();
-        assert_eq!(variants.len(), 2);
+        assert_eq!(
+            variants.len(),
+            allowed_variants(AccessPolicy::ReadOnly).len()
+        );
         assert!(
             !variants
                 .iter()
                 .any(|variant| variant.to_string().contains("CreateNote"))
+        );
+        assert!(
+            !variants
+                .iter()
+                .any(|variant| variant.to_string().contains("SetCodexProject"))
         );
         drop(owner);
         assert!(!path.exists());
@@ -809,6 +1075,25 @@ mod tests {
             panic!("create failed")
         };
         assert_eq!(created.save.persisted, Some(created.note.revision));
+        // Research mutations use asynchronous request acknowledgements, not Note results.
+        let Outcome::Result(CommandResult::Accepted { request_id }) = round_trip(
+            &mut owner,
+            &mut app,
+            &path,
+            Some(Command::Research(
+                crate::research::ResearchCommand::Create {
+                    title: "Workshop research".into(),
+                    question: "Which evidence applies?".into(),
+                },
+            )),
+        ) else {
+            panic!("durable research acknowledgement missing")
+        };
+        assert_eq!(
+            app.io_status(request_id),
+            Some(&crate::app::IoStatus::Completed)
+        );
+        assert_eq!(app.research_workspaces().len(), 1);
         // Another owner-side edit may arrive while a bridge waits for an older ack.
         app.execute(
             Command::EditNote {
