@@ -4,12 +4,14 @@ use std::collections::HashMap;
 use eframe::egui;
 
 mod code;
-#[cfg(all(target_os = "linux", feature = "codex"))]
+#[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
 mod codex_context;
-#[cfg(all(target_os = "linux", feature = "codex"))]
+#[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
 mod codex_markdown;
 mod document;
 mod editor;
+#[cfg(all(target_os = "linux", feature = "kimi"))]
+mod kimi_panel;
 mod layout;
 mod navigation;
 mod processing;
@@ -183,7 +185,7 @@ pub struct TanglewoodUi {
     picker_status: String,
     #[cfg(all(target_os = "linux", feature = "mcp"))]
     mcp: Option<crate::mcp::OwnerSocket>,
-    #[cfg(all(target_os = "linux", feature = "codex"))]
+    #[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
     conversation: Option<ConversationPanel>,
 }
 
@@ -231,7 +233,7 @@ impl TanglewoodUi {
             picker_status: String::new(),
             #[cfg(all(target_os = "linux", feature = "mcp"))]
             mcp: None,
-            #[cfg(all(target_os = "linux", feature = "codex"))]
+            #[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
             conversation: None,
         }
     }
@@ -424,14 +426,14 @@ impl TanglewoodUi {
         let view = notes
             .iter()
             .find(|view| Some(view.note.id) == self.selected);
-        #[cfg(all(target_os = "linux", feature = "codex"))]
+        #[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
         let codex_mode = self.sidebar_view == SidebarView::Codex && self.conversation.is_some();
-        #[cfg(not(all(target_os = "linux", feature = "codex")))]
+        #[cfg(not(all(target_os = "linux", any(feature = "codex", feature = "kimi"))))]
         let codex_mode = false;
         ui.scope_builder(
             egui::UiBuilder::new().id("shell-navigation-content"),
             |ui| {
-                #[cfg(all(target_os = "linux", feature = "codex"))]
+                #[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
                 if codex_mode {
                     if let Some(panel) = &mut self.conversation {
                         panel.sidebar(ui, ctx);
@@ -615,7 +617,7 @@ impl TanglewoodUi {
                     !self.research_outcomes_open || self.right_pane != pane;
                 self.right_pane = pane;
             }
-            #[cfg(all(target_os = "linux", feature = "codex"))]
+            #[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
             if pane == layout::Pane::Context {
                 if let Some(panel) = &mut self.conversation {
                     panel.context.open = true;
@@ -646,16 +648,17 @@ impl TanglewoodUi {
                 if pane == layout::Pane::Outcomes {
                     action = self.research.outcomes(ui, ctx, &mut self.app, notes);
                 }
-                #[cfg(all(target_os = "linux", feature = "codex"))]
+                #[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
                 if pane == layout::Pane::Context {
                     if let Some(panel) = &mut self.conversation {
                         let ready = panel.ready
                             && panel.pending_thread.is_none()
                             && !panel.disconnecting
                             && panel.context_goal_pending.is_none();
-                        let cwd = panel.config.cwd.clone();
+                        let cwd = panel.provider_cwd();
                         panel.context.open = true;
-                        if let Some(action) = panel.context.panel(ui, ctx, &cwd, ready) {
+                        let kimi = panel.is_kimi();
+                        if let Some(action) = panel.context.panel(ui, ctx, &cwd, ready, kimi) {
                             panel.context_action(action);
                         }
                         context_closed = !panel.context.open;
@@ -1130,7 +1133,7 @@ impl TanglewoodUi {
             self.sidebar_view = SidebarView::Research;
         }
         self.research.poll(ctx, &mut self.app);
-        #[cfg(all(target_os = "linux", feature = "codex"))]
+        #[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
         if let Some(panel) = &mut self.conversation {
             if let Some(enabled) = panel.vault_permission_requested.take() {
                 if let Err(error) = self.app.execute(
@@ -1182,39 +1185,42 @@ impl TanglewoodUi {
                 ctx.request_repaint_after(std::time::Duration::from_millis(20));
             }
         }
-        #[cfg(all(target_os = "linux", feature = "codex"))]
+        #[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
         if let Some(panel) = &mut self.conversation {
             panel.poll(ctx);
-            if panel.persist_project {
-                if let Some(project) = panel.config.project.clone() {
-                    let expected = self.app.codex_project().cloned();
-                    match self.app.execute(
-                        Command::SetCodexProject { expected, project },
-                        Caller::Local,
-                    ) {
-                        Ok(_) => panel.persist_project = false,
-                        Err(error) => panel.error = Some(error.to_string()),
+            #[cfg(feature = "codex")]
+            if !panel.is_kimi() {
+                if panel.persist_project {
+                    if let Some(project) = panel.config.project.clone() {
+                        let expected = self.app.codex_project().cloned();
+                        match self.app.execute(
+                            Command::SetCodexProject { expected, project },
+                            Caller::Local,
+                        ) {
+                            Ok(_) => panel.persist_project = false,
+                            Err(error) => panel.error = Some(error.to_string()),
+                        }
                     }
                 }
-            }
-            panel.binding_durable = !self.app.codex_project_pending()
-                && self.app.codex_project() == panel.config.project.as_ref();
-            panel.metadata_error = self.app.codex_project_error().map(str::to_owned);
-            if panel.resume_requested
-                && panel.project_ready
-                && panel.binding_durable
-                && !panel.threads_loading
-                && !panel.busy()
-                && !panel.history_loading
-            {
-                if let Some(id) = panel
-                    .config
-                    .resume_thread
-                    .clone()
-                    .filter(|id| panel.threads.iter().any(|t| &t.id == id))
+                panel.binding_durable = !self.app.codex_project_pending()
+                    && self.app.codex_project() == panel.config.project.as_ref();
+                panel.metadata_error = self.app.codex_project_error().map(str::to_owned);
+                if panel.resume_requested
+                    && panel.project_ready
+                    && panel.binding_durable
+                    && !panel.threads_loading
+                    && !panel.busy()
+                    && !panel.history_loading
                 {
-                    panel.select_thread(Some(id));
-                    panel.resume_requested = false;
+                    if let Some(id) = panel
+                        .config
+                        .resume_thread
+                        .clone()
+                        .filter(|id| panel.threads.iter().any(|t| &t.id == id))
+                    {
+                        panel.select_thread(Some(id));
+                        panel.resume_requested = false;
+                    }
                 }
             }
         }
@@ -1275,9 +1281,9 @@ impl TanglewoodUi {
             egui::containers::panel::PanelState::load(ctx, egui::Id::new("shell-right"))
                 .map_or(theme::CONTEXT_WIDTH, |s| s.rect.width())
                 .clamp(240.0, 360.0);
-        #[cfg(all(target_os = "linux", feature = "codex"))]
+        #[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
         let context_before = self.conversation.as_ref().is_some_and(|p| p.context.open);
-        #[cfg(not(all(target_os = "linux", feature = "codex")))]
+        #[cfg(not(all(target_os = "linux", any(feature = "codex", feature = "kimi"))))]
         let context_before = false;
         // Test docking capacity even when a pane is closed, so its toggle can reopen it.
         let plan = self
@@ -1369,9 +1375,9 @@ impl TanglewoodUi {
                 self.processing.update(ctx, view, document.clone());
             }
         }
-        #[cfg(all(target_os = "linux", feature = "codex"))]
+        #[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
         let codex_mode = self.sidebar_view == SidebarView::Codex && self.conversation.is_some();
-        #[cfg(not(all(target_os = "linux", feature = "codex")))]
+        #[cfg(not(all(target_os = "linux", any(feature = "codex", feature = "kimi"))))]
         let codex_mode = false;
         if !mobile {
             egui::SidePanel::left("activity-rail")
@@ -1430,7 +1436,7 @@ impl TanglewoodUi {
                             self.sidebar(SidebarView::Research, false);
                         }
                     }
-                    #[cfg(all(target_os = "linux", feature = "codex"))]
+                    #[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
                     if self.conversation.is_some() {
                         if theme::selected_button(ui, theme::Icon::Codex, "Codex", true, codex_mode)
                             .clicked()
@@ -1502,7 +1508,10 @@ impl TanglewoodUi {
                                 ] {
                                     ui.selectable_value(&mut destination, value, label);
                                 }
-                                #[cfg(all(target_os = "linux", feature = "codex"))]
+                                #[cfg(all(
+                                    target_os = "linux",
+                                    any(feature = "codex", feature = "kimi")
+                                ))]
                                 if self.conversation.is_some() {
                                     ui.selectable_value(
                                         &mut destination,
@@ -1554,9 +1563,9 @@ impl TanglewoodUi {
         }
         if self.sidebar_view == SidebarView::Research {
             let wide_research = plan.right;
-            #[cfg(all(target_os = "linux", feature = "codex"))]
+            #[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
             let conversation_available = self.conversation.is_some();
-            #[cfg(not(all(target_os = "linux", feature = "codex")))]
+            #[cfg(not(all(target_os = "linux", any(feature = "codex", feature = "kimi"))))]
             let conversation_available = false;
             egui::TopBottomPanel::top("research-header")
                 .exact_height(theme::HEADER_HEIGHT)
@@ -1630,7 +1639,10 @@ impl TanglewoodUi {
                                 self.research.source_reader(ui, ctx, &mut self.app);
                                 return;
                             }
-                            #[cfg(all(target_os = "linux", feature = "codex"))]
+                            #[cfg(all(
+                                target_os = "linux",
+                                any(feature = "codex", feature = "kimi")
+                            ))]
                             if let Some(panel) = &mut self.conversation {
                                 if panel.thread.is_none() && !panel.history_loading {
                                     ui.add_space(24.0);
@@ -1668,7 +1680,7 @@ impl TanglewoodUi {
                     "Resize context pane",
                 );
             }
-            #[cfg(all(target_os = "linux", feature = "codex"))]
+            #[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(main_fill).inner_margin(24))
                 .show(ctx, |ui| {
@@ -2011,7 +2023,7 @@ impl TanglewoodUi {
             self.layout.open(layout::Pane::Conversations);
             self.research_chats_open = false;
         }
-        #[cfg(all(target_os = "linux", feature = "codex"))]
+        #[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
         if self.conversation.as_ref().is_some_and(|p| p.context.open)
             && !context_before
             && !plan.right
@@ -2028,7 +2040,7 @@ impl TanglewoodUi {
         if self.sidebar_view == SidebarView::Research {
             panes.push(layout::Pane::Outcomes);
         }
-        #[cfg(all(target_os = "linux", feature = "codex"))]
+        #[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
         if self.conversation.is_some()
             && matches!(
                 self.sidebar_view,
@@ -2073,7 +2085,7 @@ impl TanglewoodUi {
                             research_action = Some(action);
                         }
                     }
-                    #[cfg(all(target_os = "linux", feature = "codex"))]
+                    #[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
                     if pane == layout::Pane::Conversations {
                         if let Some(panel) = &mut self.conversation {
                             ui.scope_builder(
@@ -2099,7 +2111,7 @@ impl TanglewoodUi {
                     } else if next.right() && plan.right {
                         self.right_pane = next;
                         self.research_outcomes_open = true;
-                        #[cfg(all(target_os = "linux", feature = "codex"))]
+                        #[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
                         if let Some(panel) = &mut self.conversation {
                             if next == layout::Pane::Context {
                                 panel.context.open = true;
@@ -2117,7 +2129,7 @@ impl TanglewoodUi {
                 } else {
                     self.right_pane = pane;
                     self.research_outcomes_open = true;
-                    #[cfg(all(target_os = "linux", feature = "codex"))]
+                    #[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
                     if let Some(panel) = &mut self.conversation {
                         panel.context.open = pane == layout::Pane::Context;
                     }
@@ -2165,7 +2177,7 @@ impl TanglewoodUi {
                     self.sidebar_view = SidebarView::Notes;
                 }
                 research::Action::OpenThread(thread) => {
-                    #[cfg(all(target_os = "linux", feature = "codex"))]
+                    #[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
                     if let Some(panel) = &mut self.conversation {
                         if panel
                             .research_capture()
@@ -2183,7 +2195,10 @@ impl TanglewoodUi {
                             self.research.error = Some("Conversation is not listed in the current Codex project. Refresh that project's conversations first.".into());
                         }
                     }
-                    #[cfg(not(all(target_os = "linux", feature = "codex")))]
+                    #[cfg(not(all(
+                        target_os = "linux",
+                        any(feature = "codex", feature = "kimi")
+                    )))]
                     {
                         let _ = thread;
                         self.research.error =
@@ -2195,7 +2210,7 @@ impl TanglewoodUi {
                     evidence,
                     external,
                 } => {
-                    #[cfg(all(target_os = "linux", feature = "codex"))]
+                    #[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
                     if let Some(panel) = &mut self.conversation {
                         match panel.prepare_research_context(prompt, evidence, external) {
                             Ok(()) => {
@@ -2212,7 +2227,10 @@ impl TanglewoodUi {
                             "Conversation is unavailable in this session. Use Copy prompt.".into(),
                         );
                     }
-                    #[cfg(not(all(target_os = "linux", feature = "codex")))]
+                    #[cfg(not(all(
+                        target_os = "linux",
+                        any(feature = "codex", feature = "kimi")
+                    )))]
                     {
                         let _ = (prompt, evidence, external);
                         self.research.error = Some(
@@ -2590,11 +2608,11 @@ impl TanglewoodUi {
         let local_drafts = self.drafts.values().any(|draft| draft.unsubmitted());
         #[allow(unused_mut)]
         let mut conversation_pending = false;
-        #[cfg(all(target_os = "linux", feature = "codex"))]
+        #[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
         if self.closing {
             if let Some(panel) = &mut self.conversation {
                 panel.disconnect();
-                conversation_pending = panel.adapter.is_some();
+                conversation_pending = panel.has_adapter();
                 if conversation_pending {
                     ctx.request_repaint_after(std::time::Duration::from_millis(20));
                 }
@@ -3476,16 +3494,19 @@ mod tests {
 #[cfg(all(target_os = "linux", feature = "codex"))]
 use crate::codex::{
     ApprovalDecision, ApprovalMode, CodexAdapter, CodexConfig, CodexEvent, CodexRequest,
-    ThreadAction, ThreadWorkState, TurnControls, WorkMode,
+    ThreadAction, TurnControls, WorkMode,
 };
 
-#[cfg(all(target_os = "linux", feature = "codex"))]
+#[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
+use crate::conversation::ThreadWorkState;
+
+#[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
 fn chat_status(status: &str, exit_code: Option<i64>) -> (&str, bool) {
     if exit_code.is_some_and(|code| code != 0) {
         return ("Failed", true);
     }
     match status {
-        "inProgress" | "started" | "running" => ("Running", false),
+        "inProgress" | "in_progress" | "started" | "running" => ("Running", false),
         "completed" | "done" => ("Done", false),
         "failed" | "error" => ("Failed", true),
         "unknownOutcome" => ("Outcome unknown", true),
@@ -3495,7 +3516,7 @@ fn chat_status(status: &str, exit_code: Option<i64>) -> (&str, bool) {
     }
 }
 
-#[cfg(all(target_os = "linux", feature = "codex"))]
+#[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
 fn chat_event_icon(
     ui: &mut egui::Ui,
     openness: f32,
@@ -3521,13 +3542,13 @@ fn chat_event_icon(
     }
 }
 
-#[cfg(all(target_os = "linux", feature = "codex"))]
+#[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
 struct ConversationMessage {
     role: &'static str,
     key: Option<(String, String, String)>,
     text: String,
-    command: Option<crate::codex::CommandExecution>,
-    activity: Option<crate::codex::Activity>,
+    command: Option<crate::conversation::CommandExecution>,
+    activity: Option<crate::conversation::Activity>,
 }
 #[cfg(all(target_os = "linux", feature = "codex"))]
 struct ConversationApproval {
@@ -3545,8 +3566,12 @@ struct ThreadActionDialog {
     action: ThreadAction,
     focus: bool,
 }
-#[cfg(all(target_os = "linux", feature = "codex"))]
+#[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
 struct ConversationPanel {
+    #[cfg(feature = "kimi")]
+    kimi: Option<kimi_panel::KimiState>,
+    #[cfg(feature = "kimi")]
+    active_kimi: bool,
     vault_permission_requested: Option<bool>,
     vault_write_enabled: Option<bool>,
     research_requested: bool,
@@ -3559,18 +3584,22 @@ struct ConversationPanel {
         String,
         Vec<crate::research_desktop::Passage>,
     )>,
+    #[cfg(feature = "codex")]
     config: CodexConfig,
+    #[cfg(feature = "codex")]
     adapter: Option<CodexAdapter>,
     project_ready: bool,
     fresh_thread: bool,
     resume_requested: bool,
     pending_thread: Option<Option<String>>,
+    #[cfg(feature = "codex")]
     pending_thread_action: Option<String>,
+    #[cfg(feature = "codex")]
     thread_action_dialog: Option<ThreadActionDialog>,
     binding_durable: bool,
     persist_project: bool,
     metadata_error: Option<String>,
-    threads: Vec<crate::codex::ThreadSummary>,
+    threads: Vec<crate::conversation::ThreadSummary>,
     threads_cursor: Option<String>,
     threads_loading: bool,
     threads_append: bool,
@@ -3580,12 +3609,19 @@ struct ConversationPanel {
     history_loading: bool,
     renaming: bool,
     project_name: String,
+    #[cfg(feature = "codex")]
     models: Vec<crate::codex::ModelChoice>,
+    #[cfg(feature = "codex")]
     models_cursor: Option<String>,
+    #[cfg(feature = "codex")]
     models_loading: bool,
+    #[cfg(feature = "codex")]
     selected_model: Option<String>,
+    #[cfg(feature = "codex")]
     selected_effort: Option<String>,
+    #[cfg(feature = "codex")]
     model_override: bool,
+    #[cfg(feature = "codex")]
     controls: TurnControls,
     composer_height: f32,
     context: codex_context::ContextUi,
@@ -3599,6 +3635,7 @@ struct ConversationPanel {
     prompt: String,
     messages: Vec<ConversationMessage>,
     markdown: codex_markdown::Cache,
+    #[cfg(feature = "codex")]
     approvals: Vec<ConversationApproval>,
     status: String,
     error: Option<String>,
@@ -3614,6 +3651,11 @@ impl ConversationPanel {
         self.prepare_research_context(prompt, evidence, false)
     }
     fn research_capture(&self) -> research::ConversationCapture {
+        #[cfg(feature = "kimi")]
+        if self.active_kimi {
+            return self.kimi_research_capture();
+        }
+
         let Some(project_id) = self
             .config
             .project
@@ -3699,6 +3741,11 @@ impl ConversationPanel {
         evidence: String,
         external: bool,
     ) -> Result<(), &'static str> {
+        #[cfg(feature = "kimi")]
+        if self.active_kimi {
+            return self.prepare_kimi_research(prompt, evidence, external);
+        }
+
         if !self.prompt.is_empty()
             || !self.context.draft.is_empty()
             || self.pending_thread.is_some()
@@ -3742,7 +3789,6 @@ impl ConversationPanel {
         .into();
         Ok(())
     }
-    const BYTE_LIMIT: usize = 2 * 1024 * 1024;
     fn new(config: CodexConfig) -> Self {
         let project_name = config
             .project
@@ -3751,6 +3797,10 @@ impl ConversationPanel {
             .unwrap_or_default();
         let resume_requested = config.resume_thread.is_some();
         Self {
+            #[cfg(feature = "kimi")]
+            kimi: None,
+            #[cfg(feature = "kimi")]
+            active_kimi: false,
             vault_permission_requested: None,
             vault_write_enabled: None,
             research_requested: false,
@@ -3803,221 +3853,6 @@ impl ConversationPanel {
             error: None,
         }
     }
-    fn busy(&self) -> bool {
-        self.starting
-            || self.active_turn.is_some()
-            || self.pending_thread_action.is_some()
-            || self.context.loading()
-            || self.context_goal_pending.is_some()
-            || self.context_submit_pending
-    }
-    fn bytes(&self) -> usize {
-        self.messages
-            .iter()
-            .map(|message| {
-                message.text.len()
-                    + message.activity.as_ref().map_or(0, |a| {
-                        a.item.len() + a.kind.len() + a.title.len() + a.status.len()
-                    })
-                    + message.command.as_ref().map_or(0, |c| {
-                        c.command.len() + c.cwd.len() + c.status.len() + c.item.len()
-                    })
-                    + message.key.as_ref().map_or(0, |(thread, turn, item)| {
-                        thread.len() + turn.len() + item.len()
-                    })
-            })
-            .sum::<usize>()
-            + self.prompt_drafts.values().map(String::len).sum::<usize>()
-            + self.context.bytes()
-            + self
-                .approvals
-                .iter()
-                .map(|approval| {
-                    approval.details.len()
-                        + approval.thread.len()
-                        + approval.turn.len()
-                        + approval.method.len()
-                        + approval.id.to_string().len()
-                })
-                .sum::<usize>()
-    }
-    fn disconnect(&mut self) {
-        if self.disconnecting {
-            return;
-        }
-        if let Some(adapter) = &self.adapter {
-            match adapter.try_send(CodexRequest::Disconnect) {
-                Ok(()) => {
-                    self.disconnecting = true;
-                    self.status = "Disconnecting…".into();
-                }
-                Err(error) => self.error = Some(error),
-            }
-        }
-    }
-    fn limit_exceeded(&mut self) {
-        self.error=Some("Conversation display limit reached. Disconnecting; additional output is not displayed. Clear the conversation before reconnecting.".into());
-        self.disconnect();
-    }
-    fn message(&mut self, key: (String, String, String), text: String, replace: bool) {
-        let existing = self
-            .messages
-            .iter()
-            .position(|message| message.key.as_ref() == Some(&key));
-        let previous = existing.map_or(0, |index| {
-            if replace {
-                self.messages[index].text.len()
-            } else {
-                0
-            }
-        });
-        if self.bytes().saturating_sub(previous)
-            + text.len()
-            + key.0.len()
-            + key.1.len()
-            + key.2.len()
-            > Self::BYTE_LIMIT
-            || (existing.is_none() && self.messages.len() >= 256)
-        {
-            self.limit_exceeded();
-            return;
-        }
-        if let Some(index) = existing {
-            if replace {
-                self.messages[index].text = text;
-            } else {
-                self.messages[index].text.push_str(&text);
-            }
-        } else {
-            self.messages.push(ConversationMessage {
-                role: "Codex",
-                key: Some(key),
-                text,
-                command: None,
-                activity: None,
-            });
-        }
-    }
-    fn command_card(
-        &mut self,
-        thread: String,
-        turn: String,
-        mut command: crate::codex::CommandExecution,
-    ) {
-        if self.thread.as_ref() != Some(&thread) {
-            return;
-        }
-        let key = (thread, turn, command.item.clone());
-        if !command.output_complete {
-            if let Some(previous) = self.messages.iter().find(|m| m.key.as_ref() == Some(&key)) {
-                command.output = previous.text.clone();
-                command.truncated |= previous.command.as_ref().is_some_and(|c| c.truncated);
-            }
-        }
-        let output = std::mem::take(&mut command.output);
-        let metadata_bytes =
-            command.command.len() + command.cwd.len() + command.status.len() + command.item.len();
-        if self.bytes() + output.len() + metadata_bytes > Self::BYTE_LIMIT {
-            self.limit_exceeded();
-            return;
-        }
-        self.message(key.clone(), output, true);
-        if let Some(message) = self
-            .messages
-            .iter_mut()
-            .find(|m| m.key.as_ref() == Some(&key))
-        {
-            message.command = Some(command);
-        }
-    }
-    fn activity_card(
-        &mut self,
-        thread: String,
-        turn: String,
-        mut activity: crate::codex::Activity,
-    ) {
-        if self.thread.as_ref() != Some(&thread) {
-            return;
-        }
-        let key = (thread, turn, activity.item.clone());
-        let details = std::mem::take(&mut activity.details);
-        let metadata = activity.item.len()
-            + activity.kind.len()
-            + activity.title.len()
-            + activity.status.len();
-        if self.bytes() + details.len() + metadata > Self::BYTE_LIMIT {
-            self.limit_exceeded();
-            return;
-        }
-        self.message(key.clone(), details, true);
-        if let Some(message) = self
-            .messages
-            .iter_mut()
-            .find(|m| m.key.as_ref() == Some(&key))
-        {
-            message.activity = Some(activity);
-        }
-    }
-    fn retire_activity(&mut self, thread: Option<&str>, turn: Option<&str>, status: &str) {
-        for message in &mut self.messages {
-            let Some((owner, work, _)) = &message.key else {
-                continue;
-            };
-            if thread.is_some_and(|t| t != owner) || turn.is_some_and(|t| t != work) {
-                continue;
-            }
-            if let Some(activity) = &mut message.activity {
-                if matches!(
-                    activity.status.as_str(),
-                    "inProgress" | "started" | "running"
-                ) {
-                    activity.status = status.into();
-                }
-            }
-            if let Some(command) = &mut message.command {
-                if matches!(
-                    command.status.as_str(),
-                    "inProgress" | "started" | "running"
-                ) {
-                    command.status = status.into();
-                }
-            }
-        }
-    }
-    fn plan_rows(&mut self, ui: &mut egui::Ui) {
-        if self.context.plan.is_empty() && self.context.plan_text.is_none() {
-            return;
-        }
-        egui::CollapsingHeader::new("Plan")
-            .id_salt(("conversation-plan", &self.thread))
-            .default_open(self.context.plan.iter().any(|s| s.status == "inProgress"))
-            .show(ui, |ui| {
-                if let Some(text) = &self.context.plan_text {
-                    self.markdown.show(ui, ("plan-text", &self.thread), text);
-                }
-                for step in &self.context.plan {
-                    ui.horizontal_top(|ui| {
-                        match step.status.as_str() {
-                            "inProgress" if self.active_turn.is_some() => {
-                                ui.add(egui::Spinner::new().size(12.0));
-                            }
-                            "inProgress" => {
-                                ui.weak("◉");
-                            }
-                            "completed" => {
-                                ui.weak("✓");
-                            }
-                            _ => {
-                                ui.weak("○");
-                            }
-                        }
-                        ui.add(egui::Label::new(&step.text).wrap())
-                            .on_hover_text(format!("Codex plan step · {}", step.status));
-                    });
-                }
-            });
-        ui.add_space(12.0);
-    }
     fn accept_turn(&mut self, thread: &str) {
         if self.thread.as_deref() == Some(thread) && self.context_submit_pending {
             self.context.draft = Default::default();
@@ -4035,6 +3870,14 @@ impl ConversationPanel {
         self.status = "Streaming…".into();
     }
     fn poll(&mut self, ctx: &egui::Context) {
+        #[cfg(feature = "kimi")]
+        self.advance_backend_switch();
+        #[cfg(feature = "kimi")]
+        if self.active_kimi {
+            self.poll_kimi(ctx);
+            return;
+        }
+
         self.context.poll(ctx);
         for _ in 0..64 {
             let Some(event) = self.adapter.as_ref().and_then(CodexAdapter::try_recv) else {
@@ -4276,7 +4119,7 @@ impl ConversationPanel {
                             {
                                 self.threads.insert(
                                     0,
-                                    crate::codex::ThreadSummary {
+                                    crate::conversation::ThreadSummary {
                                         id: self.thread.clone().unwrap(),
                                         title: "New thread".into(),
                                         updated_at: 0,
@@ -4402,6 +4245,9 @@ impl ConversationPanel {
                         }
                         _ => error,
                     });
+                    #[cfg(feature = "kimi")]
+                    self.advance_backend_switch();
+                    ctx.request_repaint();
                     return;
                 }
             }
@@ -4430,6 +4276,12 @@ impl ConversationPanel {
         self.threads_loading = self.send_request(CodexRequest::ListThreads { cursor });
     }
     fn select_thread(&mut self, id: Option<String>) {
+        #[cfg(feature = "kimi")]
+        if self.active_kimi {
+            self.select_kimi(id);
+            return;
+        }
+
         if self.busy() || self.history_loading || !self.binding_durable || !self.project_ready {
             return;
         }
@@ -4593,7 +4445,7 @@ impl ConversationPanel {
                         row.state = ThreadWorkState::Error;
                     } else {
                         // At most 256 ordinary rows plus one row per bounded cached draft.
-                        self.threads.push(crate::codex::ThreadSummary {
+                        self.threads.push(crate::conversation::ThreadSummary {
                             id: id.into(),
                             title: "Draft — unavailable conversation".into(),
                             state: ThreadWorkState::Error,
@@ -4715,7 +4567,7 @@ impl ConversationPanel {
             ThreadWorkState::Unknown => "Status unknown",
         }
     }
-    fn thread_state(&self, thread: &crate::codex::ThreadSummary) -> ThreadWorkState {
+    fn thread_state(&self, thread: &crate::conversation::ThreadSummary) -> ThreadWorkState {
         if !self.project_ready || self.disconnecting {
             return ThreadWorkState::Unknown;
         }
@@ -4796,6 +4648,12 @@ impl ConversationPanel {
         }
     }
     fn sidebar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        #[cfg(feature = "kimi")]
+        if self.active_kimi {
+            self.kimi_sidebar(ui, ctx);
+            return;
+        }
+
         ui.horizontal(|ui| {
             ui.strong("Codex");
             ui.add_space(
@@ -5429,6 +5287,12 @@ impl ConversationPanel {
         selected: Option<NoteId>,
         research: bool,
     ) {
+        #[cfg(feature = "kimi")]
+        if self.active_kimi {
+            self.show_kimi(ui, ctx, app, selected, research);
+            return;
+        }
+
         let title = self
             .thread
             .as_ref()
@@ -5437,6 +5301,8 @@ impl ConversationPanel {
             .unwrap_or("Codex")
             .to_owned();
         if !research {
+            #[cfg(feature = "kimi")]
+            self.backend_picker(ui);
             ui.horizontal(|ui| {
                 let width = (ui.available_width() - 92.0).max(40.0);
                 ui.allocate_ui_with_layout(
@@ -5573,6 +5439,432 @@ impl ConversationPanel {
                 cursor: self.history_cursor.clone(),
             });
         }
+        self.transcript(ui, ctx);
+        let mut answer = None;
+        for approval in &self.approvals {
+            ui.group(|ui| {
+                ui.strong("Approval required");
+                ui.label(&approval.method);
+                egui::ScrollArea::vertical()
+                    .id_salt(("approval", approval.id.to_string()))
+                    .max_height(150.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(&approval.details).monospace())
+                                .selectable(true)
+                                .wrap(),
+                        );
+                    });
+                ui.horizontal_wrapped(|ui| {
+                    for decision in &approval.decisions {
+                        let label = match decision {
+                            ApprovalDecision::Accept => "Allow once",
+                            ApprovalDecision::Decline => "Decline",
+                            ApprovalDecision::Cancel
+                                if approval.method == "mcpServer/elicitation/request" =>
+                            {
+                                "Cancel request"
+                            }
+                            ApprovalDecision::Cancel => "Cancel turn",
+                        };
+                        if ui
+                            .add_enabled(!self.disconnecting, egui::Button::new(label))
+                            .clicked()
+                        {
+                            answer = Some((approval.id.clone(), *decision));
+                        }
+                    }
+                });
+            });
+        }
+        if let Some((id, decision)) = answer {
+            if let Some(adapter) = &self.adapter {
+                match adapter.try_send(CodexRequest::AnswerApproval {
+                    id: id.clone(),
+                    decision,
+                }) {
+                    Ok(()) => self.approvals.retain(|approval| approval.id != id),
+                    Err(error) => self.error = Some(error),
+                }
+            }
+        }
+        if let Some(action) = self.context.goal_banner(
+            ui,
+            self.ready
+                && self.context.goal_loaded
+                && self.context_goal_pending.is_none()
+                && !self.history_loading
+                && self.pending_thread.is_none(),
+        ) {
+            self.context_action(action);
+        }
+        let composer = egui::Frame::new()
+            .fill(ui.visuals().widgets.inactive.bg_fill)
+            .corner_radius(20)
+            .inner_margin(egui::Margin::symmetric(14, 12))
+            .show(ui, |ui| {
+                let mut automatic_evidence=String::new();
+                egui::ScrollArea::vertical().id_salt("composer-body").max_height((ctx.content_rect().height()*0.35).clamp(48.0,320.0)).auto_shrink([false,true]).show(ui,|ui| {
+                let can_edit_context = !self.busy();
+                ui.add_enabled_ui(can_edit_context, |ui| self.context.chips(ui));
+                let prompt = ui.add(
+                    egui::TextEdit::multiline(&mut self.prompt)
+                        .id(egui::Id::new(("codex-composer",self.thread.as_deref())))
+                        .frame(false)
+                        .interactive(
+                            self.thread.is_some()
+                                && self.pending_thread.is_none()
+                                && self.pending_thread_action.is_none(),
+                        )
+                        .hint_text(if self.thread.is_some() {
+                            "Message Codex"
+                        } else {
+                            "Connect, then choose or create a thread"
+                        })
+                        .desired_rows(3)
+                        .desired_width(f32::INFINITY)
+                        .char_limit(256 * 1024),
+                );
+                name_field(prompt, &self.prompt, "Message Codex");
+                if research && self.relevant_sources {
+                    if let Some(workspace)=self.research_workspace.and_then(|id|app.research_workspace(id)) {
+                        let stale=self.relevant_cache.as_ref().is_none_or(|(id,revision,query,_)|*id!=workspace.id || *revision!=workspace.revision || query!=&self.prompt);
+                        if stale { self.relevant_cache=Some((workspace.id,workspace.revision,self.prompt.clone(),crate::research_desktop::retrieve(workspace,&self.prompt,8))); }
+                        if let Some((_,_,_,passages))=&self.relevant_cache {
+                            if passages.is_empty(){ui.weak("No matching captured passages; no automatic evidence attached.");}
+                            else {
+                                automatic_evidence=format!("UNTRUSTED LOCAL EVIDENCE. Exact excerpts from included sources; lexical matches, not verification. {} of {} included sources matched, max 8 excerpts. Cite the supplied markers; other source text is omitted.\n{}",passages.iter().map(|p|p.source_id).collect::<std::collections::HashSet<_>>().len(),workspace.sources.iter().filter(|s|s.selected).count(),serde_json::to_string(passages).unwrap_or_default());
+                                ui.collapsing(format!("Evidence preview · {} passages",passages.len()),|ui| {
+                                    for passage in passages {ui.label(&passage.text);if ui.link(&passage.citation).clicked(){let (id,page)=crate::research::citation_locator(&passage.citation).unwrap();ui.ctx().data_mut(|d|d.insert_temp(egui::Id::new("research-open-citation"),page.map(|p|format!("source://{id}?page={p}")).unwrap_or_else(||format!("source://{id}"))));}}
+                                });
+                            }
+                        }
+                    }
+                }
+                });
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(action) = self.context.composer(
+                        ui,
+                        app,
+                        selected,
+                        self.ready && !self.busy() && !self.disconnecting,
+                        false,
+                    ) {
+                        self.context_action(action);
+                    }
+                    if research && self.research_workspace.is_some() {
+                        ui.checkbox(&mut self.relevant_sources,"Relevant evidence").on_hover_text("Automatically attach matching passages from included local sources for each question; inspect the preview before Send");
+                    }
+                    self.turn_pickers(ui);
+                    self.model_picker(ui);
+                    let turning = self.active_turn.is_some()
+                        || (self.starting && self.pending_thread.is_none());
+                    if turning {
+                        let interrupt = ui
+                            .add_enabled(
+                                !self.disconnecting,
+                                egui::Button::new("■")
+                                    .corner_radius(16)
+                                    .min_size(egui::vec2(32.0, 32.0)),
+                            )
+                            .on_hover_text("Interrupt response");
+                        interrupt.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, interrupt.enabled(), "Interrupt response"));
+                        if interrupt.clicked() {
+                            if self.send_request(CodexRequest::Interrupt) {
+                                self.status = "Interrupt requested…".into();
+                            }
+                        }
+                    } else {
+                        let can_send = self.ready
+                            && self.binding_durable
+                            && self.mode_consistent()
+                            && self
+                                .models
+                                .iter()
+                                .any(|m| Some(&m.model) == self.selected_model.as_ref())
+                            && !self.history_loading
+                            && !self.busy()
+                            && !self.disconnecting
+                            && !self.prompt.trim().is_empty()
+                            && self.prompt.len() + self.context.total_input_bytes() + automatic_evidence.len() <= 256 * 1024
+                            && self.context.skills_valid();
+                        let send = ui
+                            .add_enabled(
+                                can_send,
+                                egui::Button::new("↑")
+                                    .corner_radius(16)
+                                    .min_size(egui::vec2(32.0, 32.0)),
+                            )
+                            .on_hover_text("Send message");
+                        send.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, send.enabled(), "Send message"));
+                        if send.clicked() {
+                            if self.bytes() + self.prompt.len() > Self::BYTE_LIMIT
+                                || self.messages.len() >= 256
+                            {
+                                self.limit_exceeded();
+                            } else {
+                                let request = CodexRequest::SendPromptWithControls {
+                                    text: self.prompt.clone(),
+                                    model: self.selected_model.clone(),
+                                    effort: self.selected_effort.clone(),
+                                    attachments: {
+                                        let mut attachments=self.context.draft.attachments.clone();
+                                        if !automatic_evidence.is_empty(){attachments.push(crate::codex::PromptAttachment {name:"Relevant local evidence".into(),text:automatic_evidence.clone()});}
+                                        attachments
+                                    },
+                                    skills: self.context.draft.skills.clone(),
+                                    controls: self.controls,
+                                };
+                                if self.send_request(request) {
+                                    self.context_submit_pending = true;
+                                    self.messages.push(ConversationMessage {
+                                        role: "You",
+                                        key: None,
+                                        text: std::mem::take(&mut self.prompt),
+                                        command: None,
+                                        activity: None,
+                                    });
+                                    self.starting = true;
+                                    self.status = "Starting turn…".into();
+                                    self.error = None;
+                                }
+                            }
+                        }
+                    }
+                });
+            });
+        self.composer_height = composer.response.rect.height() + ui.spacing().item_spacing.y;
+        if self.prompt.len() + self.context.total_input_bytes() > 256 * 1024 {
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                "Message and attached context exceed 256 KiB; shorten or detach before sending.",
+            );
+        }
+        if let Some(action) = self.context.dialogs(
+            ctx,
+            self.ready && !self.busy() && self.context_goal_pending.is_none(),
+        ) {
+            self.context_action(action);
+        }
+        self.thread_action_modal(ctx);
+    }
+}
+
+#[cfg(all(target_os = "linux", any(feature = "codex", feature = "kimi")))]
+impl ConversationPanel {
+    const BYTE_LIMIT: usize = 2 * 1024 * 1024;
+    fn busy(&self) -> bool {
+        self.starting
+            || self.active_turn.is_some()
+            || self.has_pending_provider_operation()
+            || self.context.loading()
+            || self.context_goal_pending.is_some()
+            || self.context_submit_pending
+    }
+    fn bytes(&self) -> usize {
+        self.messages
+            .iter()
+            .map(|message| {
+                message.text.len()
+                    + message.activity.as_ref().map_or(0, |a| {
+                        a.item.len() + a.kind.len() + a.title.len() + a.status.len()
+                    })
+                    + message.command.as_ref().map_or(0, |c| {
+                        c.command.len() + c.cwd.len() + c.status.len() + c.item.len()
+                    })
+                    + message.key.as_ref().map_or(0, |(thread, turn, item)| {
+                        thread.len() + turn.len() + item.len()
+                    })
+            })
+            .sum::<usize>()
+            + self.prompt_drafts.values().map(String::len).sum::<usize>()
+            + self.context.bytes()
+            + self.approval_bytes()
+    }
+    fn disconnect(&mut self) {
+        #[cfg(feature = "kimi")]
+        if self.active_kimi {
+            self.disconnect_kimi();
+            return;
+        }
+        #[cfg(feature = "codex")]
+        if !self.disconnecting {
+            if let Some(adapter) = &self.adapter {
+                match adapter.try_send(CodexRequest::Disconnect) {
+                    Ok(()) => {
+                        self.disconnecting = true;
+                        self.status = "Disconnecting…".into();
+                    }
+                    Err(error) => self.error = Some(error),
+                }
+            }
+        }
+    }
+    fn limit_exceeded(&mut self) {
+        self.error=Some("Conversation display limit reached. Disconnecting; additional output is not displayed. Clear the conversation before reconnecting.".into());
+        self.disconnect();
+    }
+    fn message(&mut self, key: (String, String, String), text: String, replace: bool) {
+        let existing = self
+            .messages
+            .iter()
+            .position(|message| message.key.as_ref() == Some(&key));
+        let previous = existing.map_or(0, |index| {
+            if replace {
+                self.messages[index].text.len()
+            } else {
+                0
+            }
+        });
+        if self.bytes().saturating_sub(previous)
+            + text.len()
+            + key.0.len()
+            + key.1.len()
+            + key.2.len()
+            > Self::BYTE_LIMIT
+            || (existing.is_none() && self.messages.len() >= 256)
+        {
+            self.limit_exceeded();
+            return;
+        }
+        if let Some(index) = existing {
+            if replace {
+                self.messages[index].text = text;
+            } else {
+                self.messages[index].text.push_str(&text);
+            }
+        } else {
+            self.messages.push(ConversationMessage {
+                role: self.provider_name(),
+                key: Some(key),
+                text,
+                command: None,
+                activity: None,
+            });
+        }
+    }
+    fn command_card(
+        &mut self,
+        thread: String,
+        turn: String,
+        mut command: crate::conversation::CommandExecution,
+    ) {
+        if self.thread.as_ref() != Some(&thread) {
+            return;
+        }
+        let key = (thread, turn, command.item.clone());
+        if !command.output_complete {
+            if let Some(previous) = self.messages.iter().find(|m| m.key.as_ref() == Some(&key)) {
+                command.output = previous.text.clone();
+                command.truncated |= previous.command.as_ref().is_some_and(|c| c.truncated);
+            }
+        }
+        let output = std::mem::take(&mut command.output);
+        let metadata_bytes =
+            command.command.len() + command.cwd.len() + command.status.len() + command.item.len();
+        if self.bytes() + output.len() + metadata_bytes > Self::BYTE_LIMIT {
+            self.limit_exceeded();
+            return;
+        }
+        self.message(key.clone(), output, true);
+        if let Some(message) = self
+            .messages
+            .iter_mut()
+            .find(|m| m.key.as_ref() == Some(&key))
+        {
+            message.command = Some(command);
+        }
+    }
+    fn activity_card(
+        &mut self,
+        thread: String,
+        turn: String,
+        mut activity: crate::conversation::Activity,
+    ) {
+        if self.thread.as_ref() != Some(&thread) {
+            return;
+        }
+        let key = (thread, turn, activity.item.clone());
+        let details = std::mem::take(&mut activity.details);
+        let metadata = activity.item.len()
+            + activity.kind.len()
+            + activity.title.len()
+            + activity.status.len();
+        if self.bytes() + details.len() + metadata > Self::BYTE_LIMIT {
+            self.limit_exceeded();
+            return;
+        }
+        self.message(key.clone(), details, true);
+        if let Some(message) = self
+            .messages
+            .iter_mut()
+            .find(|m| m.key.as_ref() == Some(&key))
+        {
+            message.activity = Some(activity);
+        }
+    }
+    fn retire_activity(&mut self, thread: Option<&str>, turn: Option<&str>, status: &str) {
+        for message in &mut self.messages {
+            let Some((owner, work, _)) = &message.key else {
+                continue;
+            };
+            if thread.is_some_and(|t| t != owner) || turn.is_some_and(|t| t != work) {
+                continue;
+            }
+            if let Some(activity) = &mut message.activity {
+                if matches!(
+                    activity.status.as_str(),
+                    "inProgress" | "in_progress" | "started" | "running"
+                ) {
+                    activity.status = status.into();
+                }
+            }
+            if let Some(command) = &mut message.command {
+                if matches!(
+                    command.status.as_str(),
+                    "inProgress" | "in_progress" | "started" | "running"
+                ) {
+                    command.status = status.into();
+                }
+            }
+        }
+    }
+    fn plan_rows(&mut self, ui: &mut egui::Ui) {
+        if self.context.plan.is_empty() && self.context.plan_text.is_none() {
+            return;
+        }
+        egui::CollapsingHeader::new("Plan")
+            .id_salt(("conversation-plan", &self.thread))
+            .default_open(self.context.plan.iter().any(|s| s.status == "inProgress"))
+            .show(ui, |ui| {
+                if let Some(text) = &self.context.plan_text {
+                    self.markdown.show(ui, ("plan-text", &self.thread), text);
+                }
+                for step in &self.context.plan {
+                    ui.horizontal_top(|ui| {
+                        match step.status.as_str() {
+                            "inProgress" | "in_progress" if self.active_turn.is_some() => {
+                                ui.add(egui::Spinner::new().size(12.0));
+                            }
+                            "inProgress" | "in_progress" => {
+                                ui.weak("◉");
+                            }
+                            "completed" => {
+                                ui.weak("✓");
+                            }
+                            _ => {
+                                ui.weak("○");
+                            }
+                        }
+                        ui.add(egui::Label::new(&step.text).wrap())
+                            .on_hover_text(format!("Plan step · {}", step.status));
+                    });
+                }
+            });
+        ui.add_space(12.0);
+    }
+    fn transcript(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::ScrollArea::vertical()
             .id_salt("codex-transcript")
             .stick_to_bottom(true)
@@ -5585,7 +5877,7 @@ impl ConversationPanel {
                     } else {
                         0.0
                     }
-                    - self.approvals.len() as f32 * 160.0)
+                    - self.approval_count() as f32 * 160.0)
                     .max(100.0),
             )
             .show(ui, |ui| {
@@ -5729,7 +6021,7 @@ impl ConversationPanel {
                                 ui.add(egui::Label::new(&message.text).selectable(true).wrap());
                             });
                     } else {
-                        ui.strong("Codex");
+                        ui.strong(self.provider_name());
                         self.markdown
                             .show(ui, (&self.thread, &message.key, index), &message.text);
                         let copy =
@@ -5767,7 +6059,7 @@ impl ConversationPanel {
                         20.0
                     });
                 }
-                self.context.transcript_files(ui, ctx, &self.config.cwd);
+                self.context.transcript_files(ui, ctx, &self.provider_cwd());
                 self.plan_rows(ui);
                 if self.starting || self.active_turn.is_some() {
                     ui.horizontal(|ui| {
@@ -5780,213 +6072,96 @@ impl ConversationPanel {
                     });
                 }
             });
-        let mut answer = None;
-        for approval in &self.approvals {
-            ui.group(|ui| {
-                ui.strong("Approval required");
-                ui.label(&approval.method);
-                egui::ScrollArea::vertical()
-                    .id_salt(("approval", approval.id.to_string()))
-                    .max_height(150.0)
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(&approval.details).monospace())
-                                .selectable(true)
-                                .wrap(),
-                        );
-                    });
-                ui.horizontal_wrapped(|ui| {
-                    for decision in &approval.decisions {
-                        let label = match decision {
-                            ApprovalDecision::Accept => "Allow once",
-                            ApprovalDecision::Decline => "Decline",
-                            ApprovalDecision::Cancel
-                                if approval.method == "mcpServer/elicitation/request" =>
-                            {
-                                "Cancel request"
-                            }
-                            ApprovalDecision::Cancel => "Cancel turn",
-                        };
-                        if ui
-                            .add_enabled(!self.disconnecting, egui::Button::new(label))
-                            .clicked()
-                        {
-                            answer = Some((approval.id.clone(), *decision));
-                        }
-                    }
-                });
-            });
+    }
+
+    fn is_kimi(&self) -> bool {
+        #[cfg(feature = "kimi")]
+        {
+            return self.active_kimi;
         }
-        if let Some((id, decision)) = answer {
-            if let Some(adapter) = &self.adapter {
-                match adapter.try_send(CodexRequest::AnswerApproval {
-                    id: id.clone(),
-                    decision,
-                }) {
-                    Ok(()) => self.approvals.retain(|approval| approval.id != id),
-                    Err(error) => self.error = Some(error),
-                }
-            }
+        #[cfg(not(feature = "kimi"))]
+        false
+    }
+    fn provider_name(&self) -> &'static str {
+        #[cfg(feature = "kimi")]
+        if self.active_kimi {
+            return "Kimi";
         }
-        if let Some(action) = self.context.goal_banner(
-            ui,
-            self.ready
-                && self.context.goal_loaded
-                && self.context_goal_pending.is_none()
-                && !self.history_loading
-                && self.pending_thread.is_none(),
-        ) {
-            self.context_action(action);
+        "Codex"
+    }
+    fn provider_cwd(&self) -> std::path::PathBuf {
+        #[cfg(feature = "kimi")]
+        if self.active_kimi {
+            return self
+                .kimi
+                .as_ref()
+                .map(|k| k.config.cwd.clone())
+                .unwrap_or_default();
         }
-        let composer = egui::Frame::new()
-            .fill(ui.visuals().widgets.inactive.bg_fill)
-            .corner_radius(20)
-            .inner_margin(egui::Margin::symmetric(14, 12))
-            .show(ui, |ui| {
-                let mut automatic_evidence=String::new();
-                egui::ScrollArea::vertical().id_salt("composer-body").max_height((ctx.content_rect().height()*0.35).clamp(48.0,320.0)).auto_shrink([false,true]).show(ui,|ui| {
-                let can_edit_context = !self.busy();
-                ui.add_enabled_ui(can_edit_context, |ui| self.context.chips(ui));
-                let prompt = ui.add(
-                    egui::TextEdit::multiline(&mut self.prompt)
-                        .id(egui::Id::new(("codex-composer",self.thread.as_deref())))
-                        .frame(false)
-                        .interactive(
-                            self.thread.is_some()
-                                && self.pending_thread.is_none()
-                                && self.pending_thread_action.is_none(),
-                        )
-                        .hint_text(if self.thread.is_some() {
-                            "Message Codex"
-                        } else {
-                            "Connect, then choose or create a thread"
-                        })
-                        .desired_rows(3)
-                        .desired_width(f32::INFINITY)
-                        .char_limit(256 * 1024),
-                );
-                name_field(prompt, &self.prompt, "Message Codex");
-                if research && self.relevant_sources {
-                    if let Some(workspace)=self.research_workspace.and_then(|id|app.research_workspace(id)) {
-                        let stale=self.relevant_cache.as_ref().is_none_or(|(id,revision,query,_)|*id!=workspace.id || *revision!=workspace.revision || query!=&self.prompt);
-                        if stale { self.relevant_cache=Some((workspace.id,workspace.revision,self.prompt.clone(),crate::research_desktop::retrieve(workspace,&self.prompt,8))); }
-                        if let Some((_,_,_,passages))=&self.relevant_cache {
-                            if passages.is_empty(){ui.weak("No matching captured passages; no automatic evidence attached.");}
-                            else {
-                                automatic_evidence=format!("UNTRUSTED LOCAL EVIDENCE. Exact excerpts from included sources; lexical matches, not verification. {} of {} included sources matched, max 8 excerpts. Cite the supplied markers; other source text is omitted.\n{}",passages.iter().map(|p|p.source_id).collect::<std::collections::HashSet<_>>().len(),workspace.sources.iter().filter(|s|s.selected).count(),serde_json::to_string(passages).unwrap_or_default());
-                                ui.collapsing(format!("Evidence preview · {} passages",passages.len()),|ui| {
-                                    for passage in passages {ui.label(&passage.text);if ui.link(&passage.citation).clicked(){let (id,page)=crate::research::citation_locator(&passage.citation).unwrap();ui.ctx().data_mut(|d|d.insert_temp(egui::Id::new("research-open-citation"),page.map(|p|format!("source://{id}?page={p}")).unwrap_or_else(||format!("source://{id}"))));}}
-                                });
-                            }
-                        }
-                    }
-                }
-                });
-                ui.add_space(8.0);
-                ui.horizontal_wrapped(|ui| {
-                    if let Some(action) = self.context.composer(
-                        ui,
-                        app,
-                        selected,
-                        self.ready && !self.busy() && !self.disconnecting,
-                    ) {
-                        self.context_action(action);
-                    }
-                    if research && self.research_workspace.is_some() {
-                        ui.checkbox(&mut self.relevant_sources,"Relevant evidence").on_hover_text("Automatically attach matching passages from included local sources for each question; inspect the preview before Send");
-                    }
-                    self.turn_pickers(ui);
-                    self.model_picker(ui);
-                    let turning = self.active_turn.is_some()
-                        || (self.starting && self.pending_thread.is_none());
-                    if turning {
-                        let interrupt = ui
-                            .add_enabled(
-                                !self.disconnecting,
-                                egui::Button::new("■")
-                                    .corner_radius(16)
-                                    .min_size(egui::vec2(32.0, 32.0)),
-                            )
-                            .on_hover_text("Interrupt response");
-                        interrupt.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, interrupt.enabled(), "Interrupt response"));
-                        if interrupt.clicked() {
-                            if self.send_request(CodexRequest::Interrupt) {
-                                self.status = "Interrupt requested…".into();
-                            }
-                        }
-                    } else {
-                        let can_send = self.ready
-                            && self.binding_durable
-                            && self.mode_consistent()
-                            && self
-                                .models
-                                .iter()
-                                .any(|m| Some(&m.model) == self.selected_model.as_ref())
-                            && !self.history_loading
-                            && !self.busy()
-                            && !self.disconnecting
-                            && !self.prompt.trim().is_empty()
-                            && self.prompt.len() + self.context.total_input_bytes() + automatic_evidence.len() <= 256 * 1024
-                            && self.context.skills_valid();
-                        let send = ui
-                            .add_enabled(
-                                can_send,
-                                egui::Button::new("↑")
-                                    .corner_radius(16)
-                                    .min_size(egui::vec2(32.0, 32.0)),
-                            )
-                            .on_hover_text("Send message");
-                        send.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, send.enabled(), "Send message"));
-                        if send.clicked() {
-                            if self.bytes() + self.prompt.len() > Self::BYTE_LIMIT
-                                || self.messages.len() >= 256
-                            {
-                                self.limit_exceeded();
-                            } else {
-                                let request = CodexRequest::SendPromptWithControls {
-                                    text: self.prompt.clone(),
-                                    model: self.selected_model.clone(),
-                                    effort: self.selected_effort.clone(),
-                                    attachments: {
-                                        let mut attachments=self.context.draft.attachments.clone();
-                                        if !automatic_evidence.is_empty(){attachments.push(crate::codex::PromptAttachment {name:"Relevant local evidence".into(),text:automatic_evidence.clone()});}
-                                        attachments
-                                    },
-                                    skills: self.context.draft.skills.clone(),
-                                    controls: self.controls,
-                                };
-                                if self.send_request(request) {
-                                    self.context_submit_pending = true;
-                                    self.messages.push(ConversationMessage {
-                                        role: "You",
-                                        key: None,
-                                        text: std::mem::take(&mut self.prompt),
-                                        command: None,
-                                        activity: None,
-                                    });
-                                    self.starting = true;
-                                    self.status = "Starting turn…".into();
-                                    self.error = None;
-                                }
-                            }
-                        }
-                    }
-                });
-            });
-        self.composer_height = composer.response.rect.height() + ui.spacing().item_spacing.y;
-        if self.prompt.len() + self.context.total_input_bytes() > 256 * 1024 {
-            ui.colored_label(
-                egui::Color32::YELLOW,
-                "Message and attached context exceed 256 KiB; shorten or detach before sending.",
-            );
+        #[cfg(feature = "codex")]
+        {
+            return self.config.cwd.clone();
         }
-        if let Some(action) = self.context.dialogs(
-            ctx,
-            self.ready && !self.busy() && self.context_goal_pending.is_none(),
-        ) {
-            self.context_action(action);
+        #[cfg(not(feature = "codex"))]
+        std::path::PathBuf::new()
+    }
+    fn has_adapter(&self) -> bool {
+        #[cfg(feature = "kimi")]
+        if self.active_kimi {
+            return self.kimi.as_ref().is_some_and(|k| k.adapter.is_some());
         }
-        self.thread_action_modal(ctx);
+        #[cfg(feature = "codex")]
+        {
+            return self.adapter.is_some();
+        }
+        #[cfg(not(feature = "codex"))]
+        false
+    }
+    fn has_pending_provider_operation(&self) -> bool {
+        #[cfg(feature = "kimi")]
+        if self.active_kimi {
+            return self.kimi.as_ref().is_some_and(|k| k.option_pending);
+        }
+        #[cfg(feature = "codex")]
+        {
+            return self.pending_thread_action.is_some();
+        }
+        #[cfg(not(feature = "codex"))]
+        false
+    }
+    fn approval_count(&self) -> usize {
+        #[cfg(feature = "kimi")]
+        if self.active_kimi {
+            return self.kimi.as_ref().map_or(0, |k| k.permissions.len());
+        }
+        #[cfg(feature = "codex")]
+        {
+            return self.approvals.len();
+        }
+        #[cfg(not(feature = "codex"))]
+        0
+    }
+    fn approval_bytes(&self) -> usize {
+        #[cfg(feature = "kimi")]
+        if self.active_kimi {
+            return self.kimi.as_ref().map_or(0, |k| k.permission_bytes());
+        }
+        #[cfg(feature = "codex")]
+        {
+            return self
+                .approvals
+                .iter()
+                .map(|a| {
+                    a.details.len()
+                        + a.thread.len()
+                        + a.turn.len()
+                        + a.method.len()
+                        + a.id.to_string().len()
+                })
+                .sum();
+        }
+        #[cfg(not(feature = "codex"))]
+        0
     }
 }
 
@@ -6004,10 +6179,10 @@ pub fn run_transcript_preview() -> eframe::Result {
                 egui::SidePanel::right("preview-context")
                     .default_width(300.0)
                     .show(ctx, |ui| {
-                        let _ = self
-                            .panel
-                            .context
-                            .panel(ui, ctx, &self.panel.config.cwd, false);
+                        let _ =
+                            self.panel
+                                .context
+                                .panel(ui, ctx, &self.panel.config.cwd, false, false);
                     });
             }
             egui::CentralPanel::default()
@@ -6050,7 +6225,7 @@ pub fn run_transcript_preview() -> eframe::Result {
             panel.activity_card(
                 "local-preview".into(),
                 "fixture".into(),
-                crate::codex::Activity {
+                crate::conversation::Activity {
                     item: "sources".into(),
                     kind: "webSearch".into(),
                     title: "Compared the reference sources".into(),
@@ -6062,7 +6237,7 @@ pub fn run_transcript_preview() -> eframe::Result {
             panel.command_card(
                 "local-preview".into(),
                 "fixture".into(),
-                crate::codex::CommandExecution {
+                crate::conversation::CommandExecution {
                     item: "command-failed".into(),
                     command: "cargo test --offline".into(),
                     cwd: env!("CARGO_MANIFEST_DIR").into(),
@@ -6078,7 +6253,7 @@ pub fn run_transcript_preview() -> eframe::Result {
             panel.activity_card(
                 "local-preview".into(),
                 "fixture".into(),
-                crate::codex::Activity {
+                crate::conversation::Activity {
                     item: "tool-failed".into(),
                     kind: "mcpToolCall".into(),
                     title: "invalid command arguments: missing field `include_trash`".into(),
@@ -6087,7 +6262,7 @@ pub fn run_transcript_preview() -> eframe::Result {
                     truncated: false,
                 },
             );
-            panel.activity_card("local-preview".into(), "fixture".into(), crate::codex::Activity {
+            panel.activity_card("local-preview".into(), "fixture".into(), crate::conversation::Activity {
                 item: "tool-unknown-outcome".into(), kind: "mcpToolCall".into(),
                 title: "accepted but storage failed: downloaded content is not a PDF; inspect state before retry".into(),
                 status: "unknownOutcome".into(),

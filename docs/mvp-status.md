@@ -161,3 +161,18 @@ Evidence: [desktop UX record](design/2026-10-27-desktop-ux-accessibility-evidenc
 Native whole-source AT-SPI Click remains a specific adapter/render limitation;
 keyboard Enter exposes the whole-source editor and the raw egui handler preserves
 exact source. Android/device and full screen-reader certification are unverified.
+
+## Kimi ACP desktop integration (2026-10-27)
+
+User-requested roles: Sol 6.1 xhigh planner; Sol 6.1 xhigh reviewer; GPT-6.1 Terra
+max developer. Reviewer is reused for all fixes, with at most four implementation
+review/develop cycles. Worktree: codex/kimi-acp from main 3a20248. The user subsequently authorized local commit and merge. No remote publication
+is included.
+
+| Task | Owner | State | Evidence / next |
+| --- | --- | --- | --- |
+| KA1 bounded ACP plan/contracts | kimi_plan (Sol 6.1 xhigh) | done | docs/plans/2026-10-27-kimi-acp.md frozen |
+| KA2 independent plan review | kimi_review (Sol 6.1 xhigh) | done | READY; no blocking plan findings |
+| KA3 adapter and shared GUI | kimi_develop (GPT-6.1 Terra max) | done | Final combined bins build; Kimi-only check; focused ACP/provider/MCP regressions pass |
+| KA4 review/develop loop | same developer + reviewer | READY, cycle 3/4 | Seven concrete findings resolved; same Sol 6.1 xhigh reviewer approved frozen output |
+| KA5 native/live integration evidence | root | done with limits | Kimi2.2 stream/MCP durable edit/restart/cancel pass; native model/provider/draft reconnect/compact overlay/editor pass; live permissions/rejection not observed; docs/kimi-live-evidence.md |

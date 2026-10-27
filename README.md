@@ -89,6 +89,12 @@ menu offers rename. Thread status indicators have tooltips; thread context menus
 The rounded composer includes model and reasoning-effort selection from Codex’s catalog. Connection is lazy,
 with explicit one-action approvals.
 See [Codex setup](docs/codex.md) and [actual live evidence](docs/codex-live-evidence.md).
+
+The same conversation surface also supports Kimi Code CLI over ACP. Build with
+`--features gui,kimi`, use `--kimi` with the owner socket, and choose models,
+thinking and modes from the connected session. Kimi retains its own process
+privileges and its approvals are separate from vault update permission. Multiple
+MCP clients can use the owner concurrently. See [Kimi setup](docs/kimi.md).
 The optional `sync` feature provides explicit authoritative CRDT migration:
 
 ```sh

@@ -1,4 +1,8 @@
 //! Small pinned Codex app-server boundary. No ECS or vault ownership crosses here.
+pub use crate::conversation::{
+    Activity, CommandExecution, ConnectionInfo, ContextFile, GoalInfo, HistoryMessage, PlanStep,
+    PromptAttachment, SkillInfo, ThreadSummary, ThreadWorkState,
+};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -67,42 +71,6 @@ impl ApprovalDecision {
             Self::Cancel => "cancel",
         }
     }
-}
-#[derive(Clone, Debug)]
-pub struct ContextFile {
-    pub path: String,
-    pub kind: String,
-}
-#[derive(Clone, Debug)]
-pub struct PlanStep {
-    pub text: String,
-    pub status: String,
-}
-#[derive(Clone, Debug)]
-pub struct GoalInfo {
-    pub objective: String,
-    pub status: String,
-    pub tokens_used: u64,
-    pub time_used_seconds: u64,
-    pub token_budget: Option<u64>,
-}
-#[derive(Clone, Debug)]
-pub struct SkillInfo {
-    pub name: String,
-    pub path: String,
-    pub description: String,
-    pub enabled: bool,
-}
-#[derive(Clone, Debug)]
-pub struct ConnectionInfo {
-    pub name: String,
-    pub auth_status: String,
-    pub tools: usize,
-}
-#[derive(Clone, Debug)]
-pub struct PromptAttachment {
-    pub name: String,
-    pub text: String,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WorkMode {
@@ -192,16 +160,6 @@ pub enum ThreadAction {
     Archive,
     Remove,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ThreadWorkState {
-    NotLoaded,
-    Idle,
-    Working,
-    WaitingOnApproval,
-    WaitingOnInput,
-    Error,
-    Unknown,
-}
 impl ThreadWorkState {
     fn from_status(status: &Value) -> Self {
         match status["type"].as_str() {
@@ -232,39 +190,7 @@ impl ThreadWorkState {
         }
     }
 }
-#[derive(Clone, Debug)]
-pub struct ThreadSummary {
-    pub state: ThreadWorkState,
-    pub id: String,
-    pub title: String,
-    pub updated_at: i64,
-}
-#[derive(Clone, Debug)]
-pub struct HistoryMessage {
-    pub role: String,
-    pub text: String,
-}
 const COMMAND_OUTPUT_LIMIT: usize = 64 * 1024;
-#[derive(Clone, Debug)]
-pub struct CommandExecution {
-    pub item: String,
-    pub command: String,
-    pub cwd: String,
-    pub status: String,
-    pub exit_code: Option<i64>,
-    pub output: String,
-    pub truncated: bool,
-    pub output_complete: bool,
-}
-#[derive(Clone, Debug)]
-pub struct Activity {
-    pub item: String,
-    pub kind: String,
-    pub title: String,
-    pub status: String,
-    pub details: String,
-    pub truncated: bool,
-}
 #[derive(Clone, Debug)]
 pub enum CodexEvent {
     Activity {

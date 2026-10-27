@@ -1,6 +1,8 @@
 //! View-local Codex context. Source snapshots are explicit inputs, never vault paths.
 use super::theme;
-use crate::codex::{ConnectionInfo, ContextFile, GoalInfo, PlanStep, PromptAttachment, SkillInfo};
+use crate::conversation::{
+    ConnectionInfo, ContextFile, GoalInfo, PlanStep, PromptAttachment, SkillInfo,
+};
 use crate::{app::App, notes::NoteId};
 use eframe::egui;
 use std::{collections::HashMap, io::Read, path::PathBuf, sync::mpsc};
@@ -485,6 +487,7 @@ impl ContextUi {
         app: &App,
         selected: Option<NoteId>,
         enabled: bool,
+        kimi: bool,
     ) -> Option<Action> {
         let mut action = None;
         let button = theme::button(
@@ -536,6 +539,7 @@ impl ContextUi {
                 self.file_dialog = Some(String::new());
                 ui.close();
             }
+            if !kimi {
             ui.separator();
             ui.menu_button("Skills / plugins", |ui| {
                 if self.skills.is_empty() {
@@ -578,6 +582,7 @@ impl ContextUi {
                 ui.close();
             }
             if ui.button("Draw a sketch…").on_hover_text("Draft a visual request; review it before sending. Requires a capable model/tool.").clicked() {action=Some(Action::DraftSketch);ui.close();}
+            }
             if ui.button("Show context").clicked() {
                 self.open = true;
                 ui.close();
@@ -650,7 +655,32 @@ impl ContextUi {
         ctx: &egui::Context,
         cwd: &std::path::Path,
         ready: bool,
+        kimi: bool,
     ) -> Option<Action> {
+        if kimi {
+            ui.horizontal(|ui| {
+                ui.strong("Context");
+                if theme::button(ui, theme::Icon::Cancel, "Close context", true).clicked() {
+                    self.open = false;
+                }
+            });
+            ui.add_space(12.0);
+            ui.strong("Plan");
+            if self.plan.is_empty() {
+                ui.weak("No plan reported yet.");
+            }
+            for step in &self.plan {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(match step.status.as_str() {
+                        "completed" => "✓",
+                        "in_progress" => "●",
+                        _ => "○",
+                    });
+                    ui.label(&step.text);
+                });
+            }
+            return None;
+        }
         let mut action = None;
         ui.horizontal(|ui| {
             ui.strong("Context");

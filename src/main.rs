@@ -17,6 +17,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut codex_enabled = false;
     let mut codex_cwd = None;
     let mut codex_resume = None;
+    let mut kimi_enabled = false;
+    let mut kimi_cwd = None;
+    let mut kimi_resume = None;
     let mut lan_requested = false;
     let mut lan_serve = false;
     let mut lan_listen_requested = false;
@@ -42,6 +45,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--codex-resume" => {
                 codex_resume = Some(args.next().ok_or("--codex-resume needs a thread ID")?)
+            }
+            "--kimi" => kimi_enabled = true,
+            "--kimi-cwd" => {
+                kimi_cwd = Some(PathBuf::from(
+                    args.next().ok_or("--kimi-cwd needs a directory")?,
+                ))
+            }
+            "--kimi-resume" => {
+                kimi_resume = Some(args.next().ok_or("--kimi-resume needs a session ID")?)
             }
             "--lan-listen" => {
                 lan_requested = true;
@@ -139,7 +151,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--help" | "-h" => {
                 println!(
-                    "tanglewood [--vault DIRECTORY] [--headless] [--mirror|--no-mirror] [--rescan] [--enable-sync] [--import SOURCE NOTE_PATH] [--export NOTE_UUID DESTINATION] [--mcp-socket SOCKET] [--mcp-write] [--codex [--codex-cwd DIRECTORY] [--codex-resume THREAD]]\nHeadless mode opens the vault and lists note paths. Build with --features gui for the editor.\nLAN (--features lan): --prepare-join TICKET | --cancel-join | --lan-listen ADDRESS:PORT [--lan-advertise IP] | --lan-ticket | --confirm-peer TICKET | --connect-peer FINGERPRINT | --unpair-peer FINGERPRINT | --lan-status | --pause-lan | --resume-lan | --lan-serve. Startup actions run in argument order; use fixed ports for ticket exchange across restarts."
+                    "tanglewood [--vault DIRECTORY] [--headless] [--mirror|--no-mirror] [--rescan] [--enable-sync] [--import SOURCE NOTE_PATH] [--export NOTE_UUID DESTINATION] [--mcp-socket SOCKET] [--mcp-write] [--codex [--codex-cwd DIRECTORY] [--codex-resume THREAD]] [--kimi [--kimi-cwd DIRECTORY] [--kimi-resume SESSION]]\nHeadless mode opens the vault and lists note paths. Build with --features gui for the editor.\nLAN (--features lan): --prepare-join TICKET | --cancel-join | --lan-listen ADDRESS:PORT [--lan-advertise IP] | --lan-ticket | --confirm-peer TICKET | --connect-peer FINGERPRINT | --unpair-peer FINGERPRINT | --lan-status | --pause-lan | --resume-lan | --lan-serve. Startup actions run in argument order; use fixed ports for ticket exchange across restarts."
                 );
                 return Ok(());
             }
@@ -179,6 +191,38 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if !codex_enabled && (codex_cwd.is_some() || codex_resume.is_some()) {
         return Err("Codex options require --codex".into());
     }
+    if kimi_enabled
+        && (!cfg!(all(target_os = "linux", feature = "gui", feature = "kimi"))
+            || headless
+            || mcp_path.is_none())
+    {
+        return Err(
+            "--kimi needs Linux, --features gui,kimi, a GUI session and --mcp-socket".into(),
+        );
+    }
+    if !kimi_enabled && (kimi_cwd.is_some() || kimi_resume.is_some()) {
+        return Err("Kimi options require --kimi".into());
+    }
+    #[cfg(all(target_os = "linux", feature = "gui", feature = "kimi"))]
+    let kimi_config = if kimi_enabled {
+        let cwd = match kimi_cwd {
+            Some(path) => std::fs::canonicalize(path)?,
+            None => {
+                let directory = vault.join("kimi-context");
+                std::fs::create_dir_all(&directory)?;
+                std::fs::canonicalize(directory)?
+            }
+        };
+        Some(tanglewood::kimi::KimiConfig {
+            executable: PathBuf::from("kimi"),
+            cwd,
+            mcp_bridge: std::env::current_exe()?.with_file_name("tanglewood-mcp"),
+            socket: std::path::absolute(mcp_path.as_ref().expect("validated MCP socket"))?,
+            resume_session: kimi_resume,
+        })
+    } else {
+        None
+    };
     #[cfg(all(target_os = "linux", feature = "gui", feature = "codex"))]
     let codex_config = if codex_enabled {
         let cwd = match codex_cwd {
@@ -306,6 +350,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 #[cfg(all(target_os = "linux", feature = "gui", feature = "codex"))]
                 let editor = match codex_config {
                     Some(config) => editor.with_codex(config),
+                    None => editor,
+                };
+                #[cfg(all(target_os = "linux", feature = "gui", feature = "kimi"))]
+                let editor = match kimi_config {
+                    Some(config) => editor.with_kimi(config),
                     None => editor,
                 };
                 Ok(Box::new(editor))
