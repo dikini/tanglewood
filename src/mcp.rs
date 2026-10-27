@@ -1020,6 +1020,193 @@ mod tests {
     }
 
     #[test]
+    fn simultaneous_clients_preserve_revisions_and_survive_other_disconnects() {
+        let directory = std::env::temp_dir().join(format!("tw-mcp-clients-{}", Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join("app.sock");
+        let mut app = App::open(&directory.join("vault")).unwrap();
+        let mut owner = OwnerSocket::bind(&path, AccessPolicy::ReadWrite).unwrap();
+        let create = |path: &str, text: &str| Command::CreateNote {
+            path: path.into(),
+            text: text.into(),
+        };
+        let Outcome::Result(CommandResult::Note(first)) =
+            round_trip(&mut owner, &mut app, &path, Some(create("a.md", "one")))
+        else {
+            panic!("first create failed")
+        };
+        let Outcome::Result(CommandResult::Note(second)) =
+            round_trip(&mut owner, &mut app, &path, Some(create("b.md", "two")))
+        else {
+            panic!("second create failed")
+        };
+        let (send, receive) = mpsc::channel();
+        let mut clients = Vec::new();
+        let mut joins = Vec::new();
+        for client in 0..2 {
+            let socket = path.clone();
+            let send = send.clone();
+            let (commands, incoming) = mpsc::channel::<Command>();
+            clients.push(commands);
+            joins.push(thread::spawn(move || {
+                let bridge = McpBridge::new(socket);
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                while let Ok(command) = incoming.recv() {
+                    let result = runtime.block_on(async {
+                        if command.is_mutation() {
+                            bridge.execute(command).await
+                        } else {
+                            bridge.read(command).await
+                        }
+                    });
+                    send.send((client, result.unwrap())).unwrap();
+                }
+            }));
+        }
+        let collect = |owner: &mut OwnerSocket, app: &mut App, count| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut results = Vec::new();
+            while results.len() < count {
+                owner.poll(app);
+                while let Ok(response) = receive.try_recv() {
+                    results.push(response);
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "client requests did not complete"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+            results.sort_by_key(|(client, _)| *client);
+            results
+        };
+        clients[0]
+            .send(Command::ReadNote { id: first.note.id })
+            .unwrap();
+        clients[1]
+            .send(Command::ReadNote { id: second.note.id })
+            .unwrap();
+        let reads = collect(&mut owner, &mut app, 2);
+        assert!(
+            matches!(&reads[0].1.outcome, Outcome::Result(CommandResult::Note(note)) if note.note.text == "one")
+        );
+        assert!(
+            matches!(&reads[1].1.outcome, Outcome::Result(CommandResult::Note(note)) if note.note.text == "two")
+        );
+        // Two independent transports may reuse the same request ID; the owner must
+        // return each response over its own reply channel, never by global ID.
+        let shared_id = Uuid::new_v4();
+        let (collision_send, collision_receive) = mpsc::channel();
+        for (client, id) in [first.note.id, second.note.id].into_iter().enumerate() {
+            let socket = path.clone();
+            let send = collision_send.clone();
+            thread::spawn(move || {
+                let response = forward(
+                    &socket,
+                    &RequestEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: shared_id,
+                        command: Some(Command::ReadNote { id }),
+                    },
+                )
+                .unwrap();
+                send.send((client, response)).unwrap();
+            });
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut collisions = Vec::new();
+        while collisions.len() < 2 {
+            owner.poll(&mut app);
+            while let Ok(value) = collision_receive.try_recv() {
+                collisions.push(value);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "overlapping request IDs did not complete"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        collisions.sort_by_key(|(client, _)| *client);
+        assert!(collisions.iter().all(|(_, r)| r.request_id == shared_id));
+        assert!(
+            matches!(&collisions[0].1.outcome, Outcome::Result(CommandResult::Note(note)) if note.note.text == "one")
+        );
+        assert!(
+            matches!(&collisions[1].1.outcome, Outcome::Result(CommandResult::Note(note)) if note.note.text == "two")
+        );
+        let edit = |replacement: &str| Command::EditNote {
+            id: first.note.id,
+            expected: first.note.revision,
+            edits: vec![crate::notes::TextEdit {
+                start: 0,
+                end: 3,
+                replacement: replacement.into(),
+            }],
+        };
+        clients[0].send(edit("alpha")).unwrap();
+        clients[1].send(edit("beta")).unwrap();
+        let writes = collect(&mut owner, &mut app, 2);
+        assert_eq!(
+            writes
+                .iter()
+                .filter(|(_, r)| matches!(r.outcome, Outcome::Result(CommandResult::Note(_))))
+                .count(),
+            1
+        );
+        assert_eq!(
+            writes
+                .iter()
+                .filter(|(_, r)| matches!(
+                    r.outcome,
+                    Outcome::Error(CommandError::StaleRevision { .. })
+                ))
+                .count(),
+            1
+        );
+        let confirmed = writes
+            .iter()
+            .find_map(|(_, r)| {
+                if let Outcome::Result(CommandResult::Note(note)) = &r.outcome {
+                    Some(note)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert_eq!(confirmed.save.persisted, Some(confirmed.note.revision));
+        app.execute(
+            Command::SetAutomationWriteEnabled { enabled: false },
+            Caller::Local,
+        )
+        .unwrap();
+        clients[0].send(create("blocked-a.md", "a")).unwrap();
+        clients[1].send(create("blocked-b.md", "b")).unwrap();
+        assert!(
+            collect(&mut owner, &mut app, 2)
+                .iter()
+                .all(|(_, r)| matches!(r.outcome, Outcome::Error(CommandError::Unauthorized)))
+        );
+        drop(clients.remove(0));
+        joins.remove(0).join().unwrap();
+        clients[0]
+            .send(Command::ReadNote { id: second.note.id })
+            .unwrap();
+        let read = collect(&mut owner, &mut app, 1);
+        assert!(
+            matches!(&read[0].1.outcome, Outcome::Result(CommandResult::Note(note)) if note.note.text == "two")
+        );
+        drop(clients);
+        joins.remove(0).join().unwrap();
+        drop(owner);
+        app.shutdown().unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn owner_socket_routes_policy_revision_and_durable_mutations() {
         let directory = std::env::temp_dir().join(format!("tw-mcp-{}", Uuid::new_v4()));
         fs::create_dir(&directory).unwrap();

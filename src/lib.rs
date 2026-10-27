@@ -26,8 +26,14 @@ pub mod mcp;
 #[cfg(feature = "sync")]
 pub mod sync;
 
+#[cfg(all(target_os = "linux", feature = "conversation"))]
+pub mod conversation;
+
 #[cfg(all(target_os = "linux", feature = "codex"))]
 pub mod codex;
+
+#[cfg(all(target_os = "linux", feature = "kimi"))]
+pub mod kimi;
 
 #[cfg(feature = "lan")]
 pub mod lan;

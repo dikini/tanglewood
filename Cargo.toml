@@ -10,7 +10,9 @@ gui = ["documents", "dep:eframe", "dep:jni", "dep:egui_extras", "dep:image", "de
 sync = ["dep:automerge"]
 lan = ["sync", "dep:quinn", "dep:rustls", "dep:rcgen", "dep:sha2", "dep:tokio"]
 mcp = ["dep:rmcp", "dep:tokio", "dep:schemars", "dep:libc"]
-codex = ["mcp"]
+conversation = ["mcp"]
+codex = ["conversation"]
+kimi = ["conversation"]
 documents = ["dep:libc", "dep:sha2", "dep:yaml-rust2", "dep:quick-xml", "dep:png", "dep:regex", "dep:percent-encoding", "dep:flate2", "dep:crc32fast"]
 
 [dependencies]
