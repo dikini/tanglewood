@@ -1,0 +1,6 @@
+10:56:34.718205 - SPEECH OUTPUT: 'Screen reader on.' {'established': False}
+10:56:37.663703 - SPEECH OUTPUT: 'Notes' {'established': False, 'family': {'name': '', 'gender': None, 'lang': 'C', 'dialect': '', 'variant': None}}
+10:56:37.664615 - SPEECH OUTPUT: 'toggle button not pressed.' {'established': False}
+10:56:38.195558 - SPEECH OUTPUT: 'pressed' {'established': False}
+10:56:38.364287 - SPEECH OUTPUT: 'Edit document source' {'established': False, 'family': {'name': '', 'gender': None, 'lang': 'C', 'dialect': '', 'variant': None}}
+10:56:38.367623 - SPEECH OUTPUT: 'button.' {'established': False}

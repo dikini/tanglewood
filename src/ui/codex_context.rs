@@ -478,28 +478,46 @@ impl ContextUi {
         let mut remove_skill = None;
         ui.horizontal_wrapped(|ui| {
             for (index, attachment) in self.draft.attachments.iter().enumerate() {
-                if ui
+                let remove = ui
                     .add(
                         egui::Button::new(format!("{}  ×", attachment.name))
                             .corner_radius(6)
                             .min_size(egui::vec2(0.0, 28.0)),
                     )
-                    .on_hover_text("Remove source snapshot from the next message")
-                    .clicked()
-                {
+                    .on_hover_text(format!(
+                        "Remove {} source snapshot from the next message",
+                        attachment.name
+                    ));
+                remove.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button,
+                        remove.enabled(),
+                        format!(
+                            "Remove {} source snapshot from next message",
+                            attachment.name
+                        ),
+                    )
+                });
+                if remove.clicked() {
                     remove_attachment = Some(index);
                 }
             }
             for (index, skill) in self.draft.skills.iter().enumerate() {
-                if ui
+                let remove = ui
                     .add(
                         egui::Button::new(format!("${}  ×", skill.name))
                             .corner_radius(6)
                             .min_size(egui::vec2(0.0, 28.0)),
                     )
-                    .on_hover_text("Remove skill from the next message")
-                    .clicked()
-                {
+                    .on_hover_text(format!("Remove {} skill from the next message", skill.name));
+                remove.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button,
+                        remove.enabled(),
+                        format!("Remove {} skill from next message", skill.name),
+                    )
+                });
+                if remove.clicked() {
                     remove_skill = Some(index);
                 }
             }
@@ -571,7 +589,8 @@ impl ContextUi {
             let mut close = false;
             let modal=egui::Modal::new(egui::Id::new("codex-context-goal")).show(ctx,|ui| {
                 ui.set_width(420.0);ui.heading("Set thread goal");ui.label("Set the objective for this thread. An active goal may let Codex continue work until paused or cleared.");
-                ui.add(egui::TextEdit::multiline(&mut text).desired_rows(5).desired_width(f32::INFINITY).char_limit(4000));
+                let field = ui.add(egui::TextEdit::multiline(&mut text).desired_rows(5).desired_width(f32::INFINITY).char_limit(4000));
+                super::name_field(field, &text, "Thread goal");
                 ui.horizontal(|ui| {if ui.button("Cancel").clicked() {close=true;}if ui.add_enabled(enabled && !text.trim().is_empty(),egui::Button::new("Set goal")).clicked() {action=Some(Action::SetGoal(text.trim().into()));close=true;}});
             });
             if !close && !modal.should_close() {
@@ -583,8 +602,8 @@ impl ContextUi {
             let modal = egui::Modal::new(egui::Id::new("codex-attach-file")).show(ctx, |ui| {
                 ui.set_width(420.0);
                 ui.heading("Attach text file");
-                ui.label("File path (UTF-8 text, up to 256 KiB)");
-                ui.text_edit_singleline(&mut path);
+                let label = ui.label("File path (UTF-8 text, up to 256 KiB)");
+                ui.text_edit_singleline(&mut path).labelled_by(label.id);
                 ui.horizontal(|ui| {
                     if ui.button("Cancel").clicked() {
                         close = true;

@@ -857,8 +857,8 @@ mod tests {
         assert!(before < editor_rect.top() && editor_rect.bottom() <= after);
         assert!(editor_rect.height() >= 160.0 && editor_rect.height() < 240.0);
         assert_eq!(app.note(view.note.id).unwrap().note.text, view.note.text);
-        // The same native field in the custom-fence modal must not collapse to
-        // the few visible lines in the reported screenshot.
+        // Short modal drafts fit their content with adjacent actions; long
+        // drafts retain a substantial bounded viewport instead of collapsing.
         let range = context
             .node(*context.roots().last().unwrap())
             .unwrap()
@@ -868,17 +868,56 @@ mod tests {
             .clone();
         assert!(draft.choose_range(Some(range)));
         assert!(draft.inline_block().is_none());
-        let mut height = 0.0;
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.allocate_ui(egui::vec2(650.0, 0.0), |ui| {
-                    let start = ui.cursor().min.y;
-                    source_editor(ui, &mut draft, view.note.id, false, false, 360.0);
-                    height = ui.min_rect().bottom() - start;
+        for long in [false, true] {
+            if long {
+                draft.text = format!(
+                    "```custom\n{}\n```",
+                    "A detailed illustration brief.\n".repeat(80)
+                );
+            }
+            let mut height = 0.0;
+            let mut field = egui::Rect::NOTHING;
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.allocate_ui(egui::vec2(650.0, 0.0), |ui| {
+                        let start = ui.cursor().min.y;
+                        source_editor(ui, &mut draft, view.note.id, false, false, 360.0);
+                        height = ui.min_rect().bottom() - start;
+                        field = ctx
+                            .read_response(egui::Id::new((
+                                "source",
+                                view.note.id.0,
+                                draft.widget_generation,
+                            )))
+                            .unwrap()
+                            .interact_rect;
+                        assert!(
+                            ui.min_rect().bottom() < ctx.content_rect().bottom(),
+                            "action footer outside viewport"
+                        );
+                        assert!(
+                            field.bottom() + 34.0 <= ui.min_rect().bottom(),
+                            "missing space for action footer"
+                        );
+                    });
                 });
             });
-        });
-        assert!(height >= 360.0, "source field collapsed: {height}");
+            if long {
+                assert!(
+                    field.height() >= 350.0,
+                    "long source field collapsed: {field:?}"
+                );
+                assert!(
+                    height <= 430.0,
+                    "long source editor exceeded bound: {height}"
+                );
+            } else {
+                assert!(
+                    (60.0..180.0).contains(&height),
+                    "short source editor failed content fit: {height}"
+                );
+            }
+        }
     }
 
     #[test]

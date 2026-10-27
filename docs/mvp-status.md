@@ -122,3 +122,25 @@ research orchestration explicitly deferred.
 | Retrieval and assessments | done | Selected-source lexical preview bound to workspace/revision/query; contextual history and gap suggestions |
 | Output roles and generators | done | Immutable real HTML/SVG outputs with source links; legacy Unclassified role; browser/SVG renders |
 | Integration and UX review | done | Final focused gui/headless tests and build passed; Sol6.1 xhigh review; native evidence/limits in research.md |
+
+
+## Desktop UX priorities (2026-10-27)
+
+Scope: UX0–UX5 and UX9 only; UX6–UX8 remain later follow-ups. Shared checkout;
+existing dirty work preserved; the completed, independently reviewed priority pass
+is included in the local commit requested by the user. No publication.
+
+| Task | Owner / paths | State | Evidence / next |
+| --- | --- | --- | --- |
+| UX0 baseline | ux_pm; evidence/manifest | done | fe40a2a archive; comparable stripped baseline43,528,848 bytes; native clipping classified |
+| UX1 bridge/semantics | ux_pm manifest; ux_developer UI files | done | Native AT-SPI/Orca labels/states; raw whole-source Click passes; native header Click gap remains qualified |
+| UX2 pane reachability | inherited reviewed shell | done | fe40a2a; design-system/adoption.md; native600×700 top message fully visible, scroll clipping intentional |
+| UX3 source identity/states | ux_developer; ui/research.rs, theme.rs | done | Full identity/state cues, single hover/focus tooltip, measured contrast |
+| UX4 editing/copy | ux_developer; ui/editor.rs, ui.rs | done | Clipped active marker; short/long editor regression; truthful apply/export copy |
+| UX5 recovery wording | ux_developer; ui/research.rs | done | Effects inventoried; latest context review retains input, does not retry/save |
+| UX9 review/evidence | ux_pm + independent reviewer | done | Independent review;34 UI +1 raw Click regression; native evidence/limits and accepted3.294MiB release growth |
+
+Evidence: [desktop UX record](design/2026-10-27-desktop-ux-accessibility-evidence.md).
+Native whole-source AT-SPI Click remains a specific adapter/render limitation;
+keyboard Enter exposes the whole-source editor and the raw egui handler preserves
+exact source. Android/device and full screen-reader certification are unverified.

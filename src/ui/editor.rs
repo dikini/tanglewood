@@ -171,7 +171,8 @@ pub(super) fn source_editor(
             .max(28.0)
             .min(height)
     } else {
-        height
+        (ui.fonts_mut(|fonts| fonts.layout_job(measured)).size().y + 24.0)
+            .clamp(60.0_f32.min(height), height)
     };
     let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, width: f32| {
         let mut layout = if job.text == text.as_str() {
@@ -211,12 +212,21 @@ pub(super) fn source_editor(
                 } else {
                     egui::vec2(12.0, 12.0)
                 })
-                .min_size(egui::vec2(0.0, if inline { 28.0 } else { height }))
+                .min_size(egui::vec2(0.0, if inline { 28.0 } else { field_height }))
                 .desired_width(f32::INFINITY)
                 .desired_rows(1)
                 .show(ui)
         })
         .inner;
+    super::name_field(output.response.clone(), &draft.text, "Markdown source");
+    // Only the active draft receives a boundary; ordinary reader blocks stay quiet.
+    ui.painter().line_segment(
+        [
+            output.response.interact_rect.left_top() - egui::vec2(5.0, 0.0),
+            output.response.interact_rect.left_bottom() - egui::vec2(5.0, 0.0),
+        ],
+        egui::Stroke::new(2.0, super::theme::colors(ui.visuals().dark_mode).accent),
+    );
     let focus_key = source_id.with("initial-focus");
     if !ctx.data_mut(|data| data.get_temp::<bool>(focus_key).unwrap_or(false)) {
         output.response.request_focus();
@@ -246,7 +256,7 @@ pub(super) fn source_editor(
             if super::theme::button(
                 ui,
                 super::theme::Icon::Ready,
-                "Ready — accept changes",
+                "Apply changes",
                 !trashed && !draft.composing && !draft.conflict,
             )
             .clicked()

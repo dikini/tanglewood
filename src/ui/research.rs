@@ -502,11 +502,11 @@ impl ResearchUi {
                                 if ui.add_enabled(!self.busy() && !app.research_pending(workspace.id), egui::Button::new("Get full text for linked papers")).clicked() { self.queue_full_text(app, &workspace); ui.close(); }
                                 if ui.button("Find evidence…").clicked() { self.evidence_open = true; ui.close(); }
                                 ui.separator();
-                                ui.label("Open a source citation");
+                                let label = ui.label("Open a source citation");
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.citation)
                                         .hint_text("[source:… page:2]"),
-                                );
+                                ).labelled_by(label.id);
                                 if ui.button("Open citation").clicked() {
                                     match parse_citation(&self.citation) {
                                         Some((source_id, page)) => {
@@ -592,13 +592,15 @@ impl ResearchUi {
                     for source in &workspace.sources {
                         ui.horizontal(|ui| {
                             let mut selected = source.selected;
-                            if ui
-                                .add_enabled(
-                                    !self.busy() && !app.research_pending(workspace.id),
-                                    egui::Checkbox::without_text(&mut selected),
-                                )
-                                .on_hover_text("Include this source in research context")
-                                .changed()
+                            let include = ui.add_enabled(
+                                !self.busy() && !app.research_pending(workspace.id),
+                                egui::Checkbox::without_text(&mut selected),
+                            ).on_hover_text("Include this source in research context");
+                            include.widget_info(|| egui::WidgetInfo::selected(
+                                egui::WidgetType::Checkbox, include.enabled(), selected,
+                                format!("Include {} in research context", source.title),
+                            ));
+                            if include.changed()
                             {
                                 self.execute(
                                     app,
@@ -645,17 +647,32 @@ impl ResearchUi {
                             _ if crate::research::source_has_text(source) => "✓",
                             _ => "○",
                         };
-                        ui.label(egui::RichText::new(icon).small().color(theme::muted(ui))).on_hover_text(label);
-                            if ui
-                                .add(
+                        let availability = ui.label(egui::RichText::new(icon).small().color(theme::muted(ui))).on_hover_text(label);
+                        availability.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, label));
+                            let active = self.preview_open && self.source == Some(source.id);
+                            let row = ui.add(
                                     egui::Button::selectable(
-                                        self.preview_open && self.source == Some(source.id),
+                                        active,
                                         &source.title,
                                     )
                                     .truncate(),
-                                )
-                                .clicked()
-                            {
+                                ).on_hover_text(&source.title);
+                            row.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, row.enabled(), active, &source.title));
+                            if active {
+                                ui.painter().line_segment(
+                                    [row.rect.left_top(), row.rect.left_bottom()],
+                                    egui::Stroke::new(2.0, theme::colors(ui.visuals().dark_mode).accent),
+                                );
+                            }
+                            if row.has_focus() && !row.hovered() {
+                                egui::Tooltip::for_widget(&row).show(|ui| { ui.label(&source.title); });
+                            }
+                            if row.has_focus() {
+                                ui.painter().rect_stroke(row.rect, 3.0,
+                                    egui::Stroke::new(2.0, theme::colors(ui.visuals().dark_mode).accent),
+                                    egui::StrokeKind::Inside);
+                            }
+                            if row.clicked() {
                                 self.source = Some(source.id);
                                 self.reader_page = 0;
                                 self.reader_pdf = false;
@@ -808,7 +825,7 @@ impl ResearchUi {
                     self.report_open = true;
                 }
                 if ui
-                    .add(egui::Button::new("+  Slides, infographic or map…").frame(false))
+                    .add(egui::Button::new("+  Create output…").frame(false))
                     .clicked()
                 {
                     if self.output_cards.is_empty() {
@@ -1151,12 +1168,12 @@ impl ResearchUi {
                                     if canonical == Some(&draft.value) {
                                         draft.expected = workspace.revision;
                                     }
-                                    ui.label("Relevance");
-                                    ui.text_edit_multiline(&mut draft.value.relevance);
-                                    ui.label("Quality");
-                                    ui.text_edit_multiline(&mut draft.value.quality);
-                                    ui.label("Limitations");
-                                    ui.text_edit_multiline(&mut draft.value.limitations);
+                                    let label = ui.label("Relevance");
+                                    ui.text_edit_multiline(&mut draft.value.relevance).labelled_by(label.id);
+                                    let label = ui.label("Quality");
+                                    ui.text_edit_multiline(&mut draft.value.quality).labelled_by(label.id);
+                                    let label = ui.label("Limitations");
+                                    ui.text_edit_multiline(&mut draft.value.limitations).labelled_by(label.id);
                                     let command = ui
                                         .add_enabled(!busy, egui::Button::new("Save assessment"))
                                         .clicked()
@@ -1170,16 +1187,27 @@ impl ResearchUi {
                                     if let Some(command) = command {
                                         self.execute(app, command);
                                     }
-                                    if ui.button("Discard assessment edits").clicked() {
+                                    if ui.button("Discard my assessment edits").clicked() {
                                         self.assessments.remove(&(workspace.id, source.id, human));
                                     }
 
+                                    if self.assessments.get(&(workspace.id, source.id, human))
+                                        .is_some_and(|d| d.expected != workspace.revision) {
+                                        ui.weak("This research workspace changed while you were editing. Review the latest version before applying your assessment. Your edits are kept; review does not save them.");
+                                        ui.collapsing("Latest saved assessment", |ui| {
+                                            if let Some(latest) = canonical {
+                                                ui.label(format!("Relevance: {}", latest.relevance));
+                                                ui.label(format!("Quality: {}", latest.quality));
+                                                ui.label(format!("Limitations: {}", latest.limitations));
+                                            } else { ui.weak("No saved assessment."); }
+                                        });
+                                    }
                                     if self
                                         .assessments
                                         .get(&(workspace.id, source.id, human))
                                         .is_some_and(|d| d.expected != workspace.revision)
                                         && ui
-                                            .button("Use current revision, retain my assessment")
+                                            .button("Review latest version; keep my assessment")
                                             .clicked()
                                     {
                                         if let Some(draft) = self.assessments.get_mut(&(
@@ -1281,8 +1309,8 @@ impl ResearchUi {
             }
             ui.label("Title");
             field_single(ui, &mut draft.title, "research-title");
-            ui.label("Research question");
-            ui.text_edit_multiline(&mut draft.question);
+            let label = ui.label("Research question");
+            ui.text_edit_multiline(&mut draft.question).labelled_by(label.id);
             let command = ui
                 .add_enabled(!busy, egui::Button::new("Save workspace"))
                 .clicked()
@@ -1299,12 +1327,19 @@ impl ResearchUi {
                 self.drafts.remove(&w.id);
             }
 
+            if self.drafts.get(&w.id).is_some_and(|d| d.expected != w.revision) {
+                ui.weak("This workspace changed while you were editing. Review the latest title and question before saving. Your edits are kept.");
+                ui.collapsing("Latest saved workspace", |ui| {
+                    ui.label(&w.title);
+                    ui.label(&w.question);
+                });
+            }
             if self
                 .drafts
                 .get(&w.id)
                 .is_some_and(|draft| draft.expected != w.revision)
                 && ui
-                    .button("Use current revision, retain my workspace edits")
+                    .button("Review latest version; keep my workspace edits")
                     .clicked()
             {
                 if let Some(draft) = self.drafts.get_mut(&w.id) {
@@ -1479,12 +1514,13 @@ impl ResearchUi {
                     ("Assumptions", &mut d.brief.assumptions),
                     ("Open questions", &mut d.brief.open_questions),
                 ] {
-                    ui.label(label);
+                    let label = ui.label(label);
                     ui.add(
                         egui::TextEdit::multiline(value)
                             .desired_rows(2)
                             .desired_width(f32::INFINITY),
-                    );
+                    )
+                    .labelled_by(label.id);
                 }
                 if ui
                     .add_enabled(!busy, egui::Button::new("Save brief"))
@@ -1590,12 +1626,12 @@ impl ResearchUi {
                 {
                     d.capture_answer(&self.conversation);
                 }
-                ui.label("Question / intent");
-                ui.text_edit_multiline(&mut d.question);
-                ui.label("Findings / summary");
-                ui.text_edit_multiline(&mut d.summary);
-                ui.label("Open questions");
-                ui.text_edit_multiline(&mut d.open_questions);
+                let label = ui.label("Question / intent");
+                ui.text_edit_multiline(&mut d.question).labelled_by(label.id);
+                let label = ui.label("Findings / summary");
+                ui.text_edit_multiline(&mut d.summary).labelled_by(label.id);
+                let label = ui.label("Open questions");
+                ui.text_edit_multiline(&mut d.open_questions).labelled_by(label.id);
                 if !d.discussion.is_empty() {
                     ui.collapsing("Editable discussion context · not evidence", |ui| {
                         ui.add(
@@ -1766,15 +1802,20 @@ impl ResearchUi {
                             ui.selectable_value(&mut d.artifact_mode, 1, "Web URL");
                             ui.selectable_value(&mut d.artifact_mode, 2, "Supplied Markdown");
                         });
-                    ui.label("Title");
-                    ui.text_edit_singleline(&mut d.artifact_title);
-                    ui.label(["Local file path", "HTTP(S) URL", "Markdown"][d.artifact_mode]);
+                    let label = ui.label("Title");
+                    ui.text_edit_singleline(&mut d.artifact_title)
+                        .labelled_by(label.id);
+                    let input_label =
+                        ui.label(["Local file path", "HTTP(S) URL", "Markdown"][d.artifact_mode]);
                     if d.artifact_mode == 2 {
-                        ui.text_edit_multiline(&mut d.artifact_value);
-                        ui.label("Origin URL (optional)");
-                        ui.text_edit_singleline(&mut d.artifact_url);
+                        ui.text_edit_multiline(&mut d.artifact_value)
+                            .labelled_by(input_label.id);
+                        let label = ui.label("Origin URL (optional)");
+                        ui.text_edit_singleline(&mut d.artifact_url)
+                            .labelled_by(label.id);
                     } else {
-                        ui.text_edit_singleline(&mut d.artifact_value);
+                        ui.text_edit_singleline(&mut d.artifact_value)
+                            .labelled_by(input_label.id);
                     }
                     if d.artifact_mode == 1 {
                         ui.checkbox(&mut d.archive, "Retain a Markdown web copy (uses network)");
@@ -1853,10 +1894,13 @@ impl ResearchUi {
                 }
             });
         }
+        if expected != w.revision && d.dirty(w) {
+            ui.weak("This workspace changed. Review the current workspace above before saving. Review keeps your drafts and does not submit them.");
+        }
         if expected != w.revision
             && d.dirty(w)
             && ui
-                .button("Use current revision, keep these research drafts")
+                .button("Review latest version; keep research drafts")
                 .clicked()
         {
             d.expected = Some(w.revision);
@@ -2032,8 +2076,9 @@ impl ResearchUi {
                     }
                     ui.label("Title");
                     field_single(ui, &mut self.new_title, "research-new-title");
-                    ui.label("Question");
-                    ui.text_edit_multiline(&mut self.new_question);
+                    let label = ui.label("Question");
+                    ui.text_edit_multiline(&mut self.new_question)
+                        .labelled_by(label.id);
                     if self.new_thread.is_some() {
                         ui.label("Discussion snapshot · context, not evidence");
                         ui.add(
@@ -2264,7 +2309,26 @@ impl ResearchUi {
                 .source
                 .and_then(|id| w.sources.iter().find(|s| s.id == id))
             {
-                ui.heading(&source.title);
+                ui.add(egui::Label::new(egui::RichText::new(&source.title).heading()).wrap());
+                ui.weak(format!(
+                    "{} · {}",
+                    if source.selected {
+                        "Included in context"
+                    } else {
+                        "Excluded from context"
+                    },
+                    if crate::research::source_has_text(source) {
+                        "Text available"
+                    } else if source.paper.as_ref().is_some_and(|paper| w
+                        .artifacts
+                        .iter()
+                        .any(|a| a.id == paper.artifact_id && a.managed_path.is_some()))
+                    {
+                        "Original retained · no readable text"
+                    } else {
+                        "Reference only"
+                    }
+                ));
                 self.reader_body(ui, ctx, app, &w, source);
             } else {
                 ui.weak("This source was removed. Return to the conversation.");
@@ -2661,11 +2725,17 @@ impl ResearchUi {
             if pdf_path.is_some() {
                 ui.selectable_value(&mut self.reader_pdf, true, "PDF");
             }
-            if ui
+            let previous = ui
                 .add_enabled(self.reader_page > 0, egui::Button::new("‹").frame(false))
-                .on_hover_text("Previous page")
-                .clicked()
-            {
+                .on_hover_text("Previous page");
+            previous.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Button,
+                    previous.enabled(),
+                    "Previous page",
+                )
+            });
+            if previous.clicked() {
                 self.reader_page -= 1;
             }
             let mut page = self.reader_page + 1;
@@ -2680,14 +2750,16 @@ impl ResearchUi {
                 self.reader_page = page.saturating_sub(1);
             }
             ui.weak(format!("of {}", count.max(1)));
-            if ui
+            let next = ui
                 .add_enabled(
                     self.reader_page + 1 < count,
                     egui::Button::new("›").frame(false),
                 )
-                .on_hover_text("Next page")
-                .clicked()
-            {
+                .on_hover_text("Next page");
+            next.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, next.enabled(), "Next page")
+            });
+            if next.clicked() {
                 self.reader_page += 1;
             }
             if let Some(current) = source.pages.get(self.reader_page) {
@@ -2711,13 +2783,11 @@ impl ResearchUi {
             }
         }
         ui.horizontal(|ui| {
-            if ui
-                .add(
-                    egui::TextEdit::singleline(&mut self.reader_search)
-                        .hint_text("Find in source…"),
-                )
-                .changed()
-            {
+            let search = ui.add(
+                egui::TextEdit::singleline(&mut self.reader_search).hint_text("Find in source…"),
+            );
+            super::name_field(search.clone(), &self.reader_search, "Find in source");
+            if search.changed() {
                 self.reader_hit = None;
                 self.reader_scroll_hit = false;
             }

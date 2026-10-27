@@ -44,7 +44,7 @@ syntect = { version = "=5.3.0", optional = true, default-features = false, featu
 image = { version = "=0.25.10", optional = true, default-features = false, features = ["png"] }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
-eframe = { version = "=0.33.3", optional = true, default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+eframe = { version = "=0.33.3", optional = true, default-features = false, features = ["default_fonts", "glow", "x11", "wayland", "accesskit"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = { version = "=0.22.4", optional = true }

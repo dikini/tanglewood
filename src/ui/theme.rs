@@ -39,7 +39,7 @@ pub(super) fn colors(dark: bool) -> Colors {
         hover: gray(43, 229),
         selected: gray(48, 222),
         text: gray(223, 41),
-        secondary: gray(170, 102),
+        secondary: gray(170, 97),
         border: gray(48, 222),
         accent: rgb([138, 180, 248], [36, 93, 179]),
         success: rgb([131, 201, 149], [36, 106, 55]),
@@ -222,7 +222,7 @@ pub(super) fn control(ui: &egui::Ui, icon: Icon) -> egui::Button<'static> {
         .min_size(egui::vec2(size, size))
 }
 pub(super) fn button(ui: &mut egui::Ui, icon: Icon, label: &str, enabled: bool) -> egui::Response {
-    selected_button(ui, icon, label, enabled, false)
+    icon_button(ui, icon, label, enabled, None)
 }
 pub(super) fn selected_button(
     ui: &mut egui::Ui,
@@ -230,6 +230,15 @@ pub(super) fn selected_button(
     label: &str,
     enabled: bool,
     selected: bool,
+) -> egui::Response {
+    icon_button(ui, icon, label, enabled, Some(selected))
+}
+fn icon_button(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    label: &str,
+    enabled: bool,
+    selected: Option<bool>,
 ) -> egui::Response {
     let size = control_size(ui);
     let response = ui
@@ -241,8 +250,8 @@ pub(super) fn selected_button(
             ui.add_enabled(
                 enabled,
                 control(ui, icon)
-                    .selected(selected)
-                    .frame_when_inactive(selected),
+                    .selected(selected.unwrap_or(false))
+                    .frame_when_inactive(selected.unwrap_or(false)),
             )
         })
         .inner
@@ -255,7 +264,12 @@ pub(super) fn selected_button(
             egui::StrokeKind::Inside,
         );
     }
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
+    response.widget_info(|| match selected {
+        Some(selected) => {
+            egui::WidgetInfo::selected(egui::WidgetType::Button, enabled, selected, label)
+        }
+        None => egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label),
+    });
     response
 }
 

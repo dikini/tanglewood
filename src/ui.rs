@@ -26,7 +26,29 @@ use crate::{
     notes::{NoteId, NoteView, Revision},
 };
 
+fn name_field(response: egui::Response, _text: &str, label: &str) -> egui::Response {
+    #[cfg(not(target_os = "android"))]
+    response
+        .ctx
+        .accesskit_node_builder(response.id, |node| node.set_label(label));
+    #[cfg(target_os = "android")]
+    let _ = label;
+    response
+}
+
 fn field_single(ui: &mut egui::Ui, text: &mut String, name: &str) -> egui::Response {
+    let label = match name {
+        "quick-switch" => "Search notes",
+        "document-import-path" | "markdown-import-path" => "Destination Markdown path",
+        "markdown-file-path" => "Markdown file path",
+        "research-title" | "research-new-title" => "Workspace title",
+        "research-note-path" | "research-report-path" => "Research note path",
+        "research-import-path" => "Research import file path",
+        "lan-bind" => "LAN listen address",
+        "lan-advertised" => "LAN advertised address",
+        "lan-fingerprint" => "Peer fingerprint",
+        _ => "Markdown path",
+    };
     #[cfg(target_os = "android")]
     {
         let id = egui::Id::new(("android-field", name));
@@ -37,12 +59,12 @@ fn field_single(ui: &mut egui::Ui, text: &mut String, name: &str) -> egui::Respo
         if change.changed {
             response.mark_changed();
         }
-        response
+        name_field(response, text, label)
     }
     #[cfg(not(target_os = "android"))]
     {
-        let _ = name;
-        ui.text_edit_singleline(text)
+        let response = ui.text_edit_singleline(text);
+        name_field(response, text, label)
     }
 }
 #[cfg(feature = "lan")]
@@ -436,12 +458,14 @@ impl TanglewoodUi {
                     #[cfg(target_os = "android")]
                     field_single(ui, &mut self.query, "quick-switch");
                     #[cfg(not(target_os = "android"))]
-                    ui.add(
+                    let search = ui.add(
                         egui::TextEdit::singleline(&mut self.query)
                             .id(egui::Id::new("quick-switch"))
                             .hint_text("Search notes…")
                             .desired_width(f32::INFINITY),
                     );
+                    #[cfg(not(target_os = "android"))]
+                    name_field(search, &self.query, "Search notes");
                     ui.add_space(8.0);
                 }
                 ui.add_space(6.0);
@@ -2358,7 +2382,7 @@ impl TanglewoodUi {
                                     if ui
                                         .add_enabled(
                                             files_available,
-                                            egui::Button::new("Export accepted source"),
+                                            egui::Button::new("Export current Markdown…"),
                                         )
                                         .clicked()
                                     {
@@ -2371,7 +2395,7 @@ impl TanglewoodUi {
                             });
                             ui.label(
                                 egui::RichText::new(
-                                    "Exports accepted source only; drafts are excluded.",
+                                    "Unapplied edits aren't included.",
                                 )
                                 .small()
                                 .color(theme::muted(ui)),
@@ -2685,6 +2709,60 @@ mod tests {
     use super::{
         App, Caller, Command, CommandResult, contiguous_edit, linked_path, resolve_note_target,
     };
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn accesskit_click_opens_exact_whole_document_source() {
+        use eframe::egui::{self, accesskit};
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut shell = super::TanglewoodUi::new(App::new());
+        let source = "# Exact source\n\nUnicode α 🌲 and **markup**.\n";
+        shell.dispatch(Command::CreateNote {
+            path: "Native-action.md".into(),
+            text: source.into(),
+        });
+        let note = shell.selected.unwrap();
+        shell.refresh(&shell.app.notes());
+        shell.show_preview = true;
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 850.0),
+            )),
+            ..Default::default()
+        };
+        let output = ctx.run(input(), |ctx| shell.show_frame(ctx));
+        let update = output
+            .platform_output
+            .accesskit_update
+            .expect("accessibility tree");
+        let (target, node) = update
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Edit document source"))
+            .expect("fresh source action node");
+        assert!(node.supports_action(accesskit::Action::Click));
+        let mut action_input = input();
+        action_input
+            .events
+            .push(egui::Event::AccessKitActionRequest(
+                accesskit::ActionRequest {
+                    action: accesskit::Action::Click,
+                    target: *target,
+                    data: None,
+                },
+            ));
+        let _ = ctx.run(action_input, |ctx| shell.show_frame(ctx));
+        assert!(
+            !shell.show_preview,
+            "AccessKit Click must enter source mode"
+        );
+        let draft = &shell.drafts[&note];
+        assert_eq!(draft.range, None);
+        assert_eq!(draft.text, source);
+        assert_eq!(shell.app.note(note).unwrap().note.text, source);
+    }
 
     #[test]
     fn responsive_frames_preserve_source_draft_and_use_one_pane_host() {
@@ -5664,7 +5742,7 @@ impl ConversationPanel {
                 egui::ScrollArea::vertical().id_salt("composer-body").max_height((ctx.content_rect().height()*0.35).clamp(48.0,320.0)).auto_shrink([false,true]).show(ui,|ui| {
                 let can_edit_context = !self.busy();
                 ui.add_enabled_ui(can_edit_context, |ui| self.context.chips(ui));
-                ui.add(
+                let prompt = ui.add(
                     egui::TextEdit::multiline(&mut self.prompt)
                         .id(egui::Id::new(("codex-composer",self.thread.as_deref())))
                         .frame(false)
@@ -5682,6 +5760,7 @@ impl ConversationPanel {
                         .desired_width(f32::INFINITY)
                         .char_limit(256 * 1024),
                 );
+                name_field(prompt, &self.prompt, "Message Codex");
                 if research && self.relevant_sources {
                     if let Some(workspace)=self.research_workspace.and_then(|id|app.research_workspace(id)) {
                         let stale=self.relevant_cache.as_ref().is_none_or(|(id,revision,query,_)|*id!=workspace.id || *revision!=workspace.revision || query!=&self.prompt);
@@ -5716,16 +5795,16 @@ impl ConversationPanel {
                     let turning = self.active_turn.is_some()
                         || (self.starting && self.pending_thread.is_none());
                     if turning {
-                        if ui
+                        let interrupt = ui
                             .add_enabled(
                                 !self.disconnecting,
                                 egui::Button::new("■")
                                     .corner_radius(16)
                                     .min_size(egui::vec2(32.0, 32.0)),
                             )
-                            .on_hover_text("Interrupt response")
-                            .clicked()
-                        {
+                            .on_hover_text("Interrupt response");
+                        interrupt.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, interrupt.enabled(), "Interrupt response"));
+                        if interrupt.clicked() {
                             if self.send_request(CodexRequest::Interrupt) {
                                 self.status = "Interrupt requested…".into();
                             }
@@ -5744,16 +5823,16 @@ impl ConversationPanel {
                             && !self.prompt.trim().is_empty()
                             && self.prompt.len() + self.context.total_input_bytes() + automatic_evidence.len() <= 256 * 1024
                             && self.context.skills_valid();
-                        if ui
+                        let send = ui
                             .add_enabled(
                                 can_send,
                                 egui::Button::new("↑")
                                     .corner_radius(16)
                                     .min_size(egui::vec2(32.0, 32.0)),
                             )
-                            .on_hover_text("Send message")
-                            .clicked()
-                        {
+                            .on_hover_text("Send message");
+                        send.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, send.enabled(), "Send message"));
+                        if send.clicked() {
                             if self.bytes() + self.prompt.len() > Self::BYTE_LIMIT
                                 || self.messages.len() >= 256
                             {
